@@ -302,6 +302,7 @@ class GRPOTrainer(Trainer):
         self.max_prompt_length = args.max_prompt_length
         self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
         self.num_generations = args.num_generations  # = G in the GRPO paper
+        self.cliprange = args.cliprange
         self.use_vllm = args.use_vllm
 
         # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
@@ -685,16 +686,14 @@ class GRPOTrainer(Trainer):
         # Compute the KL divergence between the model and the reference model if beta is not 0
         ref_per_token_logps = inputs["ref_per_token_logps"]
         # x - x.detach() allows for preserving gradients from x
+        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
         if ref_per_token_logps is None:
-            per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
             per_token_loss = -per_token_loss
         else:
             # we need to compute the KL divergence between the model and the reference model
             per_token_kl = (
                 torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
             )
-
-            per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
             per_token_loss = -(per_token_loss - self.beta * per_token_kl)
 
             mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()

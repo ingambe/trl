@@ -139,6 +139,10 @@ class GRPOConfig(TrainingArguments):
             "must be divisible by this value."
         },
     )
+    cliprange: float = field(
+         default=0.2,
+         metadata={"help": "Clip range."},
+     )
     temperature: Optional[float] = field(
         default=0.9,
         metadata={"help": "Temperature for sampling. The higher the temperature, the more random the completions."},
