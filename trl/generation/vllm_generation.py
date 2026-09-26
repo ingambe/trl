@@ -36,7 +36,7 @@ from ..distributed import DistributedBackend
 from ..extras.profiling import ProfilingContext
 from ..import_utils import is_vllm_available
 from ..trainer.utils import ensure_master_addr_port
-from .vllm_client import VLLMClient, pil_to_base64
+from .vllm_client import VLLMClient
 
 
 if is_vllm_available():
@@ -560,9 +560,9 @@ class VLLMGeneration:
             prompts: List of token ID lists, one per prompt (already tokenized).
             images: Optional list of image lists for VLM support. Each element is a list of PIL images for the
                 corresponding prompt, or `None` if no images for that prompt. `None` if no images at all.
-            num_generations: Number of times each original prompt is repeated in `prompts`. Server mode can send
-                repeats with identical token IDs and image payloads as one request with `n=num_generations`; otherwise
-                each row gets its own request with `n=1`. Pass 1 after tool calls because histories can diverge.
+            num_generations: Number of times each original prompt is repeated in `prompts`. Server mode groups
+                repeats with identical token IDs into one request with `n=num_generations`. Repeated rows must also
+                refer to the same images. Pass 1 after tool calls because histories can diverge.
             profiler: Optional profiler for performance tracking.
 
         Returns:
@@ -601,21 +601,12 @@ class VLLMGeneration:
                 all_images = None
 
             if num_generations > 1:
-                # Group prompts when their token IDs and images match
+                # Group prompts when their token IDs match
                 for start in range(0, len(all_prompts), num_generations):
                     group = all_prompts[start : start + num_generations]
                     if len(group) != num_generations or any(prompt != group[0] for prompt in group[1:]):
                         num_generations = 1
                         break
-                    if all_images is not None:
-                        # Same image token IDs can refer to different images
-                        image_group = [
-                            [pil_to_base64(image) for image in prompt_images or []]
-                            for prompt_images in all_images[start : start + num_generations]
-                        ]
-                        if any(images != image_group[0] for images in image_group[1:]):
-                            num_generations = 1
-                            break
 
             if accelerator.is_main_process:
                 # After checking that each group contains num_generations duplicates, we take one prompt per group
