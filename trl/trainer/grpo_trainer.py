@@ -26,6 +26,7 @@ import time
 import warnings
 from collections import defaultdict, deque
 from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -2117,71 +2118,77 @@ class GRPOTrainer(_BaseTrainer):
         # Copy the prompts to avoid modifying the original list
         prompts = copy.deepcopy(prompts)
 
-        if self.rollout_func is not None:
-            # Keep vLLM weights in sync for custom rollouts that rely on vLLM utilities.
-            if self.use_vllm and self.state.global_step != self._last_loaded_step:
-                with profiling_context(self, "sync_weights"):
-                    self.vllm_generation.sync_weights()
-                self._last_loaded_step = self.state.global_step
+        # Keep vLLM resident through initial generation, tool turns, and custom rollouts.
+        with self.vllm_generation.rollout_phase() if self.use_vllm else nullcontext():
+            if self.rollout_func is not None:
+                # Keep vLLM weights in sync for custom rollouts that rely on vLLM utilities.
+                if self.use_vllm and self.state.global_step != self._last_loaded_step:
+                    with profiling_context(self, "sync_weights"):
+                        self.vllm_generation.sync_weights()
+                    self._last_loaded_step = self.state.global_step
 
-            # Pass prompts to rollout_func preserving structured messages.
-            # Chat templating must happen inside rollout_func, at the backend boundary, so that
-            # multimodal content (images, typed content blocks) is not lost before rollout logic runs.
-            output = self.rollout_func(prompts, self)
-            required_keys = {"prompt_ids", "completion_ids", "logprobs"}
-            missing_keys = required_keys - output.keys()
-            if missing_keys:
-                missing_keys_list = sorted(missing_keys)
-                raise ValueError(f"rollout_func must return keys {missing_keys_list} in its output dict.")
-            extra_fields = {k: v for k, v in output.items() if k not in required_keys}
-            prompt_ids, completion_ids, logprobs = output["prompt_ids"], output["completion_ids"], output["logprobs"]
-            images = None
-            multimodal_fields = {}
-        else:
-            prompt_ids, images, multimodal_fields = self._tokenize_prompts(prompts)
-            completion_ids, logprobs = self._generate_single_turn(prompt_ids, images, multimodal_fields)
-            extra_fields = {}
-
-        # Decode completions. It's important to use `parse_response` when possible, because it handles tool calls.
-        if is_conversational({"prompt": prompts[0]}):
-            if Version(transformers.__version__) >= Version("5.0.0") and (  # parse_response added in v5
-                getattr(self._tokenizer, "response_template", None) is not None  # new-style
-                or getattr(self._tokenizer, "response_schema", None) is not None  # old-style
-            ):
-                completions = [
-                    [parse_response(self._tokenizer, ids, prefix=prompt_ids[i])]
-                    for i, ids in enumerate(completion_ids)
-                ]
+                # Pass prompts to rollout_func preserving structured messages.
+                # Chat templating must happen inside rollout_func, at the backend boundary, so that
+                # multimodal content (images, typed content blocks) is not lost before rollout logic runs.
+                output = self.rollout_func(prompts, self)
+                required_keys = {"prompt_ids", "completion_ids", "logprobs"}
+                missing_keys = required_keys - output.keys()
+                if missing_keys:
+                    missing_keys_list = sorted(missing_keys)
+                    raise ValueError(f"rollout_func must return keys {missing_keys_list} in its output dict.")
+                extra_fields = {k: v for k, v in output.items() if k not in required_keys}
+                prompt_ids, completion_ids, logprobs = (
+                    output["prompt_ids"],
+                    output["completion_ids"],
+                    output["logprobs"],
+                )
+                images = None
+                multimodal_fields = {}
             else:
-                contents = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-                completions = [[{"role": "assistant", "content": content}] for content in contents]
-        else:
-            completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+                prompt_ids, images, multimodal_fields = self._tokenize_prompts(prompts)
+                completion_ids, logprobs = self._generate_single_turn(prompt_ids, images, multimodal_fields)
+                extra_fields = {}
 
-        # Extract tool calls from the completions and (possibly) execute them
-        tool_images = []
-        if self.tools:
-            (
-                tool_mask,
-                completions,
-                completion_ids,
-                logprobs,
-                tool_call_count,
-                tool_failure_count,
-                tool_images,
-            ) = self._tool_call_loop(
-                prompts, prompt_ids, completion_ids, completions, logprobs, images, multimodal_fields
-            )
-            # Merge tool response images into the images list for the forward pass
-            if any(imgs for imgs in tool_images):
-                if images is None:
-                    images = [imgs if imgs else None for imgs in tool_images]
+            # Decode completions. It's important to use `parse_response` when possible, because it handles tool calls.
+            if is_conversational({"prompt": prompts[0]}):
+                if Version(transformers.__version__) >= Version("5.0.0") and (  # parse_response added in v5
+                    getattr(self._tokenizer, "response_template", None) is not None  # new-style
+                    or getattr(self._tokenizer, "response_schema", None) is not None  # old-style
+                ):
+                    completions = [
+                        [parse_response(self._tokenizer, ids, prefix=prompt_ids[i])]
+                        for i, ids in enumerate(completion_ids)
+                    ]
                 else:
-                    images = [(existing or []) + new for existing, new in zip(images, tool_images, strict=True)]
-        else:
-            # Support custom env_mask from rollout_func (e.g., for environment feedback masking)
-            # Internally treated as tool_mask - marks model tokens (1) vs external tokens (0)
-            tool_mask = extra_fields.pop("env_mask", None)
+                    contents = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+                    completions = [[{"role": "assistant", "content": content}] for content in contents]
+            else:
+                completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+
+            # Extract tool calls from the completions and (possibly) execute them
+            tool_images = []
+            if self.tools:
+                (
+                    tool_mask,
+                    completions,
+                    completion_ids,
+                    logprobs,
+                    tool_call_count,
+                    tool_failure_count,
+                    tool_images,
+                ) = self._tool_call_loop(
+                    prompts, prompt_ids, completion_ids, completions, logprobs, images, multimodal_fields
+                )
+                # Merge tool response images into the images list for the forward pass
+                if any(imgs for imgs in tool_images):
+                    if images is None:
+                        images = [imgs if imgs else None for imgs in tool_images]
+                    else:
+                        images = [(existing or []) + new for existing, new in zip(images, tool_images, strict=True)]
+            else:
+                # Support custom env_mask from rollout_func (e.g., for environment feedback masking)
+                # Internally treated as tool_mask - marks model tokens (1) vs external tokens (0)
+                tool_mask = extra_fields.pop("env_mask", None)
 
         # Get completion length per sequence, used for logging
         prompt_lengths = torch.tensor([len(ids) for ids in prompt_ids], device=device)

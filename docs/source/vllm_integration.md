@@ -265,3 +265,25 @@ training_args = RLOOConfig(
 
 > [!WARNING]
 > To reduce GPU memory usage when running vLLM, consider [enabling vLLM sleep mode](reducing_memory_usage#vllm-sleep-mode).
+
+### Colocated multi-turn rollouts with sleep mode
+
+With `vllm_mode="colocate"` and `vllm_enable_sleep_mode=True`, GRPO keeps vLLM awake for the complete rollout,
+including CPU tools and custom `rollout_func` turns. It releases memory before scoring and training, including when
+rollout generation raises an exception. Unchanged weights are transferred once per phase; a level-2 sleep discards
+weights, so the next phase must transfer them again. A real weight update invalidates the prefix cache before loading.
+
+Custom rollouts that run a GPU tool must explicitly release vLLM memory **on every rank** before the tool starts:
+
+```python
+# Inside a rollout_func, after generating a turn:
+trainer.vllm_generation.sleep()
+result = gpu_tool(...)
+# Release the tool's GPU allocations before generating again.
+_, completion_ids, logprobs, _ = trainer.vllm_generation.generate(prompts, images=None, num_generations=1)
+```
+
+Keep this handoff outside rank-dependent tool dispatch so all ranks restore weights together. CPU tools need no
+handoff. Standalone calls to `VLLMGeneration.generate` still release memory on return; callers running several turns
+outside GRPO can group them with `with generation.rollout_phase():`. Custom rollouts must use these lifecycle methods
+rather than calling the underlying `llm.sleep()` directly, which bypasses residency tracking.

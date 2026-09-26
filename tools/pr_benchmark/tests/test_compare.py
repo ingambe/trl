@@ -110,3 +110,49 @@ def test_invalid_results_fail_closed(measurements, damage):
         result["manifest_id"] = "old-request"
     with pytest.raises(ValueError):
         comparison.compare(result, manifest)
+
+
+@pytest.fixture
+def rollout_measurements(measurements):
+    manifest, result = measurements
+    manifest["workload"].update(kind="vllm-rollout", steps=6)
+    manifest["thresholds"] = {"rollout_seconds": 5.0, "weight_transfer_bytes": 0.0}
+    for record in result["records"]:
+        head = record["side"] == "head"
+        record.update(
+            steps=6,
+            rollout_seconds=8.0 if head else 10.0,
+            weight_transfer_bytes=100 if head else 400,
+            sync_count=6 if head else 24,
+            sleeping_after_phase=True,
+            output_sha256="same-tokens",
+        )
+    return manifest, result
+
+
+def test_rollout_improvement_requires_matching_tokens_and_handoff(rollout_measurements):
+    manifest, result = rollout_measurements
+    assert comparison.compare(result, manifest)["outcome"] == "improved"
+
+
+@pytest.mark.parametrize("damage", ["tokens", "handoff", "sync", "nan"])
+def test_rollout_acceptance_fails_closed(rollout_measurements, damage):
+    manifest, result = rollout_measurements
+    head = result["records"][1]
+    if damage == "tokens":
+        head["output_sha256"] = "different-tokens"
+    elif damage == "handoff":
+        head["sleeping_after_phase"] = False
+    elif damage == "sync":
+        head["sync_count"] = 7
+    else:
+        head["weight_transfer_bytes"] = float("nan")
+    with pytest.raises(ValueError):
+        comparison.compare(result, manifest)
+
+
+def test_transfer_reduction_alone_is_not_a_rollout_speedup(rollout_measurements):
+    manifest, result = rollout_measurements
+    for record in result["records"]:
+        record["rollout_seconds"] = 10.0
+    assert comparison.compare(result, manifest)["outcome"] == "no_regression"

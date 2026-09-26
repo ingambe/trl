@@ -26,7 +26,14 @@ from environment import environment_spec
 
 
 TERMINAL = {"SUCCEEDED", "FAILED", "CANCELLED"}
-BUNDLE_FILES = ("job.py", "workload.py", "environment.py", "requirements-gpu.txt", "manifest.json")
+BUNDLE_FILES = (
+    "job.py",
+    "workload.py",
+    "rollout_workload.py",
+    "environment.py",
+    "requirements-gpu.txt",
+    "manifest.json",
+)
 
 
 class HyperAI:

@@ -96,7 +96,7 @@ def run(environment):
                 subprocess.run(
                     [
                         sys.executable,
-                        str(ROOT / "workload.py"),
+                        str(ROOT / ("rollout_workload.py" if config.get("kind") == "vllm-rollout" else "workload.py")),
                         "--model-path",
                         str(environment / "model"),
                         "--checkout",

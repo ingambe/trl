@@ -17,7 +17,7 @@
 import logging
 import math
 import os
-from contextlib import nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -283,6 +283,8 @@ class VLLMGeneration:
         # Tensor names, dtypes and shapes streamed to the server on each weight sync. Collected on the first sync, as
         # it requires gathering the parameters, and constant afterwards.
         self._weight_metadata = None
+        self._rollout_depth = 0
+        self._weights_dirty = True
 
         self._init_vllm()
 
@@ -364,8 +366,8 @@ class VLLMGeneration:
             )
             if self.enable_sleep_mode:
                 self.llm.sleep(level=2)
-            # Sleep level 2 discards the weights; track it so that generate() knows it must re-push them
             self._llm_weights_sleeping = self.enable_sleep_mode
+            self._kv_cache_sleeping = self.enable_sleep_mode
         else:
             raise ValueError(f"vllm_mode must be either 'server' or 'colocate', got '{self.mode}'.")
 
@@ -445,28 +447,30 @@ class VLLMGeneration:
             # merging adapters in a sharded manner is not supported.
             # TODO: does this work with FSDP?
             with self._dist.gather_params(list(model.parameters())):
-                model.merge_adapter()
+                try:
+                    model.merge_adapter()
 
-                # Read the vLLM weights while parameters are gathered
-                if self._dist.is_fsdp:  # note if using FSDP, gather_params is a no-op
-                    # For PEFT with FSDP we need to use the memory efficient post-order traversal
-                    yield from self._iter_fsdp_params(model)
-                else:
-                    # DeepSpeed ZeRO-3 with PEFT
-                    for name, param in model.named_parameters():
-                        # When using PEFT, we need to recover the original parameter name
-                        name = name.removeprefix("base_model.model.").replace(".base_layer", "")
-                        # Skip PEFT layers: they don't exist in vLLM, and they are merged already.
-                        if model.prefix in name:
-                            continue
-                        # When module to save, remove its prefix and discard the original module
-                        if "original_module" in name:
-                            continue
-                        name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
+                    # Read the vLLM weights while parameters are gathered
+                    if self._dist.is_fsdp:  # note if using FSDP, gather_params is a no-op
+                        # For PEFT with FSDP we need to use the memory efficient post-order traversal
+                        yield from self._iter_fsdp_params(model)
+                    else:
+                        # DeepSpeed ZeRO-3 with PEFT
+                        for name, param in model.named_parameters():
+                            # When using PEFT, we need to recover the original parameter name
+                            name = name.removeprefix("base_model.model.").replace(".base_layer", "")
+                            # Skip PEFT layers: they don't exist in vLLM, and they are merged already.
+                            if model.prefix in name:
+                                continue
+                            # When module to save, remove its prefix and discard the original module
+                            if "original_module" in name:
+                                continue
+                            name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
 
-                        yield name, param.data
-                # Unmerge adapters while parameters are still gathered
-                model.unmerge_adapter()
+                            yield name, param.data
+                finally:
+                    # Unmerge adapters while parameters are still gathered, including after a failed transfer.
+                    model.unmerge_adapter()
                 # Parameters will automatically be repartitioned when exiting the context
         else:
             # For non-PEFT models, simply gather (if needed) and read each parameter individually.
@@ -483,10 +487,11 @@ class VLLMGeneration:
 
         Handles FSDP, DeepSpeed, PEFT weight synchronization.
         """
+        self._weights_dirty = True
         # Wake up vLLM weights before loading to ensure device memory is mapped. Without this, load_weights() writes to
         # freed/unmapped memory when sleep mode is active, which crashes on backends with strict physical memory
         # management (e.g., Ascend NPU). See https://github.com/huggingface/trl/issues/5142
-        if self.mode == "colocate" and self.enable_sleep_mode:
+        if self.mode == "colocate" and self.enable_sleep_mode and self._llm_weights_sleeping:
             empty_cache()  # required to avoid OOM in some cases
             self.llm.wake_up(tags=["weights"])
             self._llm_weights_sleeping = False
@@ -501,20 +506,50 @@ class VLLMGeneration:
                     (name, str(param.dtype).removeprefix("torch."), list(param.shape))
                     for name, param in self._iter_named_params()
                 ]
-            if accelerator.is_main_process:
-                self.vllm_client.update_named_params(self._weight_metadata, self._iter_named_params())
-            else:
-                for _ in self._iter_named_params():  # take part in the gather collectives
-                    pass
+            with closing(self._iter_named_params()) as params:
+                if accelerator.is_main_process:
+                    self.vllm_client.update_named_params(self._weight_metadata, params)
+                else:
+                    for _ in params:  # take part in the gather collectives
+                        pass
         elif self.mode == "colocate":
-            for name, param in self._iter_named_params():
-                self.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights([(name, param)])
+            # Invalidate policy-dependent KV before changing any weights, including a failed partial update.
+            self.llm.reset_prefix_cache()
+            with closing(self._iter_named_params()) as params:
+                for name, param in params:
+                    self.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights([(name, param)])
 
         # Reset cache on vLLM
         if self.mode == "server" and accelerator.is_main_process:
             self.vllm_client.reset_prefix_cache()
-        elif self.mode == "colocate":
-            self.llm.reset_prefix_cache()
+        self._weights_dirty = False
+
+    @contextmanager
+    def rollout_phase(self):
+        """Keep colocated vLLM resident across all turns and release it at the training handoff.
+
+        Nested phases share residency. A standalone `generate` call owns a single-turn phase.
+        """
+        if self.mode != "colocate" or not self.enable_sleep_mode:
+            yield
+            return
+        self._rollout_depth += 1
+        try:
+            yield
+        finally:
+            self._rollout_depth -= 1
+            if self._rollout_depth == 0:
+                self.sleep()
+
+    def sleep(self):
+        """Release colocated vLLM memory before a GPU tool; the next generation restores the current policy.
+
+        Call on every rank before entering the tool. CPU tools need no handoff.
+        """
+        if self.mode == "colocate" and self.enable_sleep_mode:
+            self.llm.sleep(level=2)
+            self._llm_weights_sleeping = True
+            self._kv_cache_sleeping = True
 
     def _place_features(self, features: dict | None, prompt_ids: list[int]) -> dict | None:
         """Point the image features at the image tokens of `prompt_ids`.
@@ -576,48 +611,98 @@ class VLLMGeneration:
             `num_logprobs` is 1 when `logprobs=0`, or up to N+1 when `logprobs=N` (the sampled token is always included
             and may fall outside the top-N).
         """
-        profiler = profiler or nullcontext()
-        accelerator = self.accelerator
-        temperature = self.temperature
-        top_p = self.top_p
-        top_k = self.top_k
-        min_p = self.min_p
-        repetition_penalty = self.repetition_penalty
-        max_completion_length = self.max_completion_length
+        with self.rollout_phase():
+            profiler = profiler or nullcontext()
+            accelerator = self.accelerator
+            temperature = self.temperature
+            top_p = self.top_p
+            top_k = self.top_k
+            min_p = self.min_p
+            repetition_penalty = self.repetition_penalty
+            max_completion_length = self.max_completion_length
 
-        # Sleep level 2 discards the weights, so waking up isn't enough: they must be re-pushed from the training
-        # model. vLLM's `reload_weights` can't be used here, as it reloads the initial checkpoint from disk rather
-        # than the current training weights. See https://github.com/vllm-project/vllm/issues/29341
-        if self.mode == "colocate" and self.enable_sleep_mode and self._llm_weights_sleeping:
-            self.sync_weights()
+            # Sleep level 2 discards the weights, so waking up isn't enough: they must be re-pushed from the training
+            # model. vLLM's `reload_weights` can't be used here, as it reloads the initial checkpoint from disk rather
+            # than the current training weights. See https://github.com/vllm-project/vllm/issues/29341
+            if (
+                self.mode == "colocate"
+                and self.enable_sleep_mode
+                and (self._weights_dirty or self._llm_weights_sleeping)
+            ):
+                self.sync_weights()
 
-        # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
-        if self.mode == "server":
-            all_prompts = gather_object(prompts)
-            # Always gather images (even when None) to avoid deadlock: images may be None on some ranks
-            # and non-None on others in mixed datasets, and gather_object is a collective operation.
-            all_images = gather_object(images if images is not None else [None] * len(prompts))
-            if all(img is None for img in all_images):
-                all_images = None
+            # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+            if self.mode == "server":
+                all_prompts = gather_object(prompts)
+                # Always gather images (even when None) to avoid deadlock: images may be None on some ranks
+                # and non-None on others in mixed datasets, and gather_object is a collective operation.
+                all_images = gather_object(images if images is not None else [None] * len(prompts))
+                if all(img is None for img in all_images):
+                    all_images = None
 
-            if accelerator.is_main_process:
-                # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and
-                # generate num_generations outputs for each one. This is faster than generating outputs for each
-                # duplicate prompt individually.
-                ordered_set_of_prompt_ids = all_prompts[::num_generations]
+                if accelerator.is_main_process:
+                    # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and
+                    # generate num_generations outputs for each one. This is faster than generating outputs for each
+                    # duplicate prompt individually.
+                    ordered_set_of_prompt_ids = all_prompts[::num_generations]
 
-                # The server generates from either token IDs or images, so images are processed on their own first
-                # and the resulting features are paired with the token IDs.
-                features = None
-                if all_images is not None:
-                    features = self.vllm_client.image_features(all_images[::num_generations])
-                    features = [
-                        self._place_features(prompt_features, prompt_ids)
-                        for prompt_features, prompt_ids in zip(features, ordered_set_of_prompt_ids, strict=True)
-                    ]
+                    # The server generates from either token IDs or images, so images are processed on their own first
+                    # and the resulting features are paired with the token IDs.
+                    features = None
+                    if all_images is not None:
+                        features = self.vllm_client.image_features(all_images[::num_generations])
+                        features = [
+                            self._place_features(prompt_features, prompt_ids)
+                            for prompt_features, prompt_ids in zip(features, ordered_set_of_prompt_ids, strict=True)
+                        ]
 
-                sampling_params = {
-                    "n": num_generations,
+                    sampling_params = {
+                        "n": num_generations,
+                        "repetition_penalty": repetition_penalty,
+                        "temperature": temperature,
+                        "top_p": top_p,
+                        "top_k": top_k,
+                        "min_p": 0.0 if min_p is None else min_p,
+                        "max_tokens": max_completion_length,
+                        "logprobs": self.logprobs,
+                        "structured_outputs_regex": self.structured_outputs_regex,
+                        "generation_kwargs": {**self.generation_kwargs, "n": num_generations},
+                    }
+                    with profiler:
+                        output = self.vllm_client.generate(
+                            prompts=ordered_set_of_prompt_ids, features=features, **sampling_params
+                        )
+                        payload = (
+                            output["prompt_ids"],
+                            output["completion_ids"],
+                            output["logprobs"],
+                            output.get("logprob_token_ids"),
+                        )
+                else:
+                    payload = None
+
+                # Broadcast the completions from the main process to all processes, ensuring each process receives its corresponding slice.
+                obj_list = [payload]
+                broadcast_object_list(obj_list, from_process=0)
+                all_prompt_ids, all_completion_ids, all_logprobs, all_logprob_token_ids = obj_list[0]
+
+                # vllm_client.generate(n=num_generations) returns num_generations completions per prompt.
+                # Duplicate prompt_ids to align with per-completion entries.
+                all_prompt_ids = [ids for ids in all_prompt_ids for _ in range(num_generations)]
+
+                process_slice = slice(
+                    accelerator.process_index * len(prompts),
+                    (accelerator.process_index + 1) * len(prompts),
+                )
+                prompt_ids = all_prompt_ids[process_slice]
+                completion_ids = all_completion_ids[process_slice]
+                logprobs = all_logprobs[process_slice] if all_logprobs is not None else None
+                logprob_token_ids = all_logprob_token_ids[process_slice] if all_logprob_token_ids is not None else None
+
+            # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
+            elif self.mode == "colocate":
+                generation_kwargs = {
+                    "n": 1,  # vLLM on each GPU generates only 1 in colocate mode
                     "repetition_penalty": repetition_penalty,
                     "temperature": temperature,
                     "top_p": top_p,
@@ -625,132 +710,86 @@ class VLLMGeneration:
                     "min_p": 0.0 if min_p is None else min_p,
                     "max_tokens": max_completion_length,
                     "logprobs": self.logprobs,
-                    "structured_outputs_regex": self.structured_outputs_regex,
-                    "generation_kwargs": {**self.generation_kwargs, "n": num_generations},
                 }
+                generation_kwargs.update(self.generation_kwargs)
+
+                if self.structured_outputs_regex is not None:
+                    if generation_kwargs.get("structured_outputs") is not None:
+                        logger.warning(
+                            "Both `structured_outputs_regex` and `generation_kwargs['structured_outputs']` are set; "
+                            "`structured_outputs_regex` takes precedence."
+                        )
+                    generation_kwargs["structured_outputs"] = StructuredOutputsParams(
+                        regex=self.structured_outputs_regex
+                    )
+                elif isinstance(structured_outputs_kwargs := generation_kwargs.get("structured_outputs"), dict):
+                    generation_kwargs["structured_outputs"] = StructuredOutputsParams(**structured_outputs_kwargs)
+                sampling_params = SamplingParams(**generation_kwargs)
+
+                if self.tensor_parallel_size > 1:
+                    # Gather prompts from all ranks in the TP group and flatten.
+                    # Each rank starts with its own prompts; after gathering, all ranks see the full group set.
+                    orig_size = len(prompts)
+                    gathered_prompts = [None for _ in range(self.tensor_parallel_size)]
+                    torch.distributed.all_gather_object(gathered_prompts, prompts, group=self.tp_group)
+                    all_prompts = [p for sublist in gathered_prompts for p in sublist]
+                    # Always gather images (even when None) to avoid deadlock: images may be None on some
+                    # ranks and non-None on others in mixed datasets, and all_gather_object is collective.
+                    local_images = images if images is not None else [None] * len(prompts)
+                    gathered_images = [None for _ in range(self.tensor_parallel_size)]
+                    torch.distributed.all_gather_object(gathered_images, local_images, group=self.tp_group)
+                    all_images = [img for sublist in gathered_images for img in sublist]
+                    if all(img is None for img in all_images):
+                        all_images = None
+                else:
+                    all_prompts = prompts
+                    all_images = images
+
+                if self.enable_sleep_mode and self._kv_cache_sleeping:
+                    self.llm.wake_up(tags=["kv_cache"])
+                    self._kv_cache_sleeping = False
+
+                # Build vLLM-compatible prompt inputs with token IDs and optional multi-modal data
+                vllm_prompts = []
+                if all_images is not None:
+                    for ids, img_list in zip(all_prompts, all_images, strict=True):
+                        row = {"prompt_token_ids": ids}
+                        if img_list is not None:
+                            row["multi_modal_data"] = {"image": img_list if len(img_list) > 1 else img_list[0]}
+                        vllm_prompts.append(row)
+                else:
+                    vllm_prompts = [{"prompt_token_ids": ids} for ids in all_prompts]
+
+                # When PEFT is used, DDP gradient all-reduce only covers the small LoRA parameters, so
+                # NCCL operations complete very quickly. On non-NVLink hardware (e.g. A40/A100), vLLM's
+                # TP NCCL collective can race with NCCL's internal P2P/SHM channel cleanup from that
+                # all-reduce, causing llm.generate() to hang. A barrier on the default process group
+                # forces NCCL to fully drain before vLLM's TP communication starts. We pass device_ids
+                # so NCCL uses this rank's device rather than guessing, which itself risks a hang.
+                # See https://github.com/huggingface/trl/issues/3671
+                if is_peft_model(self.model) and self.tensor_parallel_size > 1:
+                    torch.distributed.barrier(device_ids=[accelerator.local_process_index])
+
                 with profiler:
-                    output = self.vllm_client.generate(
-                        prompts=ordered_set_of_prompt_ids, features=features, **sampling_params
-                    )
-                    payload = (
-                        output["prompt_ids"],
-                        output["completion_ids"],
-                        output["logprobs"],
-                        output.get("logprob_token_ids"),
-                    )
-            else:
-                payload = None
+                    all_outputs = self.llm.generate(vllm_prompts, sampling_params=sampling_params, use_tqdm=False)
 
-            # Broadcast the completions from the main process to all processes, ensuring each process receives its corresponding slice.
-            obj_list = [payload]
-            broadcast_object_list(obj_list, from_process=0)
-            all_prompt_ids, all_completion_ids, all_logprobs, all_logprob_token_ids = obj_list[0]
+                all_prompt_ids = [output.prompt_token_ids for output in all_outputs]
+                all_completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
+                all_logprobs, all_logprob_token_ids = extract_logprobs(all_outputs)
 
-            # vllm_client.generate(n=num_generations) returns num_generations completions per prompt.
-            # Duplicate prompt_ids to align with per-completion entries.
-            all_prompt_ids = [ids for ids in all_prompt_ids for _ in range(num_generations)]
+                if self.tensor_parallel_size > 1:
+                    # Slice completions for this rank within its TP group.
+                    # Each rank generates all outputs — we keep only our share.
+                    local_rank_in_group = torch.distributed.get_rank(group=self.tp_group)
+                    tp_slice = slice(local_rank_in_group * orig_size, (local_rank_in_group + 1) * orig_size)
+                    prompt_ids = all_prompt_ids[tp_slice]
+                    completion_ids = all_completion_ids[tp_slice]
+                    logprobs = all_logprobs[tp_slice] if all_logprobs is not None else None
+                    logprob_token_ids = all_logprob_token_ids[tp_slice] if all_logprob_token_ids is not None else None
+                else:
+                    prompt_ids = all_prompt_ids
+                    completion_ids = all_completion_ids
+                    logprobs = all_logprobs
+                    logprob_token_ids = all_logprob_token_ids
 
-            process_slice = slice(
-                accelerator.process_index * len(prompts),
-                (accelerator.process_index + 1) * len(prompts),
-            )
-            prompt_ids = all_prompt_ids[process_slice]
-            completion_ids = all_completion_ids[process_slice]
-            logprobs = all_logprobs[process_slice] if all_logprobs is not None else None
-            logprob_token_ids = all_logprob_token_ids[process_slice] if all_logprob_token_ids is not None else None
-
-        # Generate completions using colocated vLLM instances: each device holds vLLM copy and work on their own batch of prompts
-        elif self.mode == "colocate":
-            generation_kwargs = {
-                "n": 1,  # vLLM on each GPU generates only 1 in colocate mode
-                "repetition_penalty": repetition_penalty,
-                "temperature": temperature,
-                "top_p": top_p,
-                "top_k": top_k,
-                "min_p": 0.0 if min_p is None else min_p,
-                "max_tokens": max_completion_length,
-                "logprobs": self.logprobs,
-            }
-            generation_kwargs.update(self.generation_kwargs)
-
-            if self.structured_outputs_regex is not None:
-                if generation_kwargs.get("structured_outputs") is not None:
-                    logger.warning(
-                        "Both `structured_outputs_regex` and `generation_kwargs['structured_outputs']` are set; "
-                        "`structured_outputs_regex` takes precedence."
-                    )
-                generation_kwargs["structured_outputs"] = StructuredOutputsParams(regex=self.structured_outputs_regex)
-            elif isinstance(structured_outputs_kwargs := generation_kwargs.get("structured_outputs"), dict):
-                generation_kwargs["structured_outputs"] = StructuredOutputsParams(**structured_outputs_kwargs)
-            sampling_params = SamplingParams(**generation_kwargs)
-
-            if self.tensor_parallel_size > 1:
-                # Gather prompts from all ranks in the TP group and flatten.
-                # Each rank starts with its own prompts; after gathering, all ranks see the full group set.
-                orig_size = len(prompts)
-                gathered_prompts = [None for _ in range(self.tensor_parallel_size)]
-                torch.distributed.all_gather_object(gathered_prompts, prompts, group=self.tp_group)
-                all_prompts = [p for sublist in gathered_prompts for p in sublist]
-                # Always gather images (even when None) to avoid deadlock: images may be None on some
-                # ranks and non-None on others in mixed datasets, and all_gather_object is collective.
-                local_images = images if images is not None else [None] * len(prompts)
-                gathered_images = [None for _ in range(self.tensor_parallel_size)]
-                torch.distributed.all_gather_object(gathered_images, local_images, group=self.tp_group)
-                all_images = [img for sublist in gathered_images for img in sublist]
-                if all(img is None for img in all_images):
-                    all_images = None
-            else:
-                all_prompts = prompts
-                all_images = images
-
-            if self.enable_sleep_mode:
-                self.llm.wake_up(tags=["kv_cache"])
-
-            # Build vLLM-compatible prompt inputs with token IDs and optional multi-modal data
-            vllm_prompts = []
-            if all_images is not None:
-                for ids, img_list in zip(all_prompts, all_images, strict=True):
-                    row = {"prompt_token_ids": ids}
-                    if img_list is not None:
-                        row["multi_modal_data"] = {"image": img_list if len(img_list) > 1 else img_list[0]}
-                    vllm_prompts.append(row)
-            else:
-                vllm_prompts = [{"prompt_token_ids": ids} for ids in all_prompts]
-
-            # When PEFT is used, DDP gradient all-reduce only covers the small LoRA parameters, so
-            # NCCL operations complete very quickly. On non-NVLink hardware (e.g. A40/A100), vLLM's
-            # TP NCCL collective can race with NCCL's internal P2P/SHM channel cleanup from that
-            # all-reduce, causing llm.generate() to hang. A barrier on the default process group
-            # forces NCCL to fully drain before vLLM's TP communication starts. We pass device_ids
-            # so NCCL uses this rank's device rather than guessing, which itself risks a hang.
-            # See https://github.com/huggingface/trl/issues/3671
-            if is_peft_model(self.model) and self.tensor_parallel_size > 1:
-                torch.distributed.barrier(device_ids=[accelerator.local_process_index])
-
-            with profiler:
-                all_outputs = self.llm.generate(vllm_prompts, sampling_params=sampling_params, use_tqdm=False)
-
-            all_prompt_ids = [output.prompt_token_ids for output in all_outputs]
-            all_completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
-            all_logprobs, all_logprob_token_ids = extract_logprobs(all_outputs)
-
-            if self.tensor_parallel_size > 1:
-                # Slice completions for this rank within its TP group.
-                # Each rank generates all outputs — we keep only our share.
-                local_rank_in_group = torch.distributed.get_rank(group=self.tp_group)
-                tp_slice = slice(local_rank_in_group * orig_size, (local_rank_in_group + 1) * orig_size)
-                prompt_ids = all_prompt_ids[tp_slice]
-                completion_ids = all_completion_ids[tp_slice]
-                logprobs = all_logprobs[tp_slice] if all_logprobs is not None else None
-                logprob_token_ids = all_logprob_token_ids[tp_slice] if all_logprob_token_ids is not None else None
-            else:
-                prompt_ids = all_prompt_ids
-                completion_ids = all_completion_ids
-                logprobs = all_logprobs
-                logprob_token_ids = all_logprob_token_ids
-
-            if self.enable_sleep_mode:
-                self.llm.sleep(level=2)
-                self._llm_weights_sleeping = True
-
-        return prompt_ids, completion_ids, logprobs, logprob_token_ids
+            return prompt_ids, completion_ids, logprobs, logprob_token_ids

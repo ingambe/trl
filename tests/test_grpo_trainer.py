@@ -16,6 +16,7 @@ import gc
 import os
 import warnings
 from collections.abc import Callable
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -163,7 +164,7 @@ class TestGRPORolloutDispatch:
     @pytest.fixture
     def rollout_trainer(self, make_grpo_trainer):
         trainer = make_grpo_trainer(global_step=2, last_loaded_step=1)
-        trainer.vllm_generation = SimpleNamespace(sync_weights=MagicMock())
+        trainer.vllm_generation = SimpleNamespace(sync_weights=MagicMock(), rollout_phase=nullcontext)
         trainer.processing_class = SimpleNamespace(
             batch_decode=MagicMock(return_value=["decoded"]),
         )

@@ -238,3 +238,29 @@ mocking the cloud API. Provider behavior and GPU execution require the live smok
 python -m pip install pytest
 python -m pytest tools/pr_benchmark/tests -q
 ```
+
+## Colocated multi-turn rollout comparison before opening a PR
+
+The `vllm-rollout` profile exercises GRPO's real `_generate` path with a custom four-turn rollout and deterministic
+CPU tool feedback. Six measured phases follow one warm-up phase for each of five paired seeds. Each phase changes
+the training weights, then times the entire rollout through its final level-2 sleep. Greedy completion tokens must
+match between base and head; the head must synchronize at most once per phase and both engines must finish asleep.
+`weight_transfer_bytes` measures tensor payload bytes passed to vLLM's `load_weights`, **not measured PCIe traffic**.
+`rollout_seconds` includes synchronization, generation, feedback, and sleep; initialization is excluded.
+
+This profile needs its own prepared environment (`requirements-vllm.txt`, including vLLM 0.22.0). SFT environments
+remain usable for their original profiles. Prepare once with the same command as above, adding `--profile vllm-rollout`,
+then select the returned `HYPERAI_ENVIRONMENT_JOB` for this comparison. Respect the controller's existing daily budget.
+
+Push the candidate branch without opening a PR, then run:
+
+```bash
+~/.local/share/trl-pr-benchmark/venv/bin/python tools/pr_benchmark/controller.py compare \
+  --repo OWNER/REPO --base-ref BASE_SHA --ref HEAD_SHA --profile vllm-rollout \
+  --env-file ~/.config/trl-bench/env
+```
+
+`compare` resolves and pins both refs and never posts a PR status. `--dry-run` resolves the request without allocating
+compute. Require the latency interval to show an improvement before claiming this optimization is faster; fewer
+transferred bytes alone are not latency evidence. This bounded synthetic workload does not establish distributed,
+merged-adapter, or GPU-tool performance; their cleanup behavior also needs the local regression tests.
