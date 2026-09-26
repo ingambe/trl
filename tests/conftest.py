@@ -18,6 +18,7 @@ import os
 import sys
 import traceback
 from functools import wraps
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -69,6 +70,31 @@ def pytest_runtest_makereport(item, call):
                 exc.__traceback__ = None
             stack.append(exc.__context__)
             stack.append(exc.__cause__)
+
+
+@pytest.fixture
+def make_grpo_trainer():
+    """Provide a factory for CPU GRPO trainer shells without model or backend initialization."""
+    from trl import GRPOTrainer
+
+    def make_trainer(*, global_step=0, last_loaded_step=0, use_vllm=False):
+        trainer = object.__new__(GRPOTrainer)
+        trainer.accelerator = SimpleNamespace(
+            device=torch.device("cpu"),
+            is_main_process=True,
+            process_index=0,
+            gather=lambda t: t,
+        )
+        trainer.args = SimpleNamespace(report_to=[])
+        trainer.model = SimpleNamespace(training=True)
+        trainer.state = SimpleNamespace(global_step=global_step, num_input_tokens_seen=0)
+        trainer._last_loaded_step = last_loaded_step
+        trainer.use_vllm = use_vllm
+        trainer.use_transformers_continuous_batching = False
+        trainer._tokenizer = SimpleNamespace(eos_token_id=2, pad_token_id=0)
+        return trainer
+
+    return make_trainer
 
 
 # ============================================================================
