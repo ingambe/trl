@@ -119,7 +119,7 @@ def main():
         result = trainer._generate(prompts)
         torch.cuda.synchronize()
         duration = time.perf_counter() - started
-        sleeping = sleeping and engine.llm.is_sleeping()
+        sleeping = sleeping and engine.llm.llm_engine.is_sleeping()
         if phase >= config["warmup_steps"]:
             durations.append(duration)
             outputs.append(result[1])
