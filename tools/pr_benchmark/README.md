@@ -264,3 +264,8 @@ Push the candidate branch without opening a PR, then run:
 compute. Require the latency interval to show an improvement before claiming this optimization is faster; fewer
 transferred bytes alone are not latency evidence. This bounded synthetic workload does not establish distributed,
 merged-adapter, or GPU-tool performance; their cleanup behavior also needs the local regression tests.
+
+If the token hash check fails, `vllm-rollout-diagnostic` runs one paired seed with two measured phases and resets the
+prefix cache before every turn on both sides. It isolates residency/weight-transfer changes from cross-turn prefix
+reuse. Every rollout workload also records `output_tokens` for inspection. The diagnostic's small sample remains
+inconclusive for performance; matching tokens there does not prove general numerical equivalence with prefix reuse.

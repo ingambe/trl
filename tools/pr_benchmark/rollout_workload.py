@@ -52,6 +52,8 @@ def main():
         histories = [ids.copy() for ids in initial]
         completions = [[] for _ in initial]
         for turn in range(config["turns"]):
+            if config.get("reset_prefix_between_turns", False):
+                trainer.vllm_generation.llm.reset_prefix_cache()
             _, tokens, _, _ = trainer.vllm_generation.generate(histories, images=None, num_generations=1)
             for history, completion, ids in zip(histories, completions, tokens, strict=True):
                 history.extend(ids)
@@ -133,6 +135,7 @@ def main():
         **counters,
         "sleeping_after_phase": sleeping,
         "output_sha256": hashlib.sha256(json.dumps(outputs).encode()).hexdigest(),
+        "output_tokens": outputs,
         "peak_memory_bytes": torch.cuda.max_memory_allocated(),
         "environment": {
             "gpu": torch.cuda.get_device_name(),

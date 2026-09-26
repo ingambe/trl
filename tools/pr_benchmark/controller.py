@@ -324,7 +324,9 @@ def main():
     )
     parser.add_argument("--base-ref", default="main", help="Base commit/ref for a pre-PR comparison")
     parser.add_argument("--env-file", type=Path)
-    parser.add_argument("--profile", choices=["sft-3090", "smoke", "vllm-rollout"], default="sft-3090")
+    parser.add_argument(
+        "--profile", choices=["sft-3090", "smoke", "vllm-rollout", "vllm-rollout-diagnostic"], default="sft-3090"
+    )
     parser.add_argument(
         "--author", action="append", help="Allowed PR author; default is your authenticated GitHub user"
     )
