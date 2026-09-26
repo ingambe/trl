@@ -12,89 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
-from unittest.mock import Mock, patch
-
-import pytest
-
-from trl.generation.vllm_generation import VLLMGeneration
-
-
-def _make_server_generation(accelerator, *, max_completion_length):
-    """Keep the real server batching code and replace only the client that sends generation requests."""
-    generation = object.__new__(VLLMGeneration)
-    generation.accelerator = accelerator
-    generation.mode = "server"
-    generation.temperature = 1.0
-    generation.top_p = 1.0
-    generation.top_k = -1
-    generation.min_p = None
-    generation.repetition_penalty = 1.0
-    generation.max_completion_length = max_completion_length
-    generation.logprobs = 0
-    generation.structured_outputs_regex = None
-    generation.generation_kwargs = {}
-
-    def generate_from_submitted_histories(prompts, n, **sampling_kwargs):
-        # Match vLLM's prompt-major ordering and n outputs per submitted history. Answers encode the tool result
-        # the server actually saw: 30 -> 130, 35 -> 135. Never infer an answer from the intended recipient.
-        tool_results = [prompt[-1] for prompt in prompts for _ in range(n)]
-        return {
-            "prompt_ids": prompts,
-            "completion_ids": [[result + 100] for result in tool_results],
-            "logprobs": [[[-result / 100]] for result in tool_results],
-            "logprob_token_ids": [[[result + 100]] for result in tool_results],
-        }
-
-    generation.vllm_client = SimpleNamespace(generate=Mock(side_effect=generate_from_submitted_histories))
-    return generation
-
-
-@pytest.fixture
-def server_tool_trainer(make_grpo_trainer):
-    """Provide a two-sibling tool scenario; restore patched dependencies after the test."""
-    trainer = make_grpo_trainer(use_vllm=True)
-    trainer.model.config = SimpleNamespace(max_position_embeddings=128)
-    trainer.vllm_mode = "server"
-    trainer.num_generations = 2
-    trainer.max_tool_calling_iterations = 1
-    trainer.max_completion_length = 32
-    trainer._is_vlm = False
-    trainer.vllm_generation = _make_server_generation(
-        trainer.accelerator, max_completion_length=trainer.max_completion_length
-    )
-
-    def calculator(result):
-        return result
-
-    trainer._sync_tool_dicts = [{"calculator": calculator} for _ in range(2)]
-    trainer._async_tool_dicts = [{}, {}]
-
-    def encode_tool_result(messages):
-        # Synthetic tokenization: a result of "30" becomes token 30.
-        return [int(messages[-1]["content"])]
-
-    def decode_assistant_response(tokenizer, ids, prefix):
-        return {"role": "assistant", "content": str(ids[0])}
-
-    def gather_on_single_process(values):
-        return values
-
-    # Patch only token formatting and distributed transport. The tool loop, single-turn generation, and server
-    # grouping run unchanged. These replacements are active during yield and automatically restored afterward.
-    with (
-        patch.object(trainer, "_get_tool_suffix_ids", side_effect=encode_tool_result),
-        patch("trl.trainer.grpo_trainer.parse_response", side_effect=decode_assistant_response),
-        patch("trl.generation.vllm_generation.gather_object", side_effect=gather_on_single_process),
-        patch("trl.generation.vllm_generation.broadcast_object_list", return_value=None),
-    ):
-        yield trainer
-
 
 def test_server_tool_continuations_keep_their_own_histories(server_tool_trainer):
     """Two siblings with different tool results must each continue from their own history."""
     trainer = server_tool_trainer
     # The same initial prompt produced two different assistant tool calls (tokens 10 and 20), returning 30 and 35.
+    # The mock server returns the last token + 100, so these histories should receive 130 and 135 respectively.
     prompts = [[{"role": "user", "content": "Calculate 3 * 10 + 5."}] for _ in range(2)]
     completions = [
         [
