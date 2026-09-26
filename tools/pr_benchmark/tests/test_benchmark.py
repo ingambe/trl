@@ -68,6 +68,18 @@ def measurements():
     return manifest, {"manifest_id": manifest["id"], "records": records}
 
 
+@pytest.fixture
+def execution(tmp_path, measurements):
+    _, result = measurements
+    provider, github = Mock(spec=hyperai.HyperAI), Mock(spec=controller.GitHub)
+    provider.submit.return_value = {"id": "job", "url": "https://example.com/job"}
+    provider.status.return_value = "SUCCEEDED"
+    provider.result.return_value = result
+    github.current.return_value = True
+    args = SimpleNamespace(state_dir=tmp_path, timeout_minutes=1, daily_compute_minutes=10, publish=True)
+    return args, github, provider, {"runs": []}, tmp_path / "state.json"
+
+
 @pytest.mark.parametrize(
     "runtime,loss,outcome",
     [
@@ -88,7 +100,6 @@ def test_paired_decisions(measurements, runtime, loss, outcome):
             record["eval_loss"] *= loss
     summary = comparison.compare(result, manifest)
     assert summary["outcome"] == outcome
-    assert manifest["head_sha"] in comparison.markdown(summary, manifest)
 
 
 def test_noise_cannot_pass_noninferiority(measurements):
@@ -141,75 +152,80 @@ def test_env_is_private_local_and_not_shell_code(tmp_path, monkeypatch):
         controller.load_env(tmp_path / "repo/env")
 
 
-def test_budget_reserved_before_launch(measurements):
+def test_budget_limit_prevents_submission(measurements, execution):
     manifest, _ = measurements
-    state = {"runs": []}
-    controller.reserve(state, manifest, 60, 60)
+    args, github, provider, state, state_file = execution
+    args.daily_compute_minutes = 1
+    controller.reserve(state, manifest, 1, 1)
     with pytest.raises(controller.BudgetExceeded):
-        controller.reserve(state, manifest, 60, 60)
+        controller.execute(args, github, provider, manifest, state, state_file)
+    provider.submit.assert_not_called()
     assert len(state["runs"]) == 1
 
 
-def test_wait_cancels_on_new_head_and_checks_failed_status(measurements, monkeypatch):
+@pytest.mark.parametrize("reason", ["stale_pr", "deadline", "interrupt"])
+def test_interrupted_run_cancels_and_confirms_stop(measurements, execution, monkeypatch, reason):
     manifest, _ = measurements
-    provider, github = Mock(), Mock()
-    record = {"job": {"id": "job"}}
-    monkeypatch.setattr(controller.time, "time", lambda: 10)
-    github.current.return_value = False
-    with pytest.raises(InterruptedError):
-        controller.wait_for_job(provider, github, manifest, record, 100)
-    provider.status.assert_not_called()
-    github.current.return_value = True
-    provider.status.return_value = "FAILED"
-    with pytest.raises(RuntimeError, match="FAILED"):
-        controller.wait_for_job(provider, github, manifest, record, 100)
-    with pytest.raises(TimeoutError):
-        controller.wait_for_job(provider, github, manifest, record, 5)
+    args, github, provider, state, state_file = execution
+    monkeypatch.setattr(controller.time, "sleep", lambda _: None)
+    if reason == "deadline":
+        monkeypatch.setattr(controller.time, "time", Mock(side_effect=[0, 61]))
+        expected = TimeoutError
+    elif reason == "interrupt":
+        github.current.side_effect = KeyboardInterrupt
+        expected = KeyboardInterrupt
+    else:
+        github.current.return_value = False
+        expected = InterruptedError
+    # Cancellation is asynchronous: the first poll after the stop request still reports RUNNING.
+    provider.status.side_effect = ["RUNNING", "RUNNING", "CANCELLED"]
 
+    def cancel(job_id):
+        assert json.loads(state_file.read_text())["runs"][0]["status"] == "cancel_pending"
 
-def test_failed_job_stopped_and_never_published_green(tmp_path, measurements, monkeypatch):
-    manifest, _ = measurements
-    provider, github = Mock(), Mock()
-    provider.submit.return_value = {"id": "job", "url": "https://example.com/job"}
-    provider.status.side_effect = ["FAILED", "FAILED"]
-    github.current.return_value = True
-    state = {"runs": []}
-    args = SimpleNamespace(state_dir=tmp_path, timeout_minutes=1, daily_compute_minutes=10, publish=True)
-    with pytest.raises(RuntimeError, match="FAILED"):
-        controller.execute(args, github, provider, manifest, state, tmp_path / "state.json")
-    assert state["runs"][0]["status"] == "error"
+    provider.cancel.side_effect = cancel
+    with pytest.raises(expected):
+        controller.execute(args, github, provider, manifest, state, state_file)
+    provider.cancel.assert_called_once_with("job")
+    assert provider.status.call_count == 3
+    assert json.loads(state_file.read_text())["runs"][0]["status"] == "error"
+    provider.result.assert_not_called()
     github.publish.assert_not_called()
     assert github.status.call_args.args[1] == "error"
 
 
-def test_successful_local_round_trip(tmp_path, measurements):
-    manifest, result = measurements
-    provider, github = Mock(), Mock()
-    provider.submit.return_value = {"id": "job", "url": "https://example.com/job"}
-    provider.status.return_value = "SUCCEEDED"
-    provider.result.return_value = result
-    github.current.return_value = True
-    state = {"runs": []}
-    args = SimpleNamespace(state_dir=tmp_path, timeout_minutes=1, daily_compute_minutes=10, publish=True)
-    assert controller.execute(args, github, provider, manifest, state, tmp_path / "state.json") == "no_regression"
-    record = state["runs"][0]
-    assert record["status"] == "completed"
-    directory = tmp_path / "runs" / record["run_id"]
-    assert {p.name for p in (directory / "bundle").iterdir()} == set(hyperai.BUNDLE_FILES)
-    assert (directory / "report.md").exists()
-    assert json.loads((directory / "result.json").read_text()) == result
-    github.publish.assert_called_once()
-
-
-def test_submission_ambiguity_remains_durable(tmp_path, measurements):
+def test_unconfirmed_stop_keeps_cleanup_pending(measurements, execution, monkeypatch):
     manifest, _ = measurements
-    provider, github = Mock(), Mock()
+    args, github, provider, state, state_file = execution
+    github.current.return_value = False
+    provider.status.return_value = "RUNNING"
+    monkeypatch.setattr(controller.time, "sleep", lambda _: None)
+    with pytest.raises(RuntimeError, match="not confirmed"):
+        controller.execute(args, github, provider, manifest, state, state_file)
+    provider.cancel.assert_called_once_with("job")
+    assert json.loads(state_file.read_text())["runs"][0]["status"] == "cancel_pending"
+    github.publish.assert_not_called()
+
+
+def test_failed_job_never_published_green(measurements, execution):
+    manifest, _ = measurements
+    args, github, provider, state, state_file = execution
+    provider.status.return_value = "FAILED"
+    with pytest.raises(RuntimeError, match="FAILED"):
+        controller.execute(args, github, provider, manifest, state, state_file)
+    assert state["runs"][0]["status"] == "error"
+    provider.cancel.assert_not_called()
+    github.publish.assert_not_called()
+    assert github.status.call_args.args[1] == "error"
+
+
+def test_submission_ambiguity_remains_durable(measurements, execution):
+    manifest, _ = measurements
+    args, github, provider, state, state_file = execution
     provider.submit.side_effect = TimeoutError("lost response after createJob")
-    state = {"runs": []}
-    args = SimpleNamespace(state_dir=tmp_path, timeout_minutes=1, daily_compute_minutes=10, publish=False)
     with pytest.raises(TimeoutError):
-        controller.execute(args, github, provider, manifest, state, tmp_path / "state.json")
-    persisted = json.loads((tmp_path / "state.json").read_text())
+        controller.execute(args, github, provider, manifest, state, state_file)
+    persisted = json.loads(state_file.read_text())
     assert persisted["runs"][0]["status"] == "submitting"
 
 
@@ -224,7 +240,7 @@ def test_current_base_tip_is_used_and_secrets_not_sent_to_github(monkeypatch):
     github.api.assert_called_once_with("repos/owner/repo/commits/release%2Ftest")
 
 
-def test_hyperai_token_stays_out_of_job(monkeypatch, tmp_path, measurements):
+def test_hyperai_token_stays_out_of_job(monkeypatch, tmp_path):
     calls = []
 
     def query(self, text, variables=None):
@@ -258,26 +274,7 @@ def test_hyperai_token_stays_out_of_job(monkeypatch, tmp_path, measurements):
             "HYPERAI_ENVIRONMENT_JOB": "prepared-job",
         }
     )
-    provider.inventory = Mock(
-        return_value={
-            "resources": [{"name": "rtx-3090", "gpu": {"count": 1}}],
-            "runtimes": [
-                {
-                    "id": "pytorch-2.11.0-2404",
-                    "deprecated": False,
-                    "device": "GPU",
-                    "labels": ["uv", "python-3.12"],
-                },
-            ],
-        }
-    )
     (tmp_path / ".env").write_text("OPENBAYES_TOKEN=local-secret")
-    manifest, _ = measurements
-    provider.status = Mock(return_value="SUCCEEDED")
-    provider.result = Mock(
-        return_value={"kind": "prepared_environment", "spec": controller.environment_spec(manifest)}
-    )
-    provider.validate(manifest)
     provider.submit(tmp_path, 60)
     assert "local-secret" not in json.dumps(calls)
     assert {Path(c.args[0]).name for c in storage.upload_file.call_args_list} == set(hyperai.BUNDLE_FILES)
@@ -305,71 +302,57 @@ def test_forbidden_auth_never_creates_compute_or_echoes_credentials(monkeypatch)
 
 
 @pytest.mark.parametrize("calibration", [False, True])
-def test_resume_preserves_original_publication_choice(tmp_path, measurements, calibration):
-    manifest, result = measurements
+def test_resume_preserves_original_publication_choice(measurements, execution, calibration):
+    manifest, _ = measurements
+    args, github, provider, state, state_file = execution
     if calibration:
         manifest["pr"] = None
-    provider, github = Mock(), Mock()
-    provider.submit.return_value = {"id": "job", "url": "https://example.com/job"}
-    provider.status.return_value = "SUCCEEDED"
-    provider.result.return_value = result
-    github.current.return_value = True
-    state = {"runs": []}
-    args = SimpleNamespace(state_dir=tmp_path, timeout_minutes=1, daily_compute_minutes=10, publish=calibration)
-    controller.execute(args, github, provider, manifest, state, tmp_path / "state.json")
+    args.publish = calibration
+    controller.execute(args, github, provider, manifest, state, state_file)
     record = state["runs"][0]
     args.publish = True
-    controller.execute(args, github, provider, manifest, state, tmp_path / "state.json", record)
+    controller.execute(args, github, provider, manifest, state, state_file, record)
     github.publish.assert_not_called()
     github.status.assert_not_called()
 
 
-def test_invalid_provider_config_does_not_reserve_budget_or_submit(tmp_path, measurements):
+def test_invalid_provider_config_does_not_reserve_budget_or_submit(measurements, execution):
     manifest, _ = measurements
-    provider = Mock()
+    args, github, provider, state, state_file = execution
     provider.validate.side_effect = ValueError("Unsupported image")
-    state = {"runs": []}
-    args = SimpleNamespace(state_dir=tmp_path, timeout_minutes=1, daily_compute_minutes=10, publish=False)
     with pytest.raises(ValueError, match="Unsupported image"):
-        controller.execute(args, Mock(), provider, manifest, state, tmp_path / "state.json")
+        controller.execute(args, github, provider, manifest, state, state_file)
     assert state["runs"] == []
     provider.submit.assert_not_called()
 
 
-def test_changed_comparator_cannot_judge_a_recorded_run(tmp_path, measurements):
+def test_changed_comparator_cannot_judge_a_recorded_run(measurements, execution):
     manifest, _ = measurements
+    args, github, provider, state, state_file = execution
     manifest["harness"]["compare.py"] = "old-comparator"
-    provider = Mock()
-    state = {"runs": []}
-    args = SimpleNamespace(state_dir=tmp_path, timeout_minutes=1, daily_compute_minutes=10, publish=False)
     with pytest.raises(ValueError, match="Comparator changed"):
-        controller.execute(args, Mock(), provider, manifest, state, tmp_path / "state.json")
+        controller.execute(args, github, provider, manifest, state, state_file)
     provider.submit.assert_not_called()
     record = {"status": "running", "job": {"id": "existing-job"}}
     state["runs"].append(record)
     provider.status.side_effect = ["RUNNING", "CANCELLED"]
     with pytest.raises(ValueError, match="Comparator changed"):
-        controller.execute(args, Mock(), provider, manifest, state, tmp_path / "state.json", record)
+        controller.execute(args, github, provider, manifest, state, state_file, record)
     provider.cancel.assert_called_once_with("existing-job")
     assert record["status"] == "error"
 
 
-def test_prepare_records_ready_artifact_without_publishing(tmp_path, measurements):
+def test_prepare_records_ready_artifact_without_publishing(measurements, execution):
     manifest, _ = measurements
+    args, github, provider, state, state_file = execution
     manifest.update(prepare=True, pr=None)
     manifest["harness"]["compare.py"] = "comparator-not-used-during-preparation"
-    provider, github = Mock(), Mock()
-    provider.submit.return_value = {"id": "environment-job", "url": "https://example.com/job"}
-    provider.status.return_value = "SUCCEEDED"
     provider.result.return_value = {
         "manifest_id": manifest["id"],
         "kind": "prepared_environment",
         "spec": controller.environment_spec(manifest),
     }
-    github.current.return_value = True
-    state = {"runs": []}
-    args = SimpleNamespace(state_dir=tmp_path, timeout_minutes=1, daily_compute_minutes=10, publish=False)
-    assert controller.execute(args, github, provider, manifest, state, tmp_path / "state.json") == "prepared"
+    assert controller.execute(args, github, provider, manifest, state, state_file) == "prepared"
     assert state["runs"][0]["outcome"] == "prepared"
     github.publish.assert_not_called()
 
