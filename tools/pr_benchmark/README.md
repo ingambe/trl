@@ -231,9 +231,10 @@ and upload logic in the adapter; add explicit provider selection only when a sec
 
 ## Local tests
 
-The controller tests do not require torch, CUDA, cloud credentials, or paid jobs:
+The comparator tests need only pytest. They check regression decisions, uncertainty, and invalid measurements without
+mocking the cloud API. Provider behavior and GPU execution require the live smoke run described above.
 
 ```bash
-python -m pip install -r tools/pr_benchmark/requirements-controller.txt pytest
+python -m pip install pytest
 python -m pytest tools/pr_benchmark/tests -q
 ```
