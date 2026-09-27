@@ -33,13 +33,13 @@ def policy_parity(trainer, histories, side, seed):
     """Compare full next-token distributions on fixed histories, including a stale-adapter control."""
     import numpy as np
     import torch
-    from peft import LoraConfig, PeftModel, get_peft_model
+    from peft import PeftModel
     from vllm import SamplingParams
 
     engine = trainer.vllm_generation
     native_lora = "_lora_config" in dir(engine) and engine._lora_config is not None
-    if isinstance(engine.model, PeftModel) and not native_lora:
-        engine.model = engine.model.unload()
+    if not isinstance(engine.model, PeftModel):
+        raise ValueError("The policy diagnostic requires the benchmark LoRA model")
     engine.temperature = 1.0
     engine.top_p = 1.0
     engine.top_k = -1
@@ -67,6 +67,7 @@ def policy_parity(trainer, histories, side, seed):
         log_midpoint = torch.logaddexp(reference, actual) - math.log(2)
         metrics = {
             "label": label,
+            "local_logprobs_sha256": hashlib.sha256(reference.numpy().tobytes()).hexdigest(),
             "total_variation": ((p - q).abs().sum() / 2).item(),
             "kl_local_vllm": (p * (reference - actual)).sum().item(),
             "js_divergence": ((p * (reference - log_midpoint)).sum() + (q * (actual - log_midpoint)).sum()).item() / 2,
@@ -93,21 +94,17 @@ def policy_parity(trainer, histories, side, seed):
         return dense([item.logprob for item in out.values()], list(out))
 
     for stage_index, stage in enumerate(("dense", "lora", "updated_lora")):
-        if stage == "lora" and not native_lora:
-            with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
-                torch.manual_seed(seed)
-                engine.model = get_peft_model(
-                    engine.model,
-                    LoraConfig(r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM"),
-                )
-        if stage != "dense":
-            generator = torch.Generator(device="cuda").manual_seed(seed + stage_index)
-            with torch.no_grad():
-                for name, param in engine.model.named_parameters():
-                    if "lora_B" in name:
+        # Both sides retain the same initialized A matrices from the timed model. Recreating only the merged
+        # side's adapter would make cross-backend distribution comparisons use different policies.
+        generator = torch.Generator(device="cuda").manual_seed(seed + stage_index)
+        with torch.no_grad():
+            for name, param in engine.model.named_parameters():
+                if "lora_B" in name:
+                    if stage == "dense":
+                        param.zero_()
+                    else:
                         param.normal_(std=0.03 if stage == "lora" else 0.1, generator=generator)
-        with engine.model.disable_adapter() if native_lora and stage == "dense" else nullcontext():
-            reference = local()
+        reference = local()
         merged_reference = reference
         if stage != "dense":
             # Evaluate the actual BF16 merged inference policy without perturbing training weights.
@@ -138,9 +135,6 @@ def policy_parity(trainer, histories, side, seed):
         context = engine.rollout_phase() if "rollout_phase" in dir(engine) else nullcontext()
         with context:
             engine.sync_weights()
-            active_request = engine._lora_request if native_lora else None
-            if native_lora and stage == "dense":
-                engine._lora_request = None
             for turn in range(4):
                 if turn == 3:
                     engine.llm.reset_prefix_cache()
@@ -148,12 +142,8 @@ def policy_parity(trainer, histories, side, seed):
                 actual = dense(logprobs[0][0], token_ids[0][0])
                 record(f"{stage}_turn{turn}", reference, actual)
                 record(f"{stage}_turn{turn}_merged_reference", merged_reference, actual)
-                with engine.model.disable_adapter() if native_lora and stage == "dense" else nullcontext():
-                    record(f"{stage}_turn{turn}_local_after_sync", local(), actual)
-            if native_lora:
-                engine._lora_request = active_request
-        with engine.model.disable_adapter() if native_lora and stage == "dense" else nullcontext():
-            record(stage + "_local_policy_drift", reference, local())
+                record(f"{stage}_turn{turn}_local_after_sync", local(), actual)
+        record(stage + "_local_policy_drift", reference, local())
         deltas = [
             (param - frozen[name]).abs().float().max().item()
             for name, param in engine.model.named_parameters()

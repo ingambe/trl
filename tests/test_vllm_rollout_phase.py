@@ -349,8 +349,31 @@ def test_native_lora_selection_preserves_other_peft_paths(monkeypatch, options):
         torch.nn.Sequential(torch.nn.Linear(4, 4)), LoraConfig(r=2, target_modules=["0"], **options)
     )
     monkeypatch.setattr(VLLMGeneration, "_init_vllm", lambda self: None)
+    monkeypatch.setattr("trl.generation.vllm_generation.is_vllm_available", lambda: True)
+    monkeypatch.setattr("trl.generation.vllm_generation.vllm_version", "0.22.0", raising=False)
     engine = VLLMGeneration(model, Accelerator(cpu=True), None)
     assert (engine._lora_config is not None) == (options == {})
+
+
+@pytest.mark.parametrize("version", ["0.21.0", "0.22.0"])
+def test_native_lora_initialization_limits_wrappers_to_targets(monkeypatch, version):
+    from accelerate import Accelerator
+    from peft import LoraConfig, get_peft_model
+
+    model = get_peft_model(torch.nn.Sequential(torch.nn.Linear(4, 4)), LoraConfig(r=2, target_modules=["0"]))
+    model.name_or_path = "test-model"
+    llm = Mock()
+    monkeypatch.setattr("trl.generation.vllm_generation.LLM", llm, raising=False)
+    monkeypatch.setattr("trl.generation.vllm_generation.is_vllm_available", lambda: True)
+    monkeypatch.setattr("trl.generation.vllm_generation.vllm_version", version, raising=False)
+    engine = VLLMGeneration(model, Accelerator(cpu=True), None, enable_sleep_mode=True)
+    if version == "0.22.0":
+        assert llm.call_args.kwargs["lora_target_modules"] == ["0"]
+        assert llm.call_args.kwargs["max_loras"] == 1
+        engine.llm.sleep.assert_called_once_with(level=1)
+    else:
+        assert "enable_lora" not in llm.call_args.kwargs
+        engine.llm.sleep.assert_called_once_with(level=2)
 
 
 @pytest.mark.parametrize("failure", ["save", "load", "retire"])

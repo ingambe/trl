@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from accelerate.utils import broadcast_object_list, gather_object, is_peft_model
+from packaging.version import Version
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, is_bitsandbytes_available
@@ -42,6 +43,7 @@ from .vllm_client import VLLMClient
 
 if is_vllm_available():
     from vllm import LLM, RequestOutput, SamplingParams
+    from vllm import __version__ as vllm_version
     from vllm.lora.request import LoRARequest
     from vllm.sampling_params import StructuredOutputsParams
 
@@ -298,7 +300,13 @@ class VLLMGeneration:
 
         # Native adapter publication currently covers unsharded, single-GPU LoRA. Other PEFT configurations keep
         # the merged export path, including DoRA, trained biases and modules_to_save, which vLLM cannot load as LoRA.
-        if mode == "colocate" and accelerator.num_processes == 1 and is_peft_model(model):
+        if (
+            mode == "colocate"
+            and accelerator.num_processes == 1
+            and is_peft_model(model)
+            and is_vllm_available()
+            and Version(vllm_version) >= Version("0.22.0")
+        ):
             from peft import LoraConfig
             from peft.tuners.tuners_utils import BaseTunerLayer
 
@@ -394,6 +402,13 @@ class VLLMGeneration:
                     "max_lora_rank": max(16, 2 ** (self._lora_config.r - 1).bit_length()),
                     "max_loras": 1,
                     "max_cpu_loras": 2,
+                    # PEFT may select individual layers; suffixes keep all those targets eligible while avoiding
+                    # LoRA kernels on unrelated projections. Regex targets retain vLLM's unrestricted selection.
+                    "lora_target_modules": sorted(
+                        {name.rsplit(".", 1)[-1] for name in self._lora_config.target_modules}
+                    )
+                    if not isinstance(self._lora_config.target_modules, str)
+                    else None,
                 }
             else:
                 self._lora_config = None
