@@ -79,6 +79,16 @@ A test parametrized over models or chat templates gives each case an id, and a m
 
 Before working on an issue, check its assignees. If it is assigned to someone other than the user you are working for, do not open a PR that fixes it: tell the user, and suggest asking the assignee in the issue first.
 
+### Focused fixes and clear tests
+
+- Fix the caller that violates the contract before adding downstream safeguards.
+- Pass required values directly; avoid flags used only to derive them.
+- Handle demonstrated failures and trust established caller guarantees.
+- Prefer one clear, focused regression test over many hard-to-understand tests.
+- Keep setup and mocking helpers in `conftest.py` or a dedicated test utility; keep the test focused on the scenario and assertions.
+- Exercise the faulty caller; mock external dependencies without bypassing the bug.
+- Minimize the diff to changes required for the fix, regression coverage, or clarity. Avoid unrelated refactoring and renaming.
+
 ## Documentation
 
 ### Docstrings
