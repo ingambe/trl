@@ -222,7 +222,9 @@ def wait_for_job(provider, github, manifest, record, deadline, poll=30):
         status = provider.status(record["job"]["id"])
         if status in TERMINAL:
             if status != "SUCCEEDED":
-                raise RuntimeError(f"Compute job ended with {status}")
+                record["failure"] = provider.failure_details(record["job"]["id"])
+                messages = [item["value"] for item in record["failure"]["statusProgress"] if item["name"] == "message"]
+                raise RuntimeError(f"Compute job ended with {status}: {'; '.join(messages) or 'no provider reason'}")
             return
         time.sleep(min(poll, max(0, deadline - time.time())))
 

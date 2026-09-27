@@ -213,6 +213,16 @@ class HyperAI:
             {"userId": self.party, "jobId": job_id},
         )["job"]["status"]
 
+    def failure_details(self, job_id):
+        return self.query(
+            """query($userId: String!, $jobId: String!) {
+              job(userId: $userId, jobId: $jobId) {
+                status subStatus statusProgress { name value } startedAt endAt
+              }
+            }""",
+            {"userId": self.party, "jobId": job_id},
+        )["job"]
+
     def cancel(self, job_id):
         self.query(
             """mutation($userId: String!, $jobId: String!) {
