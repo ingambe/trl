@@ -119,6 +119,7 @@ def policy_parity(trainer, histories, side, seed):
                 actual = dense(logprobs[0][0], token_ids[0][0])
                 record(f"{stage}_turn{turn}", reference, actual)
                 record(f"{stage}_turn{turn}_local_after_sync", local(), actual)
+        record(stage + "_local_policy_drift", reference, local())
         deltas = [
             (param - frozen[name]).abs().float().max().item()
             for name, param in engine.model.named_parameters()

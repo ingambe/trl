@@ -270,7 +270,10 @@ full-vocabulary vLLM probabilities against the local model on an identical fixed
 nonzero merged LoRA adapters, and a second adapter update across four turns, clearing the prefix cache before the
 fourth. Adapter initialization and updates use independent fixed seeds. A negative control deliberately skips an
 adapter sync, measures the discrepancy, then synchronizes and measures recovery. Frozen-weight drift is recorded
-separately because BF16 merge/unmerge can change the local model itself.
+separately because BF16 merge/unmerge can change the local model itself. The candidate must report exactly zero
+frozen-weight drift and zero local-policy total variation after both LoRA stages; missing measurements fail the gate.
+The baseline may retain the known rounding defect. CPU backup/restoration adds real transfer work during adapter
+exports; the dense rollout profile does not measure that cost.
 
 The result includes total variation, KL and Jensen–Shannon divergence, top tokens, and the exact input tokens.
 `SIDE-SEED-policy-distributions.npz` artifacts preserve the full log probabilities. Every rollout workload also

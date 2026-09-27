@@ -156,3 +156,32 @@ def test_transfer_reduction_alone_is_not_a_rollout_speedup(rollout_measurements)
     for record in result["records"]:
         record["rollout_seconds"] = 10.0
     assert comparison.compare(result, manifest)["outcome"] == "no_regression"
+
+
+@pytest.mark.parametrize("damage", [None, "weights", "policy", "missing"])
+def test_merged_export_must_preserve_head_policy(rollout_measurements, damage):
+    manifest, result = rollout_measurements
+    manifest["workload"]["policy_parity"] = True
+    for record in result["records"]:
+        # A baseline with the known defect may drift; the candidate must preserve its own training policy.
+        drift = 0.0 if record["side"] == "head" else 0.01
+        record["policy_parity"] = [
+            item
+            for stage in ("lora", "updated_lora")
+            for item in (
+                {"label": stage + "_frozen_weight_drift", "max_abs": drift},
+                {"label": stage + "_local_policy_drift", "total_variation": drift},
+            )
+        ]
+    head = result["records"][1]["policy_parity"]
+    if damage == "weights":
+        head[0]["max_abs"] = 0.001953125
+    elif damage == "policy":
+        head[1]["total_variation"] = 0.01
+    elif damage == "missing":
+        head.pop()
+    if damage is None:
+        assert comparison.compare(result, manifest)["outcome"] == "improved"
+    else:
+        with pytest.raises(ValueError, match="training policy"):
+            comparison.compare(result, manifest)

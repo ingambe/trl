@@ -63,6 +63,13 @@ def compare(result, manifest):
                 raise ValueError("Head synchronized more than once per rollout phase")
             if not record["output_sha256"] or record["output_sha256"] != indexed["base", seed]["output_sha256"]:
                 raise ValueError("Base/head rollout tokens differ")
+        if config.get("policy_parity") and side == "head":
+            parity = {item["label"]: item for item in record["policy_parity"]}
+            for stage in ("lora", "updated_lora"):
+                weight_drift = parity.get(stage + "_frozen_weight_drift", {}).get("max_abs")
+                policy_drift = parity.get(stage + "_local_policy_drift", {}).get("total_variation")
+                if weight_drift != 0.0 or policy_drift != 0.0:
+                    raise ValueError("Adapter export changed the head training policy or lacks drift measurements")
         environments.append(record["environment"])
     if any(env != environments[0] for env in environments):
         raise ValueError("GPU or dependency environment differs between runs")

@@ -299,5 +299,9 @@ finalization, and prefix-cache reset succeed. A failed update leaves the server 
 and re-export the complete policy before resuming inference. Catching an individual transfer exception inside a
 grouped `weight_update()` does not make that partial update publishable.
 
-This cleanup restores the unmerged adapter state. It does not eliminate floating-point rounding from merging and
-unmerging low-precision weights.
+The export saves exact CPU copies of the adapted base parameters, including biases, and restores those values after
+unmerging. Repeated exports therefore do not accumulate BF16 rounding drift in the training policy, including on
+failure or generator close. The copies live only for the export and avoid duplicating the adapted weights on the GPU,
+but require host memory and device-to-host/host-to-device transfers proportional to the adapted base parameters.
+This restoration does not make merged BF16 inference numerically identical to an unmerged adapter forward: the two
+forms still use different arithmetic.

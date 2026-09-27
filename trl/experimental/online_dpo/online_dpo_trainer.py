@@ -815,6 +815,16 @@ class OnlineDPOTrainer(_BaseTrainer):
             # merging adapters in a sharded manner is not supported.
             # TODO: does this work with FSDP?
             with gather_if_zero3(list(self.model.parameters())):
+                from peft.tuners.tuners_utils import BaseTunerLayer
+
+                # Unmerging subtracts a rounded delta and cannot recover the original training weights.
+                # Keep exact CPU copies of adapted base parameters to avoid a second model copy on the GPU.
+                base_parameters = {
+                    param: param.detach().to(device="cpu", copy=True)
+                    for module in self.model.modules()
+                    if isinstance(module, BaseTunerLayer)
+                    for param in module.get_base_layer().parameters()
+                }
                 try:
                     self.model.merge_adapter()
 
@@ -850,7 +860,11 @@ class OnlineDPOTrainer(_BaseTrainer):
                                 llm_model.load_weights([(name, param.data)])
                 finally:
                     # Unmerge adapters while parameters are still gathered, including after a failed transfer.
-                    self.model.unmerge_adapter()
+                    try:
+                        self.model.unmerge_adapter()
+                    finally:
+                        for param, original in base_parameters.items():
+                            param.data.copy_(original)
                 # Parameters will automatically be repartitioned when exiting the context
         else:
             # For non-PEFT models, simply gather (if needed) and update each parameter individually.
