@@ -69,6 +69,16 @@ Tests exercise real objects: a tiny model from `trl-internal-testing`, a real to
 
 There are no `slow` tests: use tiny models, and put tests that need several GPUs in `tests/distributed`. Tests that need an optional dependency or specific hardware are gated by the `require_*` decorators in `tests/testing_utils.py`, so they skip where they cannot run.
 
+### Focused fixes and clear tests
+
+- Fix the caller that violates the contract before adding downstream safeguards.
+- Pass required values directly; avoid flags used only to derive them.
+- Handle demonstrated failures and trust established caller guarantees.
+- Prefer one clear, focused regression test over many hard-to-understand tests.
+- Keep setup and mocking helpers in `conftest.py` or a dedicated test utility; keep the test focused on the scenario and assertions.
+- Exercise the faulty caller; mock external dependencies without bypassing the bug.
+- Minimize the diff to changes required for the fix, regression coverage, or clarity. Avoid unrelated refactoring and renaming.
+
 ## Documentation
 
 ### Docstrings
