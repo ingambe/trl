@@ -128,21 +128,6 @@ def test_failure_releases_memory_and_next_phase_can_retry(generation, failure):
     assert generation.llm.sleep.call_count == 2
 
 
-def test_failed_merged_adapter_transfer_unmerges_before_handoff(generation, monkeypatch):
-    generation.model.merge_adapter = Mock()
-    generation.model.unmerge_adapter = Mock()
-    generation.model.prefix = "lora_"
-    monkeypatch.setattr("trl.generation.vllm_generation.is_peft_model", lambda model: True)
-    loader = generation.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights
-    loader.side_effect = RuntimeError("failed")
-    with pytest.raises(RuntimeError, match="failed"), generation.rollout_phase():
-        generate(generation)
-    generation.model.merge_adapter.assert_called_once()
-    generation.model.unmerge_adapter.assert_called_once()
-    assert generation._weights_dirty
-    generation.llm.sleep.assert_called_once_with(level=2)
-
-
 def test_grpo_custom_rollout_owns_phase_and_cleans_up(generation, make_grpo_trainer):
     trainer = make_grpo_trainer(use_vllm=True)
     trainer.vllm_generation = generation
@@ -215,23 +200,197 @@ def test_grpo_builtin_tool_loop_shares_initial_phase(generation, server_tool_tra
     generation.llm.sleep.assert_called_once_with(level=2)
 
 
-def test_online_dpo_merged_adapter_transfer_has_matching_cleanup(generation, monkeypatch):
+@pytest.fixture
+def peft_generation(generation):
+    from contextlib import contextmanager
+
+    peft = pytest.importorskip("peft")
+    from peft.tuners.tuners_utils import BaseTunerLayer
+
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4))
+    model = peft.get_peft_model(model, peft.LoraConfig(r=2, lora_alpha=2, target_modules=["0", "1"]))
+    # Exactly representable nonzero weights isolate cleanup from the separate BF16 rounding issue.
+    with torch.no_grad():
+        for param in model.parameters():
+            param.fill_(0.125)
+    generation.model = model
+    generation.adapter_layers = [module for module in model.modules() if isinstance(module, BaseTunerLayer)]
+    generation.training_state = {name: value.clone() for name, value in model.state_dict().items()}
+    generation.gather_exits = []
+
+    @contextmanager
+    def gather(params):
+        try:
+            yield
+        finally:
+            assert not any(layer.merged for layer in generation.adapter_layers)
+            generation.gather_exits.append(True)
+
+    generation._dist.gather_params = gather
+    return generation
+
+
+def assert_adapter_restored(engine):
+    assert not any(layer.merged for layer in engine.adapter_layers)
+    for name, value in engine.model.state_dict().items():
+        torch.testing.assert_close(value, engine.training_state[name], rtol=0, atol=0)
+    assert engine.gather_exits
+
+
+def test_closing_real_peft_export_unmerges_inside_gather(peft_generation):
+    engine = peft_generation
+    params = engine._iter_named_params()
+    next(params)
+    assert all(layer.merged for layer in engine.adapter_layers)
+    params.close()
+    assert_adapter_restored(engine)
+
+
+@pytest.mark.parametrize("sleep", [False, True])
+@pytest.mark.parametrize("failure", ["merge", "before", "during", "after", "cleanup"])
+def test_real_peft_failed_export_cannot_generate_until_complete_retry(peft_generation, monkeypatch, sleep, failure):
+    engine = peft_generation
+    engine.enable_sleep_mode = sleep
+    engine._llm_weights_sleeping = sleep
+    engine._kv_cache_sleeping = sleep
+    expected = {name: value.clone() for name, value in engine._iter_named_params()}
+    loader = engine.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights
+    published = {}
+    calls = 0
+
+    def load(weights):
+        nonlocal calls
+        calls += 1
+        if failure == "before":
+            raise RuntimeError("export failed")
+        for name, value in weights:
+            published[name] = value.clone()
+        if (failure == "during" and calls == 2) or (failure == "after" and len(published) == len(expected)):
+            raise RuntimeError("export failed")
+
+    loader.side_effect = load
+    original_merge = engine.model.merge_adapter
+    original_unmerge = engine.model.unmerge_adapter
+    if failure == "merge":
+
+        def merge():
+            engine.adapter_layers[0].merge()
+            raise RuntimeError("export failed")
+
+        monkeypatch.setattr(engine.model, "merge_adapter", merge)
+    elif failure == "cleanup":
+
+        def unmerge():
+            original_unmerge()
+            raise RuntimeError("export failed")
+
+        monkeypatch.setattr(engine.model, "unmerge_adapter", unmerge)
+
+    for _ in range(2):
+        calls = 0
+        with pytest.raises(RuntimeError, match="export failed"):
+            generate(engine)
+        assert_adapter_restored(engine)
+        assert engine._weights_dirty
+        engine.llm.generate.assert_not_called()
+
+    monkeypatch.setattr(engine.model, "merge_adapter", original_merge)
+    monkeypatch.setattr(engine.model, "unmerge_adapter", original_unmerge)
+    loader.side_effect = lambda weights: published.update((name, value.clone()) for name, value in weights)
+    generate(engine)
+    assert_adapter_restored(engine)
+    assert not engine._weights_dirty
+    engine.llm.generate.assert_called_once()
+    assert published.keys() == expected.keys()
+    for name in expected:
+        torch.testing.assert_close(published[name], expected[name], rtol=0, atol=0)
+
+
+def test_server_failed_export_retries_before_generation(peft_generation):
+    engine = peft_generation
+    engine.mode = "server"
+    engine._weight_metadata = None
+    retained = []
+
+    def transfer(metadata, params):
+        retained.append(params)  # Retaining the iterator must not delay unmerge until garbage collection.
+        next(params)
+        raise RuntimeError("export failed")
+
+    engine.vllm_client = SimpleNamespace(
+        weight_update=nullcontext, update_named_params=transfer, generate=Mock(), reset_prefix_cache=Mock()
+    )
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="export failed"):
+            generate(engine)
+        assert_adapter_restored(engine)
+        assert engine._weights_dirty
+        engine.vllm_client.generate.assert_not_called()
+    assert all(params.gi_frame is None for params in retained)
+
+
+@pytest.mark.parametrize("failure", ["merge", "before", "during", "after"])
+def test_async_merged_failure_restores_adapters_without_publishing(peft_generation, monkeypatch, failure):
+    from accelerate import PartialState
+
+    from trl.experimental.async_grpo import AsyncGRPOTrainer
+
+    PartialState(cpu=True)
+    engine = peft_generation
+    trainer = object.__new__(AsyncGRPOTrainer)
+    trainer.model = engine.model
+    trainer.accelerator = SimpleNamespace(
+        unwrap_model=lambda model: model, device=torch.device("cpu"), is_main_process=True, wait_for_everyone=Mock()
+    )
+    trainer.model_version = 7
+    trainer.rollout_worker = Mock()
+    trainer.weight_transfer = Mock()
+
+    if failure == "merge":
+
+        def merge():
+            engine.adapter_layers[0].merge()
+            raise RuntimeError("export failed")
+
+        monkeypatch.setattr(engine.model, "merge_adapter", merge)
+
+    def send(params):
+        assert all(layer.merged for layer in engine.adapter_layers)
+        if failure == "during":
+            next(params)
+        elif failure == "after":
+            list(params)
+        raise RuntimeError("export failed")
+
+    trainer.weight_transfer.send_weights.side_effect = send
+    with pytest.raises(RuntimeError, match="export failed"):
+        trainer._sync_weight_merged(0.0)
+    assert not any(layer.merged for layer in engine.adapter_layers)
+    for name, value in engine.model.state_dict().items():
+        torch.testing.assert_close(value, engine.training_state[name], rtol=0, atol=0)
+    trainer.weight_transfer.pause.assert_called_once()
+    trainer.weight_transfer.resume.assert_not_called()
+    trainer.rollout_worker.update_model_version.assert_not_called()
+    assert trainer.model_version == 7
+
+
+def test_online_dpo_failed_export_invalidates_step_and_cache(peft_generation):
     from trl.experimental.online_dpo import OnlineDPOTrainer
 
+    engine = peft_generation
     trainer = object.__new__(OnlineDPOTrainer)
+    trainer.model = engine.model
     trainer.accelerator = SimpleNamespace(state=SimpleNamespace(deepspeed_plugin=None), is_main_process=True)
     trainer.is_fsdp_enabled = False
-    trainer.model = generation.model
-    trainer.model.prefix = "lora_"
-    trainer.model.merge_adapter = Mock()
-    trainer.model.unmerge_adapter = Mock()
     trainer.vllm_mode = "colocate"
-    trainer.llm = generation.llm
-    monkeypatch.setattr("trl.experimental.online_dpo.online_dpo_trainer.is_peft_model", lambda model: True)
-    trainer.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights.side_effect = RuntimeError(
-        "failed"
-    )
-    with pytest.raises(RuntimeError, match="failed"):
-        trainer._move_model_to_vllm_inner()
-    trainer.model.merge_adapter.assert_called_once()
-    trainer.model.unmerge_adapter.assert_called_once()
+    trainer.llm = engine.llm
+    trainer._last_loaded_step = 3
+    loader = trainer.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights
+    loader.side_effect = RuntimeError("export failed")
+    with pytest.raises(RuntimeError, match="export failed"):
+        trainer._move_model_to_vllm()
+    assert trainer._last_loaded_step == -1
+    assert trainer.llm.mock_calls[0] == call.reset_prefix_cache()
+    assert not any(layer.merged for layer in engine.adapter_layers)
+    for name, value in engine.model.state_dict().items():
+        torch.testing.assert_close(value, engine.training_state[name], rtol=0, atol=0)

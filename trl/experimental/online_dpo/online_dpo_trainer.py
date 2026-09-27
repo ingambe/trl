@@ -785,6 +785,11 @@ class OnlineDPOTrainer(_BaseTrainer):
                 llm_model.load_weights([(name, param)])
 
     def _move_model_to_vllm(self):
+        # A partial export must force a complete retry, even if the training step has not changed.
+        self._last_loaded_step = -1
+        if self.vllm_mode == "colocate":
+            # Invalidate policy-dependent KV before changing any weights, including a failed partial update.
+            self.llm.reset_prefix_cache()
         if self.vllm_mode == "server" and self.accelerator.is_main_process:
             # Announce one weight update for the whole model: the server prepares and finalizes it once, rather than
             # once per tensor pushed below. Only the main process holds a client; the other ranks only take part in
@@ -793,12 +798,6 @@ class OnlineDPOTrainer(_BaseTrainer):
                 self._move_model_to_vllm_inner()
         else:
             self._move_model_to_vllm_inner()
-
-        # Reset cache on vLLM
-        if self.vllm_mode == "server" and self.accelerator.is_main_process:
-            self.vllm_client.reset_prefix_cache()
-        elif self.vllm_mode == "colocate":
-            self.llm.reset_prefix_cache()
 
     def _move_model_to_vllm_inner(self):
         # For DeepSpeed ZeRO-3 and FSDP, we need to gather all parameters before operations

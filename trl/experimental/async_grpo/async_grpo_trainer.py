@@ -1718,9 +1718,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
         logger.info(f"Weight sync: transferring weights... (barrier took {t_barrier - t_pause:.1f}s)")
         # vLLM only knows the base checkpoint's parameters, so the adapter is folded into them for the send. The
         # `finally` is not optional: leaving it merged would train merged weights from the next step on.
-        if is_peft_model(model):
-            model.merge_adapter()
         try:
+            if is_peft_model(model):
+                model.merge_adapter()
             if self.accelerator.is_main_process and self.weight_transfer:
                 self.weight_transfer.send_weights(self._streaming_iter())
             else:

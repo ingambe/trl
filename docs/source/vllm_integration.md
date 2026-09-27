@@ -287,3 +287,17 @@ Keep this handoff outside rank-dependent tool dispatch so all ranks restore weig
 handoff. Standalone calls to `VLLMGeneration.generate` still release memory on return; callers running several turns
 outside GRPO can group them with `with generation.rollout_phase():`. Custom rollouts must use these lifecycle methods
 rather than calling the underlying `llm.sleep()` directly, which bypasses residency tracking.
+
+### Failed merged-adapter exports
+
+Merged PEFT exports unmerge adapters before leaving the gathered-parameter context, including when a transfer raises
+or its parameter generator is closed. A failed export does not mark the inference policy as ready. Colocated
+generation requires a complete successful re-export before it can continue, whether sleep mode is enabled or not.
+
+Server weight updates pause inference before transferring tensors and resume only after export, adapter cleanup,
+finalization, and prefix-cache reset succeed. A failed update leaves the server paused; recover the failed transport
+and re-export the complete policy before resuming inference. Catching an individual transfer exception inside a
+grouped `weight_update()` does not make that partial update publishable.
+
+This cleanup restores the unmerged adapter state. It does not eliminate floating-point rounding from merging and
+unmerging low-precision weights.

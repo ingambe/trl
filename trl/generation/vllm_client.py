@@ -20,9 +20,9 @@ import math
 import socket
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from io import BytesIO
 from urllib.parse import urlparse
 
@@ -755,7 +755,8 @@ class VLLMClient:
         """
         Groups several [`~generation.vllm_client.VLLMClient.update_named_param`] calls into a single weight update.
 
-        The server prepares the model once on entry and finalizes it once on exit, instead of doing it per tensor.
+        The server pauses and prepares the model once on entry. It finalizes, clears cached KV, and resumes only after
+        the entire update succeeds. A failed update leaves inference paused until a complete re-export succeeds.
 
         Examples:
 
@@ -765,13 +766,19 @@ class VLLMClient:
         ...         client.update_named_param(name, param.data)
         ```
         """
+        self._post(f"{self.base_url}/pause", params={"mode": "abort"})
         self._start_weight_update()
         self._updating_weights = True
+        self._weight_update_failed = False
         try:
             yield
+            if self._weight_update_failed:
+                raise RuntimeError("Weight update failed; the server remains paused. Re-export the complete policy.")
+            self._finish_weight_update()
+            self.reset_prefix_cache()
+            self._post(f"{self.base_url}/resume")
         finally:
             self._updating_weights = False
-            self._finish_weight_update()
 
     def _start_weight_update(self):
         if _HAS_WEIGHT_UPDATE_LIFECYCLE:
@@ -815,24 +822,33 @@ class VLLMClient:
         if not _HAS_STATEFUL_TRAINER_ENGINE:
             update_info["packed"] = True
 
-        if not self._updating_weights:
-            self._start_weight_update()
         # The workers block in the NCCL receive while handling the request, so it must run concurrently with the
         # trainer-side broadcast.
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self._post, f"{self.base_url}/update_weights", json={"update_info": update_info})
-            if _HAS_STATEFUL_TRAINER_ENGINE:
-                packed_nccl_broadcast_producer(
-                    iterator=named_params, group=self.communicator, src=0, post_iter_func=lambda item: item[1]
-                )
-            else:
-                NCCLWeightTransferEngine.trainer_send_weights(
-                    iterator=named_params,
-                    trainer_args=NCCLTrainerSendWeightsArgs(group=self.communicator, packed=True),
-                )
-            future.result()
-        if not self._updating_weights:
-            self._finish_weight_update()
+        with self.weight_update() if not self._updating_weights else nullcontext():
+            try:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    # Close an interrupted exporter before waiting for a receiver that may still be blocked in NCCL.
+                    with closing(named_params) if isinstance(named_params, Generator) else nullcontext():
+                        future = executor.submit(
+                            self._post, f"{self.base_url}/update_weights", json={"update_info": update_info}
+                        )
+                        if _HAS_STATEFUL_TRAINER_ENGINE:
+                            packed_nccl_broadcast_producer(
+                                iterator=named_params,
+                                group=self.communicator,
+                                src=0,
+                                post_iter_func=lambda item: item[1],
+                            )
+                        else:
+                            NCCLWeightTransferEngine.trainer_send_weights(
+                                iterator=named_params,
+                                trainer_args=NCCLTrainerSendWeightsArgs(group=self.communicator, packed=True),
+                            )
+                        future.result()
+            except BaseException:
+                # A caller catching a failed tensor transfer inside a grouped update cannot publish that group.
+                self._weight_update_failed = True
+                raise
 
     def update_model_params(self, model: nn.Module):
         """
@@ -853,7 +869,8 @@ class VLLMClient:
         Resets the prefix cache for the model.
         """
         if _HAS_RESET_PREFIX_CACHE_SUCCESS:
-            self._post(f"{self.base_url}/reset_prefix_cache")
+            if not self._post(f"{self.base_url}/reset_prefix_cache")["success"]:
+                raise RuntimeError("vLLM failed to reset the prefix cache.")
         else:
             response = self.session.post(f"{self.base_url}/reset_prefix_cache")
             if response.status_code != 200:

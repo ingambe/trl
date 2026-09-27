@@ -502,14 +502,16 @@ class VLLMGeneration:
             # The server must know every tensor it is about to receive before the first one is broadcast, so the
             # parameters are walked once to collect their metadata, and streamed on subsequent passes.
             if self._weight_metadata is None:
-                self._weight_metadata = [
-                    (name, str(param.dtype).removeprefix("torch."), list(param.shape))
-                    for name, param in self._iter_named_params()
-                ]
-            with closing(self._iter_named_params()) as params:
-                if accelerator.is_main_process:
+                with closing(self._iter_named_params()) as params:
+                    self._weight_metadata = [
+                        (name, str(param.dtype).removeprefix("torch."), list(param.shape)) for name, param in params
+                    ]
+            if accelerator.is_main_process:
+                # Publish only after the exporter has unmerged adapters and released gathered parameters.
+                with self.vllm_client.weight_update(), closing(self._iter_named_params()) as params:
                     self.vllm_client.update_named_params(self._weight_metadata, params)
-                else:
+            else:
+                with closing(self._iter_named_params()) as params:
                     for _ in params:  # take part in the gather collectives
                         pass
         elif self.mode == "colocate":
@@ -519,9 +521,6 @@ class VLLMGeneration:
                 for name, param in params:
                     self.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights([(name, param)])
 
-        # Reset cache on vLLM
-        if self.mode == "server" and accelerator.is_main_process:
-            self.vllm_client.reset_prefix_cache()
         self._weights_dirty = False
 
     @contextmanager
@@ -624,10 +623,9 @@ class VLLMGeneration:
             # Sleep level 2 discards the weights, so waking up isn't enough: they must be re-pushed from the training
             # model. vLLM's `reload_weights` can't be used here, as it reloads the initial checkpoint from disk rather
             # than the current training weights. See https://github.com/vllm-project/vllm/issues/29341
-            if (
-                self.mode == "colocate"
-                and self.enable_sleep_mode
-                and (self._weights_dirty or self._llm_weights_sleeping)
+            # A failed export also requires a complete retry, in every mode, before inference is allowed.
+            if self._weights_dirty or (
+                self.mode == "colocate" and self.enable_sleep_mode and self._llm_weights_sleeping
             ):
                 self.sync_weights()
 
