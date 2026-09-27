@@ -63,6 +63,16 @@ Concretely:
 - Avoid `hasattr` and `getattr`. Their use is almost always a symptom of overly defensive programming or a disguised version check (e.g., "this attribute was added in version X"). Instead, either drop the conditional entirely or express the version check explicitly with a version comparison. There is nearly always a cleaner alternative.
 - When in doubt, prefer less code. Every new function, parameter, or branch is maintenance burden. The best abstraction is often no abstraction.
 
+### Focused fixes and clear tests
+
+- Fix the caller that violates the contract before adding downstream safeguards.
+- Pass required values directly; avoid flags used only to derive them.
+- Handle demonstrated failures and trust established caller guarantees.
+- Prefer one clear, focused regression test over many hard-to-understand tests.
+- Keep setup and mocking helpers in `conftest.py` or a dedicated test utility; keep the test focused on the scenario and assertions.
+- Exercise the faulty caller; mock external dependencies without bypassing the bug.
+- Minimize the diff to changes required for the fix, regression coverage, or clarity. Avoid unrelated refactoring and renaming.
+
 ## Documentation
 
 ### Docstrings
