@@ -26,7 +26,15 @@ from environment import environment_spec
 
 
 TERMINAL = {"SUCCEEDED", "FAILED", "CANCELLED"}
-BUNDLE_FILES = ("job.py", "workload.py", "environment.py", "requirements-gpu.txt", "manifest.json")
+BUNDLE_FILES = (
+    "job.py",
+    "workload.py",
+    "rollout_workload.py",
+    "environment.py",
+    "profiling.py",
+    "requirements-gpu.txt",
+    "manifest.json",
+)
 
 
 class HyperAI:
@@ -109,6 +117,8 @@ class HyperAI:
             )["createProject"]["id"]
 
     def validate(self, manifest):
+        if manifest["resource"] != self.resource:
+            raise ValueError("Provider resource differs from the immutable benchmark request")
         inventory = self.inventory()
         selected = [r for r in inventory["resources"] if r["name"] == self.resource]
         if not selected:
@@ -203,6 +213,16 @@ class HyperAI:
             {"userId": self.party, "jobId": job_id},
         )["job"]["status"]
 
+    def failure_details(self, job_id):
+        return self.query(
+            """query($userId: String!, $jobId: String!) {
+              job(userId: $userId, jobId: $jobId) {
+                status subStatus statusProgress { name value } startedAt endAt
+              }
+            }""",
+            {"userId": self.party, "jobId": job_id},
+        )["job"]
+
     def cancel(self, job_id):
         self.query(
             """mutation($userId: String!, $jobId: String!) {
@@ -227,3 +247,22 @@ class HyperAI:
                 if len(content) > 10_000_000:
                     raise ValueError("Benchmark output exceeds the 10 MB limit")
         return json.loads(content)
+
+    def download_profile(self, job_id, side, destination):
+        if side not in {"base", "head"}:
+            raise ValueError("Invalid profile side")
+        output = self.query(
+            """mutation($userId: String!, $jobId: String!, $key: String!) {
+              createJobOutputDownloadUrl(userId: $userId, jobId: $jobId, key: $key) { url type name }
+            }""",
+            {"userId": self.party, "jobId": job_id, "key": f"{side}-profile.zip"},
+        )["createJobOutputDownloadUrl"]
+        with requests.get(output["url"], stream=True, timeout=60) as response:
+            response.raise_for_status()
+            size = 0
+            with destination.open("wb") as stream:
+                for chunk in response.iter_content(65536):
+                    size += len(chunk)
+                    if size > 256_000_000:
+                        raise ValueError("Profiler archive exceeds 256 MB")
+                    stream.write(chunk)
