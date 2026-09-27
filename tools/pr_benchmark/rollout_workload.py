@@ -47,6 +47,7 @@ def policy_parity(trainer, histories, side, seed):
     engine.max_completion_length = 1
     engine.logprobs = -1
     engine.generation_kwargs = {}
+    lora_b = [param for name, param in engine.model.named_parameters() if "lora_B" in name]
     records, arrays = [], {}
     ids = torch.tensor(histories[0], device="cuda").unsqueeze(0)
 
@@ -81,29 +82,25 @@ def policy_parity(trainer, histories, side, seed):
         print(json.dumps(metrics), flush=True)  # noqa: T201
 
     def raw():
-        out = (
-            engine.llm.generate(
-                [{"prompt_token_ids": histories[0]}],
-                SamplingParams(temperature=1.0, top_p=1.0, top_k=-1, max_tokens=1, logprobs=-1),
-                use_tqdm=False,
-                **({"lora_request": engine._lora_request} if native_lora else {}),
-            )[0]
-            .outputs[0]
-            .logprobs[0]
+        outputs = engine.llm.generate(
+            [{"prompt_token_ids": histories[0]}],
+            SamplingParams(temperature=1.0, top_p=1.0, top_k=-1, max_tokens=1, logprobs=-1),
+            use_tqdm=False,
+            **({"lora_request": engine._lora_request} if native_lora else {}),
         )
-        return dense([item.logprob for item in out.values()], list(out))
+        logprobs = outputs[0].outputs[0].logprobs[0]
+        return dense([item.logprob for item in logprobs.values()], list(logprobs))
 
     for stage_index, stage in enumerate(("dense", "lora", "updated_lora")):
         # Both sides retain the same initialized A matrices from the timed model. Recreating only the merged
         # side's adapter would make cross-backend distribution comparisons use different policies.
         generator = torch.Generator(device="cuda").manual_seed(seed + stage_index)
         with torch.no_grad():
-            for name, param in engine.model.named_parameters():
-                if "lora_B" in name:
-                    if stage == "dense":
-                        param.zero_()
-                    else:
-                        param.normal_(std=0.03 if stage == "lora" else 0.1, generator=generator)
+            for param in lora_b:
+                if stage == "dense":
+                    param.zero_()
+                else:
+                    param.normal_(std=0.03 if stage == "lora" else 0.1, generator=generator)
         reference = local()
         merged_reference = reference
         if stage != "dense":
@@ -155,16 +152,12 @@ def policy_parity(trainer, histories, side, seed):
     engine.sync_weights()
     engine.llm.wake_up(tags=["kv_cache"])
     try:
-        old = local()
-        old_vllm = raw()
-        record("negative_control_before_update", old, old_vllm)
+        record("negative_control_before_update", local(), raw())
         generator = torch.Generator(device="cuda").manual_seed(seed + 3)
         with torch.no_grad():
-            for name, param in engine.model.named_parameters():
-                if "lora_B" in name:
-                    param.normal_(std=0.3, generator=generator)
-        changed = local()
-        record("negative_control_missing_sync", changed, raw())
+            for param in lora_b:
+                param.normal_(std=0.3, generator=generator)
+        record("negative_control_missing_sync", local(), raw())
         engine.sync_weights()
         record("negative_control_after_sync", local(), raw())
     finally:
@@ -236,6 +229,7 @@ def main():
 
     from peft import LoraConfig
 
+    initialization_started = time.perf_counter()
     with patch.object(generation_module, "LLM", diagnostic_llm if config.get("policy_parity") else llm):
         trainer = GRPOTrainer(
             model=str(args.model_path),
@@ -265,12 +259,16 @@ def main():
             reward_funcs=lambda completions, **kwargs: [0.0] * len(completions),
             rollout_func=rollout,
         )
+    torch.cuda.synchronize()
+    initialization_seconds = time.perf_counter() - initialization_started
     engine = trainer.vllm_generation
+    # The same harness also runs revisions predating native adapter publication.
+    native_lora = "_lora_config" in dir(engine) and engine._lora_config is not None
+    lora_b = [param for name, param in trainer.model.named_parameters() if "lora_B" in name]
     generator = torch.Generator(device="cuda").manual_seed(args.seed + 1000)
     with torch.no_grad():
-        for name, param in trainer.model.named_parameters():
-            if "lora_B" in name:
-                param.normal_(std=0.01, generator=generator)
+        for param in lora_b:
+            param.normal_(std=0.01, generator=generator)
     frozen = {
         name: param.detach().cpu().clone()
         for name, param in trainer.model.named_parameters()
@@ -293,7 +291,7 @@ def main():
         counters["sync_count"] += 1
         return sync_weights()
 
-    if "_lora_config" in dir(engine) and engine._lora_config is not None:
+    if native_lora:
         add_lora = engine.llm.llm_engine.add_lora
 
         def counted_adapter(request):
@@ -324,9 +322,8 @@ def main():
             # A real update between phases must invalidate the previous policy's KV.
             with torch.no_grad():
                 if config["lora"]:
-                    for name, param in trainer.model.named_parameters():
-                        if "lora_B" in name:
-                            param.add_(0.001)
+                    for param in lora_b:
+                        param.add_(0.001)
                 else:
                     next(trainer.model.parameters()).add_(0.01)
             trainer.state.global_step = phase
@@ -345,13 +342,12 @@ def main():
             if profiler:
                 profiler.step()
     record = {
-        "publication": "native_lora"
-        if "_lora_config" in dir(engine) and engine._lora_config is not None
-        else "merged",
+        "publication": "native_lora" if native_lora else "merged",
         "side": args.side,
         "seed": args.seed,
         "sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=args.checkout, text=True).strip(),
         "steps": config["steps"],
+        "trainer_initialization_seconds": initialization_seconds,
         "rollout_seconds": sum(durations),
         "phase_seconds": durations,
         **counters,

@@ -249,8 +249,11 @@ match between base and head; the head must synchronize at most once per phase an
 `rollout_seconds` includes synchronization, generation, feedback, and sleep; initialization is excluded.
 
 For native LoRA publication, the workload counts the adapter tensors submitted to vLLM's adapter loader as well as
-any initial base-weight copy. It consumes full-weight exporters lazily. These are logical publication bytes, not total
+any base-weight copy performed during the measured phases. It consumes full-weight exporters lazily. These are logical publication bytes, not total
 device traffic: level-1 sleep also offloads/restores the frozen base, which is visible in the profiler's memory copies.
+Native initialization exports the current frozen base once as a sharded checkpoint for vLLM to load normally.
+The checkpoint stays in temporary storage for the engine lifetime; its disk writes and initial loading are outside
+rollout timing and included in `trainer_initialization_seconds` and `workload_seconds`.
 The result's `publication` field distinguishes native adapters from merged exports. The probability diagnostic passes
 the published adapter explicitly, including in the deliberately stale-policy control. Native LoRA and BF16-merged
 execution can produce different tokens; the existing exact-token gate still reports this as a failed comparison.

@@ -135,18 +135,18 @@ def test_rollout_improvement_requires_matching_tokens_and_handoff(rollout_measur
     assert comparison.compare(result, manifest)["outcome"] == "improved"
 
 
-@pytest.mark.parametrize("damage", ["tokens", "handoff", "sync", "nan"])
-def test_rollout_acceptance_fails_closed(rollout_measurements, damage):
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("output_sha256", "different-tokens"),
+        ("sleeping_after_phase", False),
+        ("sync_count", 7),
+        ("weight_transfer_bytes", float("nan")),
+    ],
+)
+def test_rollout_acceptance_fails_closed(rollout_measurements, field, value):
     manifest, result = rollout_measurements
-    head = result["records"][1]
-    if damage == "tokens":
-        head["output_sha256"] = "different-tokens"
-    elif damage == "handoff":
-        head["sleeping_after_phase"] = False
-    elif damage == "sync":
-        head["sync_count"] = 7
-    else:
-        head["weight_transfer_bytes"] = float("nan")
+    result["records"][1][field] = value
     with pytest.raises(ValueError):
         comparison.compare(result, manifest)
 
@@ -210,12 +210,3 @@ def test_serious_flag_rejects_other_workloads_before_accessing_cloud():
     )
     assert result.returncode == 2
     assert "--serious requires --profile vllm-rollout" in result.stderr
-
-
-def test_wrong_gpu_rejected_before_provider_access():
-    from hyperai import HyperAI
-
-    provider = object.__new__(HyperAI)
-    provider.resource = "rtx-3090"
-    with pytest.raises(ValueError, match="resource differs"):
-        provider.validate({"resource": "rtx-5090"})

@@ -826,25 +826,27 @@ class VLLMClient:
         # trainer-side broadcast.
         with self.weight_update() if not self._updating_weights else nullcontext():
             try:
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    # Close an interrupted exporter before waiting for a receiver that may still be blocked in NCCL.
-                    with closing(named_params) if isinstance(named_params, Generator) else nullcontext():
-                        future = executor.submit(
-                            self._post, f"{self.base_url}/update_weights", json={"update_info": update_info}
+                # Close an interrupted exporter before waiting for a receiver that may still be blocked in NCCL.
+                with (
+                    ThreadPoolExecutor(max_workers=1) as executor,
+                    closing(named_params) if isinstance(named_params, Generator) else nullcontext(),
+                ):
+                    future = executor.submit(
+                        self._post, f"{self.base_url}/update_weights", json={"update_info": update_info}
+                    )
+                    if _HAS_STATEFUL_TRAINER_ENGINE:
+                        packed_nccl_broadcast_producer(
+                            iterator=named_params,
+                            group=self.communicator,
+                            src=0,
+                            post_iter_func=lambda item: item[1],
                         )
-                        if _HAS_STATEFUL_TRAINER_ENGINE:
-                            packed_nccl_broadcast_producer(
-                                iterator=named_params,
-                                group=self.communicator,
-                                src=0,
-                                post_iter_func=lambda item: item[1],
-                            )
-                        else:
-                            NCCLWeightTransferEngine.trainer_send_weights(
-                                iterator=named_params,
-                                trainer_args=NCCLTrainerSendWeightsArgs(group=self.communicator, packed=True),
-                            )
-                        future.result()
+                    else:
+                        NCCLWeightTransferEngine.trainer_send_weights(
+                            iterator=named_params,
+                            trainer_args=NCCLTrainerSendWeightsArgs(group=self.communicator, packed=True),
+                        )
+                    future.result()
             except BaseException:
                 # A caller catching a failed tensor transfer inside a grouped update cannot publish that group.
                 self._weight_update_failed = True

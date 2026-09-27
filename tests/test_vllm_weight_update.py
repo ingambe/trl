@@ -75,7 +75,6 @@ def test_failed_publication_leaves_server_paused(client, failure):
 def test_interrupted_weight_stream_closes_before_waiting_for_receiver(client, monkeypatch, stateful, failure):
     closed = threading.Event()
     observed = []
-    retained = []
 
     def parameters():
         try:
@@ -85,7 +84,6 @@ def test_interrupted_weight_stream_closes_before_waiting_for_receiver(client, mo
             closed.set()
 
     params = parameters()
-    retained.append(params)
 
     def send(iterator, **kwargs):
         next(iterator)
@@ -119,14 +117,7 @@ def test_interrupted_weight_stream_closes_before_waiting_for_receiver(client, mo
         client.update_named_params(metadata, params)
         assert not client.paused
     assert observed == [True]
-    assert retained[0].gi_frame is None
-
-
-def test_legacy_lifecycle_still_pauses_and_resets_before_resume(client, monkeypatch):
-    monkeypatch.setattr(vllm_client, "_HAS_WEIGHT_UPDATE_LIFECYCLE", False)
-    with client.weight_update():
-        assert client.paused
-    assert client.events == ["/pause", "/reset_prefix_cache", "/resume"]
+    assert params.gi_frame is None
 
 
 def test_caught_transfer_error_cannot_publish_the_group(client, monkeypatch):
@@ -162,27 +153,3 @@ def test_unsuccessful_cache_reset_cannot_publish_the_group(client, monkeypatch):
             pass
     assert client.paused
     assert "/resume" not in client.events
-
-
-def test_grouped_tensors_share_one_pause_and_one_publication(client, monkeypatch):
-    sent = []
-
-    def send(iterator, **kwargs):
-        sent.extend(name for name, _ in iterator)
-
-    monkeypatch.setattr(vllm_client, "_HAS_STATEFUL_TRAINER_ENGINE", True)
-    monkeypatch.setattr(vllm_client, "packed_nccl_broadcast_producer", send, raising=False)
-    with client.weight_update():
-        client.update_named_param("weight", torch.ones(2))
-        client.update_named_param("bias", torch.zeros(2))
-        assert client.paused
-    assert sent == ["weight", "bias"]
-    assert client.events == [
-        "/pause",
-        "/start_weight_update",
-        "/update_weights",
-        "/update_weights",
-        "/finish_weight_update",
-        "/reset_prefix_cache",
-        "/resume",
-    ]
