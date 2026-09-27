@@ -59,6 +59,8 @@ def profile_run(tmp_path):
     events = [
         {"ph": "X", "cat": "user_annotation", "name": "ProfilerStep#1", "pid": 1, "tid": 1, "ts": 1000, "dur": 200}
     ]
+    # Newer PyTorch mirrors user ranges onto GPU tracks; these are not additional steps.
+    events.append({**events[0], "cat": "gpu_user_annotation", "pid": 0, "tid": 7})
     for i in range(4):
         memory = i % 2 == 0
         events += [

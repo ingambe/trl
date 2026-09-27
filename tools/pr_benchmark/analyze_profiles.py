@@ -64,7 +64,11 @@ def analyze(directory):
             events = json.load(stream)["traceEvents"]
         if not any(event.get("cat") == "kernel" for event in events):
             raise ValueError(f"{side} profile has no CUDA kernels; check CUPTI availability")
-        steps = [event for event in events if event.get("name", "").startswith("ProfilerStep#")]
+        steps = [
+            event
+            for event in events
+            if event.get("cat") == "user_annotation" and event.get("name", "").startswith("ProfilerStep#")
+        ]
         if len(steps) != metadata["active_steps"]:
             raise ValueError(f"{side} capture has an incomplete profiler step window")
         copies = {}
