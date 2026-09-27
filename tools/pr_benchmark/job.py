@@ -136,6 +136,9 @@ def run(environment):
     result["profiles"] = {}
     for side in ("base", "head"):
         run_child(side, config["seeds"][0], profile=True)
+        distributions = ROOT / f"{side}-{config['seeds'][0]}-policy-distributions.npz"
+        if distributions.exists():
+            shutil.copyfile(distributions, ROOT / f"{side}-profile/policy-distributions.npz")
         archive = Path(shutil.make_archive(str(ROOT / f"{side}-profile"), "zip", ROOT / f"{side}-profile"))
         result["profiles"][side] = {
             "file": archive.name,

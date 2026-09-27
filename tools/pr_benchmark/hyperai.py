@@ -117,6 +117,8 @@ class HyperAI:
             )["createProject"]["id"]
 
     def validate(self, manifest):
+        if manifest["resource"] != self.resource:
+            raise ValueError("Provider resource differs from the immutable benchmark request")
         inventory = self.inventory()
         selected = [r for r in inventory["resources"] if r["name"] == self.resource]
         if not selected:

@@ -185,3 +185,37 @@ def test_merged_export_must_preserve_head_policy(rollout_measurements, damage):
     else:
         with pytest.raises(ValueError, match="training policy"):
             comparison.compare(result, manifest)
+
+
+@pytest.mark.parametrize("drift", [0.001953125, None])
+def test_timed_lora_export_drift_cannot_pass(rollout_measurements, drift):
+    manifest, result = rollout_measurements
+    manifest["workload"]["lora"] = True
+    for record in result["records"]:
+        record["frozen_weight_max_abs_drift"] = 0.0
+    result["records"][-1]["frozen_weight_max_abs_drift"] = drift
+    with pytest.raises(ValueError, match="frozen training weights"):
+        comparison.compare(result, manifest)
+
+
+def test_serious_flag_rejects_other_workloads_before_accessing_cloud():
+    import subprocess
+
+    controller = Path(__file__).resolve().parents[1] / "controller.py"
+    result = subprocess.run(
+        [sys.executable, str(controller), "compare", "--profile", "smoke", "--serious"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "--serious requires --profile vllm-rollout" in result.stderr
+
+
+def test_wrong_gpu_rejected_before_provider_access():
+    from hyperai import HyperAI
+
+    provider = object.__new__(HyperAI)
+    provider.resource = "rtx-3090"
+    with pytest.raises(ValueError, match="resource differs"):
+        provider.validate({"resource": "rtx-5090"})

@@ -63,7 +63,9 @@ def compare(result, manifest):
                 raise ValueError("Head synchronized more than once per rollout phase")
             if not record["output_sha256"] or record["output_sha256"] != indexed["base", seed]["output_sha256"]:
                 raise ValueError("Base/head rollout tokens differ")
-        if config.get("policy_parity") and side == "head":
+        if config.get("lora") and side == "head" and record.get("frozen_weight_max_abs_drift") != 0.0:
+            raise ValueError("Timed adapter exports changed frozen training weights")
+        if config.get("policy_parity") and side == "head" and seed == config["seeds"][0]:
             parity = {item["label"]: item for item in record["policy_parity"]}
             for stage in ("lora", "updated_lora"):
                 weight_drift = parity.get(stage + "_frozen_weight_drift", {}).get("max_abs")

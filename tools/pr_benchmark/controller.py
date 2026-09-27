@@ -155,7 +155,7 @@ class GitHub:
         self.api(f"repos/{self.repo}/issues/{manifest['pr']}/comments", {"body": report})
 
 
-def manifest_for(github, pull, profile, environment_job=None, prepare=False):
+def manifest_for(github, pull, profile, environment_job=None, prepare=False, resource="rtx-3090"):
     config = json.loads((ROOT / "profiles.json").read_text())[profile]
     manifest = {
         "schema": 1,
@@ -165,6 +165,7 @@ def manifest_for(github, pull, profile, environment_job=None, prepare=False):
         "base_sha": github.base_sha(pull),
         "head_sha": pull["head"]["sha"],
         "profile": profile,
+        "resource": "standard-cpu" if prepare else resource,
         "prepare": prepare,
         "environment_job": None if prepare else environment_job,
         "workload": config,
@@ -335,6 +336,11 @@ def main():
         "--profile", choices=["sft-3090", "smoke", "vllm-rollout", "vllm-rollout-diagnostic"], default="sft-3090"
     )
     parser.add_argument(
+        "--serious",
+        action="store_true",
+        help="Use the longer LoRA rollout workload on one RTX 5090 (requires --profile vllm-rollout)",
+    )
+    parser.add_argument(
         "--author", action="append", help="Allowed PR author; default is your authenticated GitHub user"
     )
     parser.add_argument("--publish", action="store_true", help="Publish commit statuses and PR reports")
@@ -347,6 +353,10 @@ def main():
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--state-dir", type=Path, default=Path.home() / ".local/state/trl-pr-benchmark")
     args = parser.parse_args()
+    if args.serious:
+        if args.profile != "vllm-rollout":
+            parser.error("--serious requires --profile vllm-rollout")
+        args.profile = "vllm-rollout-serious"
     if args.timeout_minutes <= 0 or args.daily_compute_minutes <= 0 or args.poll_seconds < 10:
         parser.error("Timeout/budget must be positive; polling must be at least 10 seconds")
     if args.command == "run" and not args.pr:
@@ -359,6 +369,8 @@ def main():
         import hta.trace_analysis  # noqa: F401
 
     env = load_env(args.env_file)
+    if args.serious:
+        env["HYPERAI_RESOURCE"] = "rtx-5090"
     if args.command == "doctor":
         print(json.dumps(HyperAI(env).inventory(), indent=2))  # noqa: T201
         return 0
@@ -418,7 +430,12 @@ def main():
                         raise ValueError("PR must be open, ready for review, and from an explicitly allowed author")
                     continue
                 manifest = manifest_for(
-                    github, pull, args.profile, env.get("HYPERAI_ENVIRONMENT_JOB"), args.command == "prepare"
+                    github,
+                    pull,
+                    args.profile,
+                    env.get("HYPERAI_ENVIRONMENT_JOB"),
+                    args.command == "prepare",
+                    env.get("HYPERAI_RESOURCE", "rtx-3090"),
                 )
                 if args.dry_run:
                     print(json.dumps(manifest, indent=2))  # noqa: T201

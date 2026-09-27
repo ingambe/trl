@@ -33,10 +33,12 @@ def policy_parity(trainer, histories, side, seed):
     """Compare full next-token distributions on fixed histories, including a stale-adapter control."""
     import numpy as np
     import torch
-    from peft import LoraConfig, get_peft_model
+    from peft import LoraConfig, PeftModel, get_peft_model
     from vllm import SamplingParams
 
     engine = trainer.vllm_generation
+    if isinstance(engine.model, PeftModel):
+        engine.model = engine.model.unload()
     engine.temperature = 1.0
     engine.top_p = 1.0
     engine.top_k = -1
@@ -103,6 +105,27 @@ def policy_parity(trainer, histories, side, seed):
                     if "lora_B" in name:
                         param.normal_(std=0.03 if stage == "lora" else 0.1, generator=generator)
         reference = local()
+        merged_reference = reference
+        if stage != "dense":
+            # Evaluate the actual BF16 merged inference policy without perturbing training weights.
+            from peft.tuners.tuners_utils import BaseTunerLayer
+
+            originals = {
+                param: param.detach().cpu().clone()
+                for module in engine.model.modules()
+                if isinstance(module, BaseTunerLayer)
+                for param in module.get_base_layer().parameters()
+            }
+            try:
+                engine.model.merge_adapter()
+                merged_reference = local()
+            finally:
+                try:
+                    engine.model.unmerge_adapter()
+                finally:
+                    with torch.no_grad():
+                        for param, original in originals.items():
+                            param.copy_(original)
         # Snapshot only the frozen tensors that PEFT merges, to detect merge/unmerge rounding drift.
         frozen = {
             name: param.detach().clone()
@@ -118,6 +141,7 @@ def policy_parity(trainer, histories, side, seed):
                 _, _, logprobs, token_ids = engine.generate([histories[0]], images=None, num_generations=1)
                 actual = dense(logprobs[0][0], token_ids[0][0])
                 record(f"{stage}_turn{turn}", reference, actual)
+                record(f"{stage}_turn{turn}_merged_reference", merged_reference, actual)
                 record(f"{stage}_turn{turn}_local_after_sync", local(), actual)
         record(stage + "_local_policy_drift", reference, local())
         deltas = [
@@ -169,14 +193,15 @@ def main():
     config = manifest["workload"].copy()
     if args.profile_dir:
         config["steps"] = min(2, config["steps"])
-    if config.get("policy_parity"):
-        # The diagnostic performs many small CPU tensor reductions on a worker with a limited CPU quota.
-        torch.set_num_threads(1)
+    # Fix CPU parallelism across both sides, including unprofiled runs.
+    torch.set_num_threads(config.get("cpu_threads", 1))
     set_seed(args.seed)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, local_files_only=True)
     data = json.loads(args.data.read_text())
-    prompt = tokenizer.decode(data["train"][args.seed % len(data["train"])][:48])
-    prompts = [prompt, prompt]
+    prompts = [
+        tokenizer.decode(data["train"][(args.seed + index // 2) % len(data["train"])][: config["prompt_tokens"]])
+        for index in range(config["batch_size"])
+    ]
     tool_ids = tokenizer.encode("\nTool result: 42. Continue.\n", add_special_tokens=False)
 
     def rollout(prompts, trainer):
@@ -206,9 +231,14 @@ def main():
     def diagnostic_llm(**kwargs):
         return llm(**kwargs, max_logprobs=-1)
 
+    from peft import LoraConfig
+
     with patch.object(generation_module, "LLM", diagnostic_llm if config.get("policy_parity") else llm):
         trainer = GRPOTrainer(
             model=str(args.model_path),
+            peft_config=LoraConfig(r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM")
+            if config["lora"]
+            else None,
             processing_class=tokenizer,
             args=GRPOConfig(
                 output_dir=str(args.output.parent / "checkpoints"),
@@ -217,12 +247,12 @@ def main():
                 vllm_mode="colocate",
                 vllm_enable_sleep_mode=True,
                 vllm_gpu_memory_utilization=0.35,
-                vllm_max_model_length=512,
-                max_completion_length=16,
-                generation_kwargs={"ignore_eos": True, "min_tokens": 16},
+                vllm_max_model_length=config["context_tokens"],
+                max_completion_length=config["completion_tokens"],
+                generation_kwargs={"ignore_eos": True, "min_tokens": config["completion_tokens"]},
                 temperature=0.0,
                 num_generations=2,
-                per_device_train_batch_size=2,
+                per_device_train_batch_size=config["batch_size"],
                 bf16=True,
                 report_to="none",
                 save_strategy="no",
@@ -233,6 +263,16 @@ def main():
             rollout_func=rollout,
         )
     engine = trainer.vllm_generation
+    generator = torch.Generator(device="cuda").manual_seed(args.seed + 1000)
+    with torch.no_grad():
+        for name, param in trainer.model.named_parameters():
+            if "lora_B" in name:
+                param.normal_(std=0.01, generator=generator)
+    frozen = {
+        name: param.detach().cpu().clone()
+        for name, param in trainer.model.named_parameters()
+        if "base_layer.weight" in name
+    }
     counters = {"weight_transfer_bytes": 0, "sync_count": 0}
     sync_weights = engine.sync_weights
     loader = engine.llm.llm_engine.model_executor.driver_worker.model_runner.model
@@ -263,7 +303,12 @@ def main():
         for phase in range(config["warmup_steps"] + config["steps"]):
             # A real update between phases must invalidate the previous policy's KV.
             with torch.no_grad():
-                next(trainer.model.parameters()).add_(0.01)
+                if config["lora"]:
+                    for name, param in trainer.model.named_parameters():
+                        if "lora_B" in name:
+                            param.add_(0.001)
+                else:
+                    next(trainer.model.parameters()).add_(0.01)
             trainer.state.global_step = phase
             if phase == config["warmup_steps"]:
                 counters.update(weight_transfer_bytes=0, sync_count=0)
@@ -291,6 +336,15 @@ def main():
         "output_sha256": hashlib.sha256(json.dumps(outputs).encode()).hexdigest(),
         "output_tokens": outputs,
         "peak_memory_bytes": torch.cuda.max_memory_allocated(),
+        "frozen_weight_max_abs_drift": max(
+            (
+                (param.detach().cpu() - frozen[name]).abs().float().max().item()
+                for name, param in trainer.model.named_parameters()
+                if name in frozen
+            ),
+            default=0.0,
+        ),
+        "prompt_lengths": [len(ids) for ids in tokenizer(prompts)["input_ids"]],
         "environment": {
             "gpu": torch.cuda.get_device_name(),
             "driver": subprocess.check_output(
@@ -299,7 +353,7 @@ def main():
             "packages": sorted(f"{d.metadata['Name']}=={d.version}" for d in importlib.metadata.distributions()),
         },
     }
-    if config.get("policy_parity") and not args.profile_dir:
+    if config.get("policy_parity") and not args.profile_dir and args.seed == config["seeds"][0]:
         histories = tokenizer(prompts)["input_ids"]
         record["policy_parity_prompt_ids"] = histories[0]
         record["policy_parity"] = policy_parity(trainer, histories, args.side, args.seed)

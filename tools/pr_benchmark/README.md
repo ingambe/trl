@@ -243,7 +243,7 @@ python -m pytest tools/pr_benchmark/tests -q
 
 The `vllm-rollout` profile exercises GRPO's real `_generate` path with a custom four-turn rollout and deterministic
 CPU tool feedback. Six measured phases follow one warm-up phase for each of five paired seeds. Each phase changes
-the training weights, then times the entire rollout through its final level-2 sleep. Greedy completion tokens must
+nonzero LoRA adapter weights, then times the entire rollout through its final level-2 sleep. Greedy completion tokens must
 match between base and head; the head must synchronize at most once per phase and both engines must finish asleep.
 `weight_transfer_bytes` measures tensor payload bytes passed to vLLM's `load_weights`, **not measured PCIe traffic**.
 `rollout_seconds` includes synchronization, generation, feedback, and sleep; initialization is excluded.
@@ -263,7 +263,7 @@ Push the candidate branch without opening a PR, then run:
 `compare` resolves and pins both refs and never posts a PR status. `--dry-run` resolves the request without allocating
 compute. Require the latency interval to show an improvement before claiming this optimization is faster; fewer
 transferred bytes alone are not latency evidence. This bounded synthetic workload does not establish distributed,
-merged-adapter, or GPU-tool performance; their cleanup behavior also needs the local regression tests.
+GPU-tool performance or downstream task quality; their cleanup behavior also needs the local regression tests.
 
 If the token hash check fails, `vllm-rollout-diagnostic` runs one paired seed with two measured phases, then compares
 full-vocabulary vLLM probabilities against the local model on an identical fixed history. It checks dense weights,
@@ -273,13 +273,48 @@ adapter sync, measures the discrepancy, then synchronizes and measures recovery.
 separately because BF16 merge/unmerge can change the local model itself. The candidate must report exactly zero
 frozen-weight drift and zero local-policy total variation after both LoRA stages; missing measurements fail the gate.
 The baseline may retain the known rounding defect. CPU backup/restoration adds real transfer work during adapter
-exports; the dense rollout profile does not measure that cost.
+exports; both timing and profiling now include that cost. The full profile also runs the fixed-history
+distribution diagnostic after timing on the first paired seed. All seeds check frozen-weight preservation.
 
 The result includes total variation, KL and Jensen–Shannon divergence, top tokens, and the exact input tokens.
 `SIDE-SEED-policy-distributions.npz` artifacts preserve the full log probabilities. Every rollout workload also
 records `output_tokens`. The normal comparator still rejects differing rollout tokens; inspect the saved diagnostic
 results even when that gate fails. One fixed history and one paired seed cannot establish downstream quality or
 general numerical equivalence, and this diagnostic is not a performance qualification.
+
+### Longer rollout measurements on RTX 5090
+
+Add `--serious` to `--profile vllm-rollout` for the longer workload on **one RTX 5090**. The flag explicitly overrides
+`HYPERAI_RESOURCE`; it never falls back to another GPU. The immutable manifest records the selected resource.
+It reuses the pinned Qwen 0.5B model, Capybara dataset and prepared environment, while increasing the workload:
+
+| Setting | Standard | `--serious` |
+|---|---:|---:|
+| Paired seeds | 5 | 5 |
+| Warm-up / measured phases per seed | 1 / 6 | 3 / 12 |
+| Concurrent histories | 2 | 8 (four distinct prompts, repeated twice) |
+| Prompt token limit | 48 | 768 |
+| Generated tokens per turn | 16 | 64 |
+| Turns per phase | 4 | 6 |
+| Context limit | 512 | 1536 |
+
+Both modes use rank-8 nonzero LoRA, real adapter updates between phases, fixed CPU thread counts, alternating side
+order, exact token hashes, frozen-weight drift checks, and separately instrumented profiler captures. The first seed
+also compares full next-token distributions with local unmerged and BF16-merged references and a stale-adapter control.
+This is a more demanding systems workload with synthetic CPU feedback, not a scored reasoning/tool-use environment.
+Longer runs and larger batches do not by themselves establish downstream quality or reproducibility across hardware.
+Compare base and head **on the same GPU**; never pool 3090 and 5090 results. A baseline rounding defect may produce
+different tokens: the comparator still rejects the comparison, even when timing improves and candidate drift is zero.
+
+```bash
+python tools/pr_benchmark/controller.py compare \
+  --repo OWNER/REPO --base-ref BASE_SHA --ref HEAD_SHA --profile vllm-rollout --serious \
+  --env-file ~/.config/trl-bench/env --timeout-minutes 25
+```
+
+Deadlines include initialization, timing, diagnostics and two extra profiling starts. Use `--dry-run` to review the
+manifest before spending compute; the usual daily reservation limit still applies. Serious mode is restricted to
+`vllm-rollout`; it cannot silently turn an SFT or diagnostic-only request into a different experiment.
 
 ## Before/after PyTorch and HTA profiles
 
