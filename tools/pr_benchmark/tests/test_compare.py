@@ -110,3 +110,103 @@ def test_invalid_results_fail_closed(measurements, damage):
         result["manifest_id"] = "old-request"
     with pytest.raises(ValueError):
         comparison.compare(result, manifest)
+
+
+@pytest.fixture
+def rollout_measurements(measurements):
+    manifest, result = measurements
+    manifest["workload"].update(kind="vllm-rollout", steps=6)
+    manifest["thresholds"] = {"rollout_seconds": 5.0, "weight_transfer_bytes": 0.0}
+    for record in result["records"]:
+        head = record["side"] == "head"
+        record.update(
+            steps=6,
+            rollout_seconds=8.0 if head else 10.0,
+            weight_transfer_bytes=100 if head else 400,
+            sync_count=6 if head else 24,
+            sleeping_after_phase=True,
+            output_sha256="same-tokens",
+        )
+    return manifest, result
+
+
+def test_rollout_improvement_requires_matching_tokens_and_handoff(rollout_measurements):
+    manifest, result = rollout_measurements
+    assert comparison.compare(result, manifest)["outcome"] == "improved"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("output_sha256", "different-tokens"),
+        ("sleeping_after_phase", False),
+        ("sync_count", 7),
+        ("weight_transfer_bytes", float("nan")),
+    ],
+)
+def test_rollout_acceptance_fails_closed(rollout_measurements, field, value):
+    manifest, result = rollout_measurements
+    result["records"][1][field] = value
+    with pytest.raises(ValueError):
+        comparison.compare(result, manifest)
+
+
+def test_transfer_reduction_alone_is_not_a_rollout_speedup(rollout_measurements):
+    manifest, result = rollout_measurements
+    for record in result["records"]:
+        record["rollout_seconds"] = 10.0
+    assert comparison.compare(result, manifest)["outcome"] == "no_regression"
+
+
+@pytest.mark.parametrize("damage", [None, "weights", "policy", "missing"])
+def test_merged_export_must_preserve_head_policy(rollout_measurements, damage):
+    manifest, result = rollout_measurements
+    manifest["workload"]["policy_parity"] = True
+    for record in result["records"]:
+        # A baseline with the known defect may drift; the candidate must preserve its own training policy.
+        drift = 0.0 if record["side"] == "head" else 0.01
+        record["policy_parity"] = [
+            item
+            for stage in ("lora", "updated_lora")
+            for item in (
+                {"label": stage + "_frozen_weight_drift", "max_abs": drift},
+                {"label": stage + "_local_policy_drift", "total_variation": drift},
+            )
+        ]
+    head = result["records"][1]["policy_parity"]
+    if damage == "weights":
+        head[0]["max_abs"] = 0.001953125
+    elif damage == "policy":
+        head[1]["total_variation"] = 0.01
+    elif damage == "missing":
+        head.pop()
+    if damage is None:
+        assert comparison.compare(result, manifest)["outcome"] == "improved"
+    else:
+        with pytest.raises(ValueError, match="training policy"):
+            comparison.compare(result, manifest)
+
+
+@pytest.mark.parametrize("drift", [0.001953125, None])
+def test_timed_lora_export_drift_cannot_pass(rollout_measurements, drift):
+    manifest, result = rollout_measurements
+    manifest["workload"]["lora"] = True
+    for record in result["records"]:
+        record["frozen_weight_max_abs_drift"] = 0.0
+    result["records"][-1]["frozen_weight_max_abs_drift"] = drift
+    with pytest.raises(ValueError, match="frozen training weights"):
+        comparison.compare(result, manifest)
+
+
+def test_serious_flag_rejects_other_workloads_before_accessing_cloud():
+    import subprocess
+
+    controller = Path(__file__).resolve().parents[1] / "controller.py"
+    result = subprocess.run(
+        [sys.executable, str(controller), "compare", "--profile", "smoke", "--serious"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "--serious requires --profile vllm-rollout" in result.stderr
