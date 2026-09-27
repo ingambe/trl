@@ -112,7 +112,12 @@ def run(environment):
             command += ["--profile-dir", str(ROOT / f"{side}-profile")]
         with (ROOT / f"{stem}.log").open("w") as log:
             before = time.perf_counter()
-            subprocess.run(command, cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+            try:
+                subprocess.run(command, cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+            except subprocess.CalledProcessError:
+                log.flush()
+                print((ROOT / f"{stem}.log").read_text()[-8000:], flush=True)  # noqa: T201
+                raise
         record = json.loads(output.read_text())
         record["workload_seconds"] = time.perf_counter() - before
         return record
