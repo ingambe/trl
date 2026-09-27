@@ -37,15 +37,41 @@ def compare(result, manifest):
     indexed = {(r["side"], r["seed"]): r for r in records}
     if set(indexed) != expected or len(records) != len(expected):
         raise ValueError("Missing, duplicate, or unexpected measurements")
-    metrics = ("train_seconds", "steady_seconds", "eval_loss")
+    rollout = config.get("kind") == "vllm-rollout"
+    metrics = (
+        ("rollout_seconds", "weight_transfer_bytes") if rollout else ("train_seconds", "steady_seconds", "eval_loss")
+    )
     environments = []
     for (side, seed), record in indexed.items():
         if record["sha"] != manifest[f"{side}_sha"] or record["steps"] != config["steps"]:
             raise ValueError("Wrong commit or incomplete training")
-        for metric in (*metrics, "train_loss", "peak_memory_bytes", "workload_seconds"):
+        diagnostics = (
+            ("peak_memory_bytes", "workload_seconds")
+            if rollout
+            else ("train_loss", "peak_memory_bytes", "workload_seconds")
+        )
+        for metric in (*metrics, *diagnostics):
             value = record[metric]
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"Invalid {metric} for {side}, seed {seed}")
+        if rollout:
+            if record["sleeping_after_phase"] is not True:
+                raise ValueError("vLLM did not release memory at the phase boundary")
+            if type(record["sync_count"]) is not int or record["sync_count"] < config["steps"]:
+                raise ValueError("Missing weight synchronization after policy updates")
+            if side == "head" and record["sync_count"] > config["steps"]:
+                raise ValueError("Head synchronized more than once per rollout phase")
+            if not record["output_sha256"] or record["output_sha256"] != indexed["base", seed]["output_sha256"]:
+                raise ValueError("Base/head rollout tokens differ")
+        if config.get("lora") and side == "head" and record.get("frozen_weight_max_abs_drift") != 0.0:
+            raise ValueError("Timed adapter exports changed frozen training weights")
+        if config.get("policy_parity") and side == "head" and seed == config["seeds"][0]:
+            parity = {item["label"]: item for item in record["policy_parity"]}
+            for stage in ("lora", "updated_lora"):
+                weight_drift = parity.get(stage + "_frozen_weight_drift", {}).get("max_abs")
+                policy_drift = parity.get(stage + "_local_policy_drift", {}).get("total_variation")
+                if weight_drift != 0.0 or policy_drift != 0.0:
+                    raise ValueError("Adapter export changed the head training policy or lacks drift measurements")
         environments.append(record["environment"])
     if any(env != environments[0] for env in environments):
         raise ValueError("GPU or dependency environment differs between runs")
@@ -85,6 +111,8 @@ def compare(result, manifest):
         if outcome in outcomes:
             summary["outcome"] = outcome
             break
+    if rollout and summary["outcome"] == "improved" and summary["metrics"]["rollout_seconds"]["outcome"] != "improved":
+        summary["outcome"] = "no_regression"
     return summary
 
 
@@ -110,7 +138,11 @@ def markdown(summary, manifest):
     lines += [
         "",
         "Margins: " + ", ".join(f"{key} +{value}%" for key, value in manifest["thresholds"].items()) + ".",
-        "Held-out SFT token loss is a quality proxy; this does not certify other trainers or downstream tasks.",
+        (
+            "Rollout tokens must match; transfer bytes count tensor payloads passed to load_weights, not hardware bus traffic."
+            if manifest["workload"].get("kind") == "vllm-rollout"
+            else "Held-out SFT token loss is a quality proxy; this does not certify other trainers or downstream tasks."
+        ),
         "Smoke runs cannot establish no regression. Missing/non-finite measurements are errors, never passes.",
     ]
     return "\n".join(lines) + "\n"

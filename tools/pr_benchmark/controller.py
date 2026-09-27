@@ -30,6 +30,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import quote
 
+from analyze_profiles import analyze
 from compare import compare, markdown
 from environment import environment_spec
 from hyperai import BUNDLE_FILES, TERMINAL, HyperAI
@@ -131,7 +132,7 @@ class GitHub:
 
     def current(self, manifest):
         if manifest["pr"] is None:
-            return True  # Calibration pins the same immutable commit on both sides.
+            return True  # Calibration and pre-PR comparisons pin immutable commits.
         pull = self.pull(manifest["pr"])
         return (
             pull["state"] == "open"
@@ -154,7 +155,7 @@ class GitHub:
         self.api(f"repos/{self.repo}/issues/{manifest['pr']}/comments", {"body": report})
 
 
-def manifest_for(github, pull, profile, environment_job=None, prepare=False):
+def manifest_for(github, pull, profile, environment_job=None, prepare=False, resource="rtx-3090"):
     config = json.loads((ROOT / "profiles.json").read_text())[profile]
     manifest = {
         "schema": 1,
@@ -164,14 +165,24 @@ def manifest_for(github, pull, profile, environment_job=None, prepare=False):
         "base_sha": github.base_sha(pull),
         "head_sha": pull["head"]["sha"],
         "profile": profile,
+        "resource": "standard-cpu" if prepare else resource,
         "prepare": prepare,
         "environment_job": None if prepare else environment_job,
         "workload": config,
-        "thresholds": {"train_seconds": 5.0, "steady_seconds": 5.0, "eval_loss": 1.0},
+        "thresholds": (
+            {"rollout_seconds": 5.0, "weight_transfer_bytes": 0.0}
+            if config.get("kind") == "vllm-rollout"
+            else {"train_seconds": 5.0, "steady_seconds": 5.0, "eval_loss": 1.0}
+        ),
         "harness": {
-            name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in (*BUNDLE_FILES[:-1], "compare.py")
+            name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+            for name in (*BUNDLE_FILES[:-1], "compare.py", "analyze_profiles.py", "requirements-controller.txt")
         },
     }
+    if config.get("kind") == "vllm-rollout":
+        manifest["harness"]["requirements-gpu.txt"] = hashlib.sha256(
+            (ROOT / "requirements-vllm.txt").read_bytes()
+        ).hexdigest()
     for key in ("base_sha", "head_sha"):
         if not re.fullmatch("[a-f0-9]{40}", manifest[key]):
             raise ValueError("GitHub returned an invalid commit SHA")
@@ -211,7 +222,11 @@ def wait_for_job(provider, github, manifest, record, deadline, poll=30):
         status = provider.status(record["job"]["id"])
         if status in TERMINAL:
             if status != "SUCCEEDED":
-                raise RuntimeError(f"Compute job ended with {status}")
+                record["failure"] = provider.failure_details(record["job"]["id"])
+                messages = [
+                    item["value"] for item in (record["failure"]["statusProgress"] or []) if item["name"] == "message"
+                ]
+                raise RuntimeError(f"Compute job ended with {status}: {'; '.join(messages) or 'no provider reason'}")
             return
         time.sleep(min(poll, max(0, deadline - time.time())))
 
@@ -245,7 +260,12 @@ def execute(args, github, provider, manifest, state, state_file, record=None):
         bundle = directory / "bundle"
         bundle.mkdir()
         for name in BUNDLE_FILES[:-1]:
-            shutil.copyfile(ROOT / name, bundle / name)
+            source = (
+                "requirements-vllm.txt"
+                if (name == "requirements-gpu.txt" and manifest["workload"].get("kind") == "vllm-rollout")
+                else name
+            )
+            shutil.copyfile(ROOT / source, bundle / name)
             if hashlib.sha256((bundle / name).read_bytes()).hexdigest() != manifest["harness"][name]:
                 raise ValueError("Harness changed while preparing the bundle; restart the controller")
         save(bundle / "manifest.json", manifest)
@@ -275,18 +295,23 @@ def execute(args, github, provider, manifest, state, state_file, record=None):
             record["outcome"] = "prepared"
             print(f"Environment ready. Set HYPERAI_ENVIRONMENT_JOB={job['id']} in your local env file.", flush=True)  # noqa: T201
             return "prepared"
+        for side in ("base", "head"):
+            provider.download_profile(job["id"], side, directory / f"{side}-profile.zip")
+        analyze(directory)
         summary = compare(result, manifest)
         report = markdown(summary, manifest)
+        report += "\nProfiler diagnostics: [before/after traces and HTA tables](profiles/report.md). Instrumented runs are excluded from timing.\n"
         save(directory / "summary.json", summary)
         (directory / "report.md").write_text(report)
         # Recheck after download/analysis so an obsolete comparison cannot publish a green status.
         if not github.current(manifest):
             raise InterruptedError("Comparison became stale before publication")
         if publish:
-            github.publish(manifest, summary, report, job["url"])
+            github.publish(manifest, summary, report.replace("(profiles/report.md)", f"({job['url']})"), job["url"])
         record["status"] = "completed"
         record["outcome"] = summary["outcome"]
         print(report, flush=True)  # noqa: T201
+        print(f"Local profiler report: {directory / 'profiles/report.md'}", flush=True)  # noqa: T201
         return summary["outcome"]
     except BaseException:
         record["status"] = "cancel_pending"
@@ -303,12 +328,23 @@ def execute(args, github, provider, manifest, state, state_file, record=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["doctor", "prepare", "calibrate", "run", "watch"])
+    parser.add_argument("command", choices=["doctor", "prepare", "calibrate", "compare", "run", "watch"])
     parser.add_argument("--repo", help="GitHub owner/repo containing the PR")
     parser.add_argument("--pr", type=int)
-    parser.add_argument("--ref", default="main", help="Commit or ref for a base-versus-itself calibration")
+    parser.add_argument(
+        "--ref", default="main", help="Commit/ref for calibration or the candidate in a pre-PR comparison"
+    )
+    parser.add_argument("--base-ref", default="main", help="Base commit/ref for a pre-PR comparison")
     parser.add_argument("--env-file", type=Path)
-    parser.add_argument("--profile", choices=["sft-3090", "smoke"], default="sft-3090")
+    parser.add_argument("--resource", help="Hyper.ai resource override, e.g. rtx-3090")
+    parser.add_argument(
+        "--profile", choices=["sft-3090", "smoke", "vllm-rollout", "vllm-rollout-diagnostic"], default="sft-3090"
+    )
+    parser.add_argument(
+        "--serious",
+        action="store_true",
+        help="Use the longer LoRA workload; defaults to RTX 5090 unless --resource is set (requires --profile vllm-rollout)",
+    )
     parser.add_argument(
         "--author", action="append", help="Allowed PR author; default is your authenticated GitHub user"
     )
@@ -322,15 +358,24 @@ def main():
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--state-dir", type=Path, default=Path.home() / ".local/state/trl-pr-benchmark")
     args = parser.parse_args()
+    if args.serious:
+        if args.profile != "vllm-rollout":
+            parser.error("--serious requires --profile vllm-rollout")
+        args.profile = "vllm-rollout-serious"
     if args.timeout_minutes <= 0 or args.daily_compute_minutes <= 0 or args.poll_seconds < 10:
         parser.error("Timeout/budget must be positive; polling must be at least 10 seconds")
     if args.command == "run" and not args.pr:
         parser.error("run requires --pr")
     if args.command == "watch" and args.rerun:
         parser.error("--rerun is only supported for manual runs")
-    if args.command in {"prepare", "calibrate"} and args.publish:
-        parser.error("Preparation and calibration do not publish PR statuses")
+    if args.command in {"prepare", "calibrate", "compare"} and args.publish:
+        parser.error("Preparation, calibration, and pre-PR comparisons do not publish PR statuses")
+    if args.command not in {"doctor", "prepare"} and not args.dry_run:
+        import hta.trace_analysis  # noqa: F401
+
     env = load_env(args.env_file)
+    if args.resource or args.serious:
+        env["HYPERAI_RESOURCE"] = args.resource or "rtx-5090"
     if args.command == "doctor":
         print(json.dumps(HyperAI(env).inventory(), indent=2))  # noqa: T201
         return 0
@@ -368,7 +413,7 @@ def main():
                         raise ValueError("Resume this state directory with its original --repo")
                     execute(args, github, provider, manifest, state, state_file, record)
         while True:
-            if args.command in {"prepare", "calibrate"}:
+            if args.command in {"prepare", "calibrate", "compare"}:
                 sha = github.api(f"repos/{args.repo}/commits/{quote(args.ref, safe='')}")["sha"]
                 pulls = [
                     {
@@ -376,7 +421,7 @@ def main():
                         "state": "open",
                         "draft": False,
                         "user": {"login": github.user},
-                        "base": {"ref": sha},
+                        "base": {"ref": args.base_ref if args.command == "compare" else sha},
                         "head": {"sha": sha},
                     }
                 ]
@@ -390,7 +435,12 @@ def main():
                         raise ValueError("PR must be open, ready for review, and from an explicitly allowed author")
                     continue
                 manifest = manifest_for(
-                    github, pull, args.profile, env.get("HYPERAI_ENVIRONMENT_JOB"), args.command == "prepare"
+                    github,
+                    pull,
+                    args.profile,
+                    env.get("HYPERAI_ENVIRONMENT_JOB"),
+                    args.command == "prepare",
+                    env.get("HYPERAI_RESOURCE", "rtx-3090"),
                 )
                 if args.dry_run:
                     print(json.dumps(manifest, indent=2))  # noqa: T201
