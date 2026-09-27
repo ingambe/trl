@@ -285,7 +285,6 @@ class VLLMGeneration:
         self._weight_metadata = None
         self._rollout_depth = 0
         self._weights_dirty = True
-        self._use_ipc = False
 
         self._init_vllm()
 
@@ -346,17 +345,6 @@ class VLLMGeneration:
                     elif isinstance(module, bnb.nn.Linear8bitLt):
                         raise ValueError("vLLM does not support in-flight 8-bit quantization.")
 
-            # Trial the vLLM 0.22-0.26 IPC API on the unsharded, single-GPU colocated path.
-            # Later vLLM releases use a different trainer-side transfer API.
-            self._use_ipc = (
-                accelerator.device.type == "cuda"
-                and accelerator.num_processes == 1
-                and not self._dist.is_fsdp
-                and not self._dist.is_zero3
-                and quantization is None
-                and is_vllm_available(min_version="0.22.0")
-                and not is_vllm_available(min_version="0.27.0")
-            )
             self.llm = LLM(
                 model=model.name_or_path,
                 tensor_parallel_size=self.tensor_parallel_size,
@@ -374,10 +362,7 @@ class VLLMGeneration:
                 logprobs_mode="processed_logprobs",
                 quantization=quantization,
                 trust_remote_code=self.trust_remote_code,
-                weight_transfer_config={"backend": "ipc"} if self._use_ipc else None,
             )
-            if self._use_ipc:
-                self.llm.init_weight_transfer_engine({"init_info": {}})
             self._llm_weights_sleeping = False
             self._kv_cache_sleeping = False
             self.sleep()
@@ -447,12 +432,9 @@ class VLLMGeneration:
         elif self._dist.fsdp_version == 2:
             yield from self._iter_fsdp2_params(model)
 
-    def _iter_named_params(self):
-        """Iterate over the model parameters, materialized one at a time under the name vLLM expects.
-
-        Handles FSDP, DeepSpeed and PEFT. Gathering a parameter is a collective operation, so every process must
-        iterate, even the ones that don't push the weights anywhere.
-        """
+    @contextmanager
+    def _export_named_params(self):
+        """Keep exported parameters valid until the receiver returns, then restore training weights."""
         model = self.model
 
         if is_peft_model(model):
@@ -473,24 +455,8 @@ class VLLMGeneration:
                 try:
                     model.merge_adapter()
 
-                    # Read the vLLM weights while parameters are gathered
-                    if self._dist.is_fsdp:  # note if using FSDP, gather_params is a no-op
-                        # For PEFT with FSDP we need to use the memory efficient post-order traversal
-                        yield from self._iter_fsdp_params(model)
-                    else:
-                        # DeepSpeed ZeRO-3 with PEFT
-                        for name, param in model.named_parameters():
-                            # When using PEFT, we need to recover the original parameter name
-                            name = name.removeprefix("base_model.model.").replace(".base_layer", "")
-                            # Skip PEFT layers: they don't exist in vLLM, and they are merged already.
-                            if model.prefix in name:
-                                continue
-                            # When module to save, remove its prefix and discard the original module
-                            if "original_module" in name:
-                                continue
-                            name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
-
-                            yield name, param.data
+                    with closing(self._iter_named_params()) as params:
+                        yield params
                 finally:
                     # Unmerge adapters while parameters are still gathered, including after a failed transfer.
                     try:
@@ -500,14 +466,31 @@ class VLLMGeneration:
                             param.data.copy_(original)
                 # Parameters will automatically be repartitioned when exiting the context
         else:
-            # For non-PEFT models, simply gather (if needed) and read each parameter individually.
-            if self._dist.is_fsdp:
-                yield from self._iter_fsdp_params(model)
-            else:
-                for name, param in model.named_parameters():
-                    name = self._fix_param_name_to_vllm(name)
-                    with self._dist.gather_params([param]):
-                        yield name, param.data
+            with closing(self._iter_named_params()) as params:
+                yield params
+
+    def _iter_named_params(self):
+        """Stream parameters while the caller holds the export context open."""
+        model = self.model
+        if self._dist.is_fsdp:
+            yield from self._iter_fsdp_params(model)
+        elif is_peft_model(model):
+            for name, param in model.named_parameters():
+                # When using PEFT, we need to recover the original parameter name
+                name = name.removeprefix("base_model.model.").replace(".base_layer", "")
+                # Skip PEFT layers: they don't exist in vLLM, and they are merged already.
+                if model.prefix in name:
+                    continue
+                # When module to save, remove its prefix and discard the original module
+                if "original_module" in name:
+                    continue
+                name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
+                yield name, param.data
+        else:
+            for name, param in model.named_parameters():
+                name = self._fix_param_name_to_vllm(name)
+                with self._dist.gather_params([param]):
+                    yield name, param.data
 
     def sync_weights(self):
         """Synchronize model weights to vLLM.
@@ -529,50 +512,29 @@ class VLLMGeneration:
             # The server must know every tensor it is about to receive before the first one is broadcast, so the
             # parameters are walked once to collect their metadata, and streamed on subsequent passes.
             if self._weight_metadata is None:
-                with closing(self._iter_named_params()) as params:
+                with self._export_named_params() as params:
                     self._weight_metadata = [
                         (name, str(param.dtype).removeprefix("torch."), list(param.shape)) for name, param in params
                     ]
             if accelerator.is_main_process:
                 # Publish only after the exporter has unmerged adapters and released gathered parameters.
-                with self.vllm_client.weight_update(), closing(self._iter_named_params()) as params:
+                with self.vllm_client.weight_update(), self._export_named_params() as params:
                     self.vllm_client.update_named_params(self._weight_metadata, params)
             else:
-                with closing(self._iter_named_params()) as params:
+                with self._export_named_params() as params:
                     for _ in params:  # take part in the gather collectives
                         pass
         elif self.mode == "colocate":
             # Invalidate policy-dependent KV before changing any weights, including a failed partial update.
             self.llm.reset_prefix_cache()
-            if self._use_ipc:
-                from dataclasses import asdict
-
-                from vllm.distributed.weight_transfer.ipc_engine import (
-                    IPCTrainerSendWeightsArgs,
-                    IPCWeightTransferEngine,
-                )
-
-                self.llm.start_weight_update(is_checkpoint_format=True)
-                with closing(self._iter_named_params()) as params:
-                    IPCWeightTransferEngine.trainer_send_weights(
-                        params,
-                        IPCTrainerSendWeightsArgs(
-                            send_mode=lambda info: self.llm.update_weights({"update_info": asdict(info)}),
-                            packed=True,
-                            # One reusable buffer, large enough for the largest unsharded tensor.
-                            packed_buffer_size_bytes=max(
-                                64 * 1024**2, max(p.numel() * p.element_size() for p in self.model.parameters())
-                            ),
-                        ),
-                    )
-                # Do not finalize or mark a partial update healthy. A failed IPC update requires engine recreation.
-                self.llm.finish_weight_update()
-            else:
-                with closing(self._iter_named_params()) as params:
+            load_weights = self.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights
+            with self._export_named_params() as params:
+                if self._dist.is_fsdp or self._dist.is_zero3:
+                    # Consume each gathered tensor before advancing the exporter and releasing its storage.
                     for name, param in params:
-                        self.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights(
-                            [(name, param)]
-                        )
+                        load_weights([(name, param)])
+                else:
+                    load_weights(params)
 
         self._weights_dirty = False
 

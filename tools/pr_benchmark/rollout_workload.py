@@ -264,7 +264,6 @@ def main():
     engine = trainer.vllm_generation
     # The same harness also runs revisions predating native adapter publication.
     native_lora = "_lora_config" in dir(engine) and engine._lora_config is not None
-    ipc = "_use_ipc" in dir(engine) and engine._use_ipc
     lora_b = [param for name, param in trainer.model.named_parameters() if "lora_B" in name]
     generator = torch.Generator(device="cuda").manual_seed(args.seed + 1000)
     with torch.no_grad():
@@ -316,10 +315,6 @@ def main():
         engine.llm.reset_prefix_cache = annotate(engine.llm.reset_prefix_cache)
         engine.sync_weights = annotate(engine.sync_weights)
         loader.load_weights = annotate(loader.load_weights)
-        if ipc:
-            engine.llm.start_weight_update = annotate(engine.llm.start_weight_update)
-            engine.llm.update_weights = annotate(engine.llm.update_weights)
-            engine.llm.finish_weight_update = annotate(engine.llm.finish_weight_update)
     durations, outputs = [], []
     sleeping = True
     torch.cuda.reset_peak_memory_stats()
@@ -349,7 +344,7 @@ def main():
             if profiler:
                 profiler.step()
     record = {
-        "publication": "ipc" if ipc else "native_lora" if native_lora else "merged",
+        "publication": "native_lora" if native_lora else "merged",
         "side": args.side,
         "seed": args.seed,
         "sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=args.checkout, text=True).strip(),
@@ -383,37 +378,6 @@ def main():
         histories = tokenizer(prompts)["input_ids"]
         record["policy_parity_prompt_ids"] = histories[0]
         record["policy_parity"] = policy_parity(trainer, histories, args.side, args.seed)
-        if ipc:
-            # Exercise an actual partial IPC publication after diagnostics, outside timing and profiling.
-            before = {
-                name: value.detach().cpu().clone()
-                for name, value in trainer.model.state_dict().items()
-                if "base_layer" in name or "lora_" in name
-            }
-            update_weights = engine.llm.update_weights
-
-            def fail_after_transfer(request):
-                update_weights(request)
-                raise RuntimeError("injected partial IPC publication")
-
-            with patch.object(engine.llm, "update_weights", fail_after_transfer):
-                try:
-                    engine.sync_weights()
-                except RuntimeError as error:
-                    assert "injected partial IPC publication" in str(error)
-                else:
-                    raise AssertionError("IPC failure injection did not execute")
-            for name, value in trainer.model.state_dict().items():
-                if name in before:
-                    torch.testing.assert_close(value.detach().cpu(), before[name], rtol=0, atol=0)
-            try:
-                engine.generate([histories[0]], images=None, num_generations=1)
-            except RuntimeError as error:
-                assert "already active" in str(error)
-            else:
-                raise AssertionError("Generation accepted an unfinished IPC update")
-            assert engine._weights_dirty and engine.llm.llm_engine.is_sleeping()
-            record["ipc_partial_publication_blocked"] = True
     if args.profile_dir:
         save_profile_metadata(args.profile_dir, record, manifest, config["warmup_steps"], config["steps"])
     args.output.write_text(json.dumps(record, indent=2, allow_nan=False))

@@ -164,10 +164,10 @@ def assert_adapter_restored(engine):
 
 def test_closing_real_peft_export_unmerges_inside_gather(peft_generation):
     engine = peft_generation
-    params = engine._iter_named_params()
-    next(params)
-    assert all(layer.merged for layer in engine.adapter_layers)
-    params.close()
+    with engine._export_named_params() as params:
+        next(params)
+        assert all(layer.merged for layer in engine.adapter_layers)
+    assert params.gi_frame is None
     assert_adapter_restored(engine)
 
 
@@ -178,19 +178,19 @@ def test_real_peft_failed_export_cannot_generate_until_complete_retry(peft_gener
     engine.enable_sleep_mode = sleep
     engine._llm_weights_sleeping = sleep
     engine._kv_cache_sleeping = sleep
-    expected = {name: value.clone() for name, value in engine._iter_named_params()}
+    with engine._export_named_params() as params:
+        expected = {name: value.clone() for name, value in params}
     loader = engine.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights
     published = {}
-    calls = 0
 
     def load(weights):
-        nonlocal calls
-        calls += 1
         if failure == "before":
             raise RuntimeError("export failed")
         for name, value in weights:
             published[name] = value.clone()
-        if (failure == "during" and calls == 2) or (failure == "after" and len(published) == len(expected)):
+            if failure == "during" and len(published) == 2:
+                raise RuntimeError("export failed")
+        if failure == "after":
             raise RuntimeError("export failed")
 
     loader.side_effect = load
@@ -212,7 +212,6 @@ def test_real_peft_failed_export_cannot_generate_until_complete_retry(peft_gener
         monkeypatch.setattr(engine.model, "unmerge_adapter", unmerge)
 
     for _ in range(2):
-        calls = 0
         with pytest.raises(RuntimeError, match="export failed"):
             generate(engine)
         assert_adapter_restored(engine)
@@ -343,7 +342,8 @@ def test_bf16_repeated_exports_preserve_policy_and_publish_adapter_updates(gener
             reference = copy.deepcopy(model).merge_and_unload()
             expected = reference.state_dict()
             for _ in range(8):
-                exported = {name: value.clone() for name, value in generation._iter_named_params()}
+                with generation._export_named_params() as params:
+                    exported = {name: value.clone() for name, value in params}
                 torch.testing.assert_close(exported, expected, rtol=0, atol=0)
                 torch.testing.assert_close(model.state_dict(), training_state, rtol=0, atol=0)
                 torch.testing.assert_close(model(ids).logits.float().log_softmax(-1), logprobs, rtol=0, atol=0)
@@ -365,5 +365,28 @@ def test_bf16_export_preserves_merged_adapter_bias(generation):
     generation.model = model
     expected = {name: value.clone() for name, value in model.state_dict().items()}
     for _ in range(8):
-        list(generation._iter_named_params())
+        with generation._export_named_params() as params:
+            list(params)
         torch.testing.assert_close(model.state_dict(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("sharded", [False, True])
+def test_publication_keeps_merged_weights_live_until_loader_returns(peft_generation, sharded):
+    engine = peft_generation
+    engine._dist = SimpleNamespace(is_zero3=sharded, is_fsdp=False, gather_params=engine._dist.gather_params)
+    with engine._export_named_params() as params:
+        expected = {name: value.clone() for name, value in params}
+    published = {}
+
+    def load(weights):
+        # Exercise a loader that retains references until it has consumed the iterable.
+        pending = list(weights)
+        assert all(layer.merged for layer in engine.adapter_layers)
+        published.update((name, value.clone()) for name, value in pending)
+
+    loader = engine.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights
+    loader.side_effect = load
+    engine.sync_weights()
+    assert loader.call_count == (len(expected) if sharded else 1)
+    torch.testing.assert_close(published, expected, rtol=0, atol=0)
+    assert_adapter_restored(engine)
