@@ -46,6 +46,7 @@ def validate_environment(directory, manifest):
 
 
 def prepare_assets(manifest):
+    print("Preparing pinned model and dataset assets", flush=True)  # noqa: T201
     from datasets import load_dataset
     from huggingface_hub import snapshot_download
 
@@ -57,6 +58,7 @@ def prepare_assets(manifest):
         local_dir=ROOT / "model",
         allow_patterns=["*.json", "*.safetensors", "*.txt", "*.model", "*.jinja"],
     )
+    print("Model ready; downloading pinned dataset", flush=True)  # noqa: T201
     load_dataset(
         config["dataset"],
         revision=config["dataset_revision"],
@@ -70,6 +72,7 @@ def prepare_assets(manifest):
         "python": platform.python_version(),
         "packages": sorted(f"{d.metadata['Name']}=={d.version}" for d in importlib.metadata.distributions()),
     }
+    print("Pinned model and dataset ready", flush=True)  # noqa: T201
     # A marker is written only after installation and both asset downloads have succeeded.
     (ROOT / "environment.json").write_text(json.dumps(marker, indent=2))
     (ROOT / "result.json").write_text(json.dumps(marker, indent=2))
