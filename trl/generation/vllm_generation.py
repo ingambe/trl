@@ -18,6 +18,7 @@ import logging
 import math
 import os
 from contextlib import closing, contextmanager, nullcontext
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING
 
 import torch
@@ -41,6 +42,7 @@ from .vllm_client import VLLMClient
 
 if is_vllm_available():
     from vllm import LLM, RequestOutput, SamplingParams
+    from vllm.lora.request import LoRARequest
     from vllm.sampling_params import StructuredOutputsParams
 
 
@@ -171,6 +173,9 @@ class VLLMGeneration:
         enable_sleep_mode (`bool`, *optional*, defaults to `False`):
             Whether to enable sleep mode for the engine to offload weights/cache during the optimizer step. Keeps GPU
             memory usage low, but waking the engine adds host–device transfer latency.
+            Single-GPU, unsharded LoRA without trained biases, extra trainable modules or DoRA uses native adapter
+            publication and level-1 sleep. This preserves the frozen base in CPU memory between rollout phases.
+            Other configurations export full weights and use level-2 sleep.
         model_impl (`str`, *optional*, defaults to `"auto"`):
             Model implementation to use for vLLM.
             - "auto" will try to use the vLLM implementation, if it exists, and fall back to the Transformers
@@ -285,6 +290,42 @@ class VLLMGeneration:
         self._weight_metadata = None
         self._rollout_depth = 0
         self._weights_dirty = True
+        self._lora_config = None
+        self._lora_request = None
+        self._lora_snapshot = None
+        self._lora_version = 0
+        self._base_weights_loaded = False
+
+        # Native adapter publication currently covers unsharded, single-GPU LoRA. Other PEFT configurations keep
+        # the merged export path, including DoRA, trained biases and modules_to_save, which vLLM cannot load as LoRA.
+        if mode == "colocate" and accelerator.num_processes == 1 and is_peft_model(model):
+            from peft import LoraConfig
+            from peft.tuners.tuners_utils import BaseTunerLayer
+
+            if len(model.active_adapters) == 1 and not self._dist.is_fsdp and not self._dist.is_zero3:
+                config = model.peft_config[model.active_adapters[0]]
+                settings = config.to_dict()
+                if (
+                    isinstance(config, LoraConfig)
+                    and config.bias == "none"
+                    and config.r <= 512
+                    and not any(
+                        settings.get(name)
+                        for name in (
+                            "use_dora",
+                            "modules_to_save",
+                            "rank_pattern",
+                            "alpha_pattern",
+                            "lora_bias",
+                            "target_parameters",
+                            "trainable_token_indices",
+                            "use_bdlora",
+                        )
+                    )
+                    and all("lora_" in name for name, param in model.named_parameters() if param.requires_grad)
+                    and all(not module.merged for module in model.modules() if isinstance(module, BaseTunerLayer))
+                ):
+                    self._lora_config = config
 
         self._init_vllm()
 
@@ -346,6 +387,16 @@ class VLLMGeneration:
                         raise ValueError("vLLM does not support in-flight 8-bit quantization.")
 
             # Build LLM initialization kwargs
+            lora_kwargs = {}
+            if self._lora_config is not None and quantization is None:
+                lora_kwargs = {
+                    "enable_lora": True,
+                    "max_lora_rank": max(16, 2 ** (self._lora_config.r - 1).bit_length()),
+                    "max_loras": 1,
+                    "max_cpu_loras": 2,
+                }
+            else:
+                self._lora_config = None
             self.llm = LLM(
                 model=model.name_or_path,
                 tensor_parallel_size=self.tensor_parallel_size,
@@ -363,9 +414,10 @@ class VLLMGeneration:
                 logprobs_mode="processed_logprobs",
                 quantization=quantization,
                 trust_remote_code=self.trust_remote_code,
+                **lora_kwargs,
             )
             if self.enable_sleep_mode:
-                self.llm.sleep(level=2)
+                self.llm.sleep(level=1 if self._lora_config is not None else 2)
             self._llm_weights_sleeping = self.enable_sleep_mode
             self._kv_cache_sleeping = self.enable_sleep_mode
         else:
@@ -531,11 +583,84 @@ class VLLMGeneration:
         elif self.mode == "colocate":
             # Invalidate policy-dependent KV before changing any weights, including a failed partial update.
             self.llm.reset_prefix_cache()
-            with closing(self._iter_named_params()) as params:
-                for name, param in params:
-                    self.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights([(name, param)])
+            if self._lora_config is not None:
+                self._sync_lora()
+            else:
+                with closing(self._iter_named_params()) as params:
+                    for name, param in params:
+                        self.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights(
+                            [(name, param)]
+                        )
 
         self._weights_dirty = False
+
+    def _sync_lora(self):
+        """Publish an owned adapter snapshot without merging or modifying the training model."""
+        from peft import get_peft_model_state_dict
+        from safetensors.torch import save_file
+
+        if (
+            len(self.model.active_adapters) != 1
+            or self.model.peft_config[self.model.active_adapters[0]] is not self._lora_config
+        ):
+            raise ValueError("Changing the active PEFT adapter requires recreating the vLLM generation engine.")
+
+        # The in-memory base can differ from its original checkpoint. Copy it once, unmerged, before publishing
+        # any adapter. Level-1 sleep preserves this exact base across subsequent training/tool handoffs.
+        if not self._base_weights_loaded:
+            from vllm.lora.layers import BaseLayerWithLoRA
+
+            inference_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+            # Native model loaders expect checkpoint names, without the runtime LoRA wrappers' base_layer prefix.
+            # Temporarily expose those same base modules; restore wrappers even if loading fails.
+            wrappers = {
+                name: module
+                for name, module in inference_model.named_modules()
+                if isinstance(module, BaseLayerWithLoRA) and "base_layer" in module._modules
+            }
+            params = (
+                (
+                    self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", "")),
+                    param,
+                )
+                for name, param in self.model.named_parameters()
+                if "lora_" not in name
+            )
+            try:
+                for name, module in wrappers.items():
+                    inference_model.set_submodule(name, module.base_layer)
+                inference_model.load_weights(params)
+            finally:
+                for name, module in wrappers.items():
+                    inference_model.set_submodule(name, module)
+            self._base_weights_loaded = True
+
+        self._lora_version += 1
+        snapshot = TemporaryDirectory(prefix="trl-lora-")
+        request = LoRARequest(f"trl-policy-{self._lora_version}", self._lora_version, snapshot.name)
+        try:
+            # CPU copies own their storage: subsequent optimizer steps cannot change a published policy.
+            state = get_peft_model_state_dict(
+                self.model, adapter_name=self.model.active_adapters[0], save_embedding_layers=False
+            )
+            state = {name: tensor.detach().to(device="cpu", copy=True).contiguous() for name, tensor in state.items()}
+            save_file(state, os.path.join(snapshot.name, "adapter_model.safetensors"))
+            self._lora_config.save_pretrained(snapshot.name)
+            if not self.llm.llm_engine.add_lora(request):
+                raise RuntimeError("vLLM did not load the new policy adapter.")
+            if self._lora_request is not None:
+                self.llm.llm_engine.remove_lora(self._lora_request.lora_int_id)
+        except BaseException:
+            try:
+                self.llm.llm_engine.remove_lora(request.lora_int_id)
+            finally:
+                snapshot.cleanup()
+            raise
+        old_snapshot = self._lora_snapshot
+        self._lora_request = request
+        self._lora_snapshot = snapshot
+        if old_snapshot is not None:
+            old_snapshot.cleanup()
 
     @contextmanager
     def rollout_phase(self):
@@ -560,7 +685,7 @@ class VLLMGeneration:
         Call on every rank before entering the tool. CPU tools need no handoff.
         """
         if self.mode == "colocate" and self.enable_sleep_mode:
-            self.llm.sleep(level=2)
+            self.llm.sleep(level=1 if self._lora_config is not None else 2)
             self._llm_weights_sleeping = True
             self._kv_cache_sleeping = True
 
@@ -634,14 +759,20 @@ class VLLMGeneration:
             repetition_penalty = self.repetition_penalty
             max_completion_length = self.max_completion_length
 
-            # Sleep level 2 discards the weights, so waking up isn't enough: they must be re-pushed from the training
-            # model. vLLM's `reload_weights` can't be used here, as it reloads the initial checkpoint from disk rather
-            # than the current training weights. See https://github.com/vllm-project/vllm/issues/29341
+            # Dense/merged export uses level-2 sleep, which discards weights and requires re-publication. Native LoRA
+            # uses level-1 sleep: wake restores the frozen base and the already published adapter without an update.
             # A failed export also requires a complete retry, in every mode, before inference is allowed.
             if self._weights_dirty or (
-                self.mode == "colocate" and self.enable_sleep_mode and self._llm_weights_sleeping
+                self.mode == "colocate"
+                and self.enable_sleep_mode
+                and self._llm_weights_sleeping
+                and self._lora_config is None
             ):
                 self.sync_weights()
+            elif self.mode == "colocate" and self.enable_sleep_mode and self._llm_weights_sleeping:
+                empty_cache()
+                self.llm.wake_up(tags=["weights"])
+                self._llm_weights_sleeping = False
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             if self.mode == "server":
@@ -783,7 +914,9 @@ class VLLMGeneration:
                     torch.distributed.barrier(device_ids=[accelerator.local_process_index])
 
                 with profiler:
-                    all_outputs = self.llm.generate(vllm_prompts, sampling_params=sampling_params, use_tqdm=False)
+                    all_outputs = self.llm.generate(
+                        vllm_prompts, sampling_params=sampling_params, use_tqdm=False, lora_request=self._lora_request
+                    )
 
                 all_prompt_ids = [output.prompt_token_ids for output in all_outputs]
                 all_completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]

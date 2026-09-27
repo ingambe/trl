@@ -37,7 +37,8 @@ def policy_parity(trainer, histories, side, seed):
     from vllm import SamplingParams
 
     engine = trainer.vllm_generation
-    if isinstance(engine.model, PeftModel):
+    native_lora = "_lora_config" in dir(engine) and engine._lora_config is not None
+    if isinstance(engine.model, PeftModel) and not native_lora:
         engine.model = engine.model.unload()
     engine.temperature = 1.0
     engine.top_p = 1.0
@@ -84,6 +85,7 @@ def policy_parity(trainer, histories, side, seed):
                 [{"prompt_token_ids": histories[0]}],
                 SamplingParams(temperature=1.0, top_p=1.0, top_k=-1, max_tokens=1, logprobs=-1),
                 use_tqdm=False,
+                **({"lora_request": engine._lora_request} if native_lora else {}),
             )[0]
             .outputs[0]
             .logprobs[0]
@@ -91,7 +93,7 @@ def policy_parity(trainer, histories, side, seed):
         return dense([item.logprob for item in out.values()], list(out))
 
     for stage_index, stage in enumerate(("dense", "lora", "updated_lora")):
-        if stage == "lora":
+        if stage == "lora" and not native_lora:
             with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
                 torch.manual_seed(seed)
                 engine.model = get_peft_model(
@@ -104,7 +106,8 @@ def policy_parity(trainer, histories, side, seed):
                 for name, param in engine.model.named_parameters():
                     if "lora_B" in name:
                         param.normal_(std=0.03 if stage == "lora" else 0.1, generator=generator)
-        reference = local()
+        with engine.model.disable_adapter() if native_lora and stage == "dense" else nullcontext():
+            reference = local()
         merged_reference = reference
         if stage != "dense":
             # Evaluate the actual BF16 merged inference policy without perturbing training weights.
@@ -135,6 +138,9 @@ def policy_parity(trainer, histories, side, seed):
         context = engine.rollout_phase() if "rollout_phase" in dir(engine) else nullcontext()
         with context:
             engine.sync_weights()
+            active_request = engine._lora_request if native_lora else None
+            if native_lora and stage == "dense":
+                engine._lora_request = None
             for turn in range(4):
                 if turn == 3:
                     engine.llm.reset_prefix_cache()
@@ -142,8 +148,12 @@ def policy_parity(trainer, histories, side, seed):
                 actual = dense(logprobs[0][0], token_ids[0][0])
                 record(f"{stage}_turn{turn}", reference, actual)
                 record(f"{stage}_turn{turn}_merged_reference", merged_reference, actual)
-                record(f"{stage}_turn{turn}_local_after_sync", local(), actual)
-        record(stage + "_local_policy_drift", reference, local())
+                with engine.model.disable_adapter() if native_lora and stage == "dense" else nullcontext():
+                    record(f"{stage}_turn{turn}_local_after_sync", local(), actual)
+            if native_lora:
+                engine._lora_request = active_request
+        with engine.model.disable_adapter() if native_lora and stage == "dense" else nullcontext():
+            record(stage + "_local_policy_drift", reference, local())
         deltas = [
             (param - frozen[name]).abs().float().max().item()
             for name, param in engine.model.named_parameters()
@@ -168,7 +178,10 @@ def policy_parity(trainer, histories, side, seed):
         engine.sync_weights()
         record("negative_control_after_sync", local(), raw())
     finally:
-        engine.llm.sleep(level=2)
+        if "sleep" in dir(engine):
+            engine.sleep()
+        else:
+            engine.llm.sleep(level=2)
     np.savez_compressed(Path(__file__).parent / f"{side}-{seed}-policy-distributions.npz", **arrays)
     return records
 
@@ -279,13 +292,30 @@ def main():
     load_weights = loader.load_weights
 
     def counted_load(weights):
-        weights = list(weights)
-        counters["weight_transfer_bytes"] += sum(param.numel() * param.element_size() for _, param in weights)
-        return load_weights(weights)
+        def counted():
+            for name, param in weights:
+                counters["weight_transfer_bytes"] += param.numel() * param.element_size()
+                yield name, param
+
+        return load_weights(counted())
 
     def counted_sync():
         counters["sync_count"] += 1
         return sync_weights()
+
+    if "_lora_config" in dir(engine) and engine._lora_config is not None:
+        add_lora = engine.llm.llm_engine.add_lora
+
+        def counted_adapter(request):
+            from safetensors import safe_open
+
+            with safe_open(str(Path(request.lora_path) / "adapter_model.safetensors"), framework="pt") as adapter:
+                for name in adapter.keys():
+                    param = adapter.get_tensor(name)
+                    counters["weight_transfer_bytes"] += param.numel() * param.element_size()
+            return add_lora(request)
+
+        engine.llm.llm_engine.add_lora = annotate(counted_adapter) if args.profile_dir else counted_adapter
 
     engine.sync_weights = counted_sync
     loader.load_weights = counted_load
@@ -325,6 +355,9 @@ def main():
             if profiler:
                 profiler.step()
     record = {
+        "publication": "native_lora"
+        if "_lora_config" in dir(engine) and engine._lora_config is not None
+        else "merged",
         "side": args.side,
         "seed": args.seed,
         "sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=args.checkout, text=True).strip(),

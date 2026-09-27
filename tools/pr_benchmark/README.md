@@ -248,6 +248,13 @@ match between base and head; the head must synchronize at most once per phase an
 `weight_transfer_bytes` measures tensor payload bytes passed to vLLM's `load_weights`, **not measured PCIe traffic**.
 `rollout_seconds` includes synchronization, generation, feedback, and sleep; initialization is excluded.
 
+For native LoRA publication, the workload counts the adapter tensors submitted to vLLM's adapter loader as well as
+any initial base-weight copy. It consumes full-weight exporters lazily. These are logical publication bytes, not total
+device traffic: level-1 sleep also offloads/restores the frozen base, which is visible in the profiler's memory copies.
+The result's `publication` field distinguishes native adapters from merged exports. The probability diagnostic passes
+the published adapter explicitly, including in the deliberately stale-policy control. Native LoRA and BF16-merged
+execution can produce different tokens; the existing exact-token gate still reports this as a failed comparison.
+
 This profile needs its own prepared environment (`requirements-vllm.txt`, including vLLM 0.22.0). SFT environments
 remain usable for their original profiles. Prepare once with the same command as above, adding `--profile vllm-rollout`,
 then select the returned `HYPERAI_ENVIRONMENT_JOB` for this comparison. Respect the controller's existing daily budget.

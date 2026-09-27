@@ -30,6 +30,8 @@ def generation(monkeypatch):
     engine.enable_sleep_mode = True
     engine._rollout_depth = 0
     engine._weights_dirty = True
+    engine._lora_config = None
+    engine._lora_request = None
     engine._llm_weights_sleeping = True
     engine._kv_cache_sleeping = True
     engine.model = torch.nn.Linear(2, 2, bias=False)
@@ -236,6 +238,149 @@ def assert_adapter_restored(engine):
     for name, value in engine.model.state_dict().items():
         torch.testing.assert_close(value, engine.training_state[name], rtol=0, atol=0)
     assert engine.gather_exits
+
+
+@pytest.fixture
+def native_lora(peft_generation, monkeypatch):
+    engine = peft_generation
+    engine._lora_config = engine.model.peft_config["default"]
+    engine._lora_snapshot = None
+    engine._lora_version = 0
+    engine._base_weights_loaded = True
+    monkeypatch.setattr(
+        "trl.generation.vllm_generation.LoRARequest",
+        lambda name, version, path: SimpleNamespace(lora_name=name, lora_int_id=version, lora_path=path),
+        raising=False,
+    )
+    yield engine
+    if engine._lora_snapshot is not None:
+        engine._lora_snapshot.cleanup()
+
+
+def test_native_lora_snapshot_is_immutable_and_versions_are_retired(native_lora):
+    from pathlib import Path
+
+    from safetensors.torch import load_file
+
+    engine = native_lora
+    with engine.rollout_phase():
+        generate(engine)
+        first = engine._lora_request
+        before = load_file(str(Path(first.lora_path) / "adapter_model.safetensors"))
+        with torch.no_grad():
+            for name, param in engine.model.named_parameters():
+                if "lora_B" in name:
+                    param.add_(1)
+        generate(engine)
+        assert engine.llm.llm_engine.add_lora.call_count == 1
+        assert engine.llm.generate.call_args.kwargs["lora_request"] is first
+        after = load_file(str(Path(first.lora_path) / "adapter_model.safetensors"))
+        for name in before:
+            torch.testing.assert_close(before[name], after[name], rtol=0, atol=0)
+        engine.sync_weights()
+        second = engine._lora_request
+        assert second.lora_int_id != first.lora_int_id
+        assert second.lora_name != first.lora_name
+        assert not Path(first.lora_path).exists()
+        engine.llm.llm_engine.remove_lora.assert_called_once_with(first.lora_int_id)
+    engine.llm.sleep.assert_called_once_with(level=1)
+    for name, param in engine.model.state_dict().items():
+        if "lora_" not in name:
+            torch.testing.assert_close(param, engine.training_state[name], rtol=0, atol=0)
+
+
+def test_native_lora_tool_handoff_restores_without_republication(native_lora):
+    engine = native_lora
+    with engine.rollout_phase():
+        generate(engine)
+        engine.sleep()
+        generate(engine)
+    engine.llm.llm_engine.add_lora.assert_called_once()
+    assert engine.llm.wake_up.call_args_list == [call(tags=["weights"]), call(tags=["kv_cache"])] * 2
+    assert engine.llm.sleep.call_args_list == [call(level=1), call(level=1)]
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_native_lora_initial_base_copy_restores_inference_wrappers(native_lora, monkeypatch, failure):
+    import sys
+
+    engine = native_lora
+
+    class NativeLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base_layer = torch.nn.Linear(4, 4)
+
+    inference = torch.nn.Sequential(NativeLayer(), NativeLayer()).to(torch.bfloat16)
+    wrappers = list(inference.children())
+
+    def load(weights):
+        for name, weight in weights:
+            inference.get_parameter(name).data.copy_(weight)
+            if failure:
+                raise RuntimeError("base transfer failed")
+
+    inference.load_weights = load
+    monkeypatch.setitem(sys.modules, "vllm.lora.layers", SimpleNamespace(BaseLayerWithLoRA=NativeLayer))
+    engine.llm.llm_engine.model_executor.driver_worker.model_runner.model = inference
+    engine._base_weights_loaded = False
+    if failure:
+        with pytest.raises(RuntimeError, match="base transfer failed"):
+            engine.sync_weights()
+        assert not engine._base_weights_loaded
+        assert engine._weights_dirty
+        engine.llm.llm_engine.add_lora.assert_not_called()
+    else:
+        engine.sync_weights()
+        for index, wrapper in enumerate(wrappers):
+            torch.testing.assert_close(
+                wrapper.base_layer.weight, engine.model.base_model.model[index].base_layer.weight
+            )
+        assert engine._base_weights_loaded
+    assert list(inference.children()) == wrappers
+
+
+@pytest.mark.parametrize("options", [{}, {"use_dora": True}, {"bias": "all"}, {"rank_pattern": {"0": 4}}])
+def test_native_lora_selection_preserves_other_peft_paths(monkeypatch, options):
+    from accelerate import Accelerator
+    from peft import LoraConfig, get_peft_model
+
+    model = get_peft_model(
+        torch.nn.Sequential(torch.nn.Linear(4, 4)), LoraConfig(r=2, target_modules=["0"], **options)
+    )
+    monkeypatch.setattr(VLLMGeneration, "_init_vllm", lambda self: None)
+    engine = VLLMGeneration(model, Accelerator(cpu=True), None)
+    assert (engine._lora_config is not None) == (options == {})
+
+
+@pytest.mark.parametrize("failure", ["save", "load", "retire"])
+def test_native_lora_failure_does_not_publish_or_mutate_training(native_lora, monkeypatch, failure):
+    from pathlib import Path
+
+    engine = native_lora
+    engine.sync_weights()
+    original = engine._lora_request
+    engine.llm.reset_mock()
+    if failure == "save":
+        monkeypatch.setattr("safetensors.torch.save_file", Mock(side_effect=RuntimeError("failed")))
+    elif failure == "load":
+        engine.llm.llm_engine.add_lora.side_effect = RuntimeError("failed")
+    else:
+        engine.llm.llm_engine.remove_lora.side_effect = [RuntimeError("failed"), True]
+    with pytest.raises(RuntimeError, match="failed"), engine.rollout_phase():
+        engine.sync_weights()
+    assert engine._weights_dirty
+    assert engine._lora_request is original
+    engine.llm.generate.assert_not_called()
+    for name, value in engine.model.state_dict().items():
+        torch.testing.assert_close(value, engine.training_state[name], rtol=0, atol=0)
+    assert Path(original.lora_path).exists()
+    if failure == "load":
+        failed = engine.llm.llm_engine.add_lora.call_args.args[0]
+        assert not Path(failed.lora_path).exists()
+        engine.llm.llm_engine.add_lora.side_effect = None
+        generate(engine)
+        assert engine._lora_request.lora_int_id > failed.lora_int_id
 
 
 def test_closing_real_peft_export_unmerges_inside_gather(peft_generation):
