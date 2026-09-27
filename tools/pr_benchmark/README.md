@@ -322,6 +322,9 @@ python tools/pr_benchmark/controller.py compare \
   --env-file ~/.config/trl-bench/env --timeout-minutes 25
 ```
 
+Add `--resource rtx-3090` to run the same serious workload on a single RTX 3090. The explicit resource overrides
+serious mode's RTX 5090 default; both sides still use the same selected GPU.
+
 Deadlines include initialization, timing, diagnostics and two extra profiling starts. Use `--dry-run` to review the
 manifest before spending compute; the usual daily reservation limit still applies. Serious mode is restricted to
 `vllm-rollout`; it cannot silently turn an SFT or diagnostic-only request into a different experiment.

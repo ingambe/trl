@@ -336,13 +336,14 @@ def main():
     )
     parser.add_argument("--base-ref", default="main", help="Base commit/ref for a pre-PR comparison")
     parser.add_argument("--env-file", type=Path)
+    parser.add_argument("--resource", help="Hyper.ai resource override, e.g. rtx-3090")
     parser.add_argument(
         "--profile", choices=["sft-3090", "smoke", "vllm-rollout", "vllm-rollout-diagnostic"], default="sft-3090"
     )
     parser.add_argument(
         "--serious",
         action="store_true",
-        help="Use the longer LoRA rollout workload on one RTX 5090 (requires --profile vllm-rollout)",
+        help="Use the longer LoRA workload; defaults to RTX 5090 unless --resource is set (requires --profile vllm-rollout)",
     )
     parser.add_argument(
         "--author", action="append", help="Allowed PR author; default is your authenticated GitHub user"
@@ -373,8 +374,8 @@ def main():
         import hta.trace_analysis  # noqa: F401
 
     env = load_env(args.env_file)
-    if args.serious:
-        env["HYPERAI_RESOURCE"] = "rtx-5090"
+    if args.resource or args.serious:
+        env["HYPERAI_RESOURCE"] = args.resource or "rtx-5090"
     if args.command == "doctor":
         print(json.dumps(HyperAI(env).inventory(), indent=2))  # noqa: T201
         return 0
