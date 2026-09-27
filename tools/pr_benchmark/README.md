@@ -265,7 +265,15 @@ compute. Require the latency interval to show an improvement before claiming thi
 transferred bytes alone are not latency evidence. This bounded synthetic workload does not establish distributed,
 merged-adapter, or GPU-tool performance; their cleanup behavior also needs the local regression tests.
 
-If the token hash check fails, `vllm-rollout-diagnostic` runs one paired seed with two measured phases and resets the
-prefix cache before every turn on both sides. It isolates residency/weight-transfer changes from cross-turn prefix
-reuse. Every rollout workload also records `output_tokens` for inspection. The diagnostic's small sample remains
-inconclusive for performance; matching tokens there does not prove general numerical equivalence with prefix reuse.
+If the token hash check fails, `vllm-rollout-diagnostic` runs one paired seed with two measured phases, then compares
+full-vocabulary vLLM probabilities against the local model on an identical fixed history. It checks dense weights,
+nonzero merged LoRA adapters, and a second adapter update across four turns, clearing the prefix cache before the
+fourth. Adapter initialization and updates use independent fixed seeds. A negative control deliberately skips an
+adapter sync, measures the discrepancy, then synchronizes and measures recovery. Frozen-weight drift is recorded
+separately because BF16 merge/unmerge can change the local model itself.
+
+The result includes total variation, KL and Jensen–Shannon divergence, top tokens, and the exact input tokens.
+`SIDE-SEED-policy-distributions.npz` artifacts preserve the full log probabilities. Every rollout workload also
+records `output_tokens`. The normal comparator still rejects differing rollout tokens; inspect the saved diagnostic
+results even when that gate fails. One fixed history and one paired seed cannot establish downstream quality or
+general numerical equivalence, and this diagnostic is not a performance qualification.

@@ -90,7 +90,7 @@ def run(environment):
     for index, seed in enumerate(config["seeds"]):
         # Alternate order to reduce drift caused by temperature or competing workloads.
         for side in ("base", "head") if index % 2 == 0 else ("head", "base"):
-            output = work / f"{side}-{seed}.json"
+            output = ROOT / f"{side}-{seed}.json"
             with (ROOT / f"{side}-{seed}.log").open("w") as log:
                 before = time.perf_counter()
                 subprocess.run(

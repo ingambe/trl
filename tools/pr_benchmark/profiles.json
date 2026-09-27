@@ -74,6 +74,7 @@
     ],
     "kind": "vllm-rollout",
     "turns": 4,
-    "reset_prefix_between_turns": true
+    "reset_prefix_between_turns": false,
+    "policy_parity": true
   }
 }
