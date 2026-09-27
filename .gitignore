@@ -146,3 +146,17 @@ uv.lock
 # AI agent generated artifacts
 /.claude/skills
 /.agents/skills/local-*/
+
+# Local task artifacts, including benchmark results, traces, and analyst archives
+/.humanlayer/
+
+# Generated files when the benchmark worker runs from the source directory
+/tools/pr_benchmark/manifest.json
+/tools/pr_benchmark/result.json
+/tools/pr_benchmark/environment.json
+/tools/pr_benchmark/base-*
+/tools/pr_benchmark/head-*
+/tools/pr_benchmark/profiles/
+/tools/pr_benchmark/model/
+/tools/pr_benchmark/dataset/
+/tools/pr_benchmark/checkpoints/
