@@ -26,6 +26,8 @@ from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
+from profiling import annotate, make_profiler, save_profile_metadata, span
+
 
 def policy_parity(trainer, histories, side, seed):
     """Compare full next-token distributions on fixed histories, including a stale-adapter control."""
@@ -152,6 +154,7 @@ def main():
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--side", choices=["base", "head"], required=True)
     parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--profile-dir", type=Path)
     args = parser.parse_args()
     sys.path.insert(0, str(args.checkout))
 
@@ -161,7 +164,10 @@ def main():
 
     from trl import GRPOConfig, GRPOTrainer
 
-    config = json.loads(args.manifest.read_text())["workload"]
+    manifest = json.loads(args.manifest.read_text())
+    config = manifest["workload"].copy()
+    if args.profile_dir:
+        config["steps"] = min(2, config["steps"])
     if config.get("policy_parity"):
         # The diagnostic performs many small CPU tensor reductions on a worker with a limited CPU quota.
         torch.set_num_threads(1)
@@ -179,14 +185,16 @@ def main():
         for turn in range(config["turns"]):
             if config.get("reset_prefix_between_turns", False):
                 trainer.vllm_generation.llm.reset_prefix_cache()
-            _, tokens, _, _ = trainer.vllm_generation.generate(histories, images=None, num_generations=1)
+            with span(f"turn_{turn}", args.profile_dir is not None):
+                _, tokens, _, _ = trainer.vllm_generation.generate(histories, images=None, num_generations=1)
             for history, completion, ids in zip(histories, completions, tokens, strict=True):
                 history.extend(ids)
                 completion.extend(ids)
                 # Deterministic CPU tool feedback; all turns keep the same policy.
                 if turn + 1 < config["turns"]:
-                    history.extend(tool_ids)
-                    completion.extend(tool_ids)
+                    with span("cpu_tool", args.profile_dir is not None):
+                        history.extend(tool_ids)
+                        completion.extend(tool_ids)
         return {"prompt_ids": initial, "completion_ids": completions, "logprobs": None}
 
     # Full-vocabulary logprobs are enabled only for the diagnostic, without changing the production API.
@@ -240,25 +248,36 @@ def main():
 
     engine.sync_weights = counted_sync
     loader.load_weights = counted_load
+    if args.profile_dir:
+        engine.llm.wake_up = annotate(engine.llm.wake_up)
+        engine.llm.sleep = annotate(engine.llm.sleep)
+        engine.llm.reset_prefix_cache = annotate(engine.llm.reset_prefix_cache)
+        engine.sync_weights = annotate(engine.sync_weights)
+        loader.load_weights = annotate(loader.load_weights)
     durations, outputs = [], []
     sleeping = True
     torch.cuda.reset_peak_memory_stats()
-    for phase in range(config["warmup_steps"] + config["steps"]):
-        # A real update between phases must invalidate the previous policy's KV.
-        with torch.no_grad():
-            next(trainer.model.parameters()).add_(0.01)
-        trainer.state.global_step = phase
-        if phase == config["warmup_steps"]:
-            counters.update(weight_transfer_bytes=0, sync_count=0)
-        torch.cuda.synchronize()
-        started = time.perf_counter()
-        result = trainer._generate(prompts)
-        torch.cuda.synchronize()
-        duration = time.perf_counter() - started
-        sleeping = sleeping and engine.llm.llm_engine.is_sleeping()
-        if phase >= config["warmup_steps"]:
-            durations.append(duration)
-            outputs.append(result[1])
+    profiler = make_profiler(args.profile_dir, config["warmup_steps"], config["steps"]) if args.profile_dir else None
+    with profiler if profiler else nullcontext():
+        for phase in range(config["warmup_steps"] + config["steps"]):
+            # A real update between phases must invalidate the previous policy's KV.
+            with torch.no_grad():
+                next(trainer.model.parameters()).add_(0.01)
+            trainer.state.global_step = phase
+            if phase == config["warmup_steps"]:
+                counters.update(weight_transfer_bytes=0, sync_count=0)
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            with span("rollout_phase", args.profile_dir is not None):
+                result = trainer._generate(prompts)
+            torch.cuda.synchronize()
+            duration = time.perf_counter() - started
+            sleeping = sleeping and engine.llm.llm_engine.is_sleeping()
+            if phase >= config["warmup_steps"]:
+                durations.append(duration)
+                outputs.append(result[1])
+            if profiler:
+                profiler.step()
     record = {
         "side": args.side,
         "seed": args.seed,
@@ -279,10 +298,12 @@ def main():
             "packages": sorted(f"{d.metadata['Name']}=={d.version}" for d in importlib.metadata.distributions()),
         },
     }
-    if config.get("policy_parity"):
+    if config.get("policy_parity") and not args.profile_dir:
         histories = tokenizer(prompts)["input_ids"]
         record["policy_parity_prompt_ids"] = histories[0]
         record["policy_parity"] = policy_parity(trainer, histories, args.side, args.seed)
+    if args.profile_dir:
+        save_profile_metadata(args.profile_dir, record, manifest, config["warmup_steps"], config["steps"])
     args.output.write_text(json.dumps(record, indent=2, allow_nan=False))
 
 

@@ -30,6 +30,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import quote
 
+from analyze_profiles import analyze
 from compare import compare, markdown
 from environment import environment_spec
 from hyperai import BUNDLE_FILES, TERMINAL, HyperAI
@@ -173,7 +174,8 @@ def manifest_for(github, pull, profile, environment_job=None, prepare=False):
             else {"train_seconds": 5.0, "steady_seconds": 5.0, "eval_loss": 1.0}
         ),
         "harness": {
-            name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in (*BUNDLE_FILES[:-1], "compare.py")
+            name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+            for name in (*BUNDLE_FILES[:-1], "compare.py", "analyze_profiles.py", "requirements-controller.txt")
         },
     }
     if config.get("kind") == "vllm-rollout":
@@ -288,18 +290,23 @@ def execute(args, github, provider, manifest, state, state_file, record=None):
             record["outcome"] = "prepared"
             print(f"Environment ready. Set HYPERAI_ENVIRONMENT_JOB={job['id']} in your local env file.", flush=True)  # noqa: T201
             return "prepared"
+        for side in ("base", "head"):
+            provider.download_profile(job["id"], side, directory / f"{side}-profile.zip")
+        analyze(directory)
         summary = compare(result, manifest)
         report = markdown(summary, manifest)
+        report += "\nProfiler diagnostics: [before/after traces and HTA tables](profiles/report.md). Instrumented runs are excluded from timing.\n"
         save(directory / "summary.json", summary)
         (directory / "report.md").write_text(report)
         # Recheck after download/analysis so an obsolete comparison cannot publish a green status.
         if not github.current(manifest):
             raise InterruptedError("Comparison became stale before publication")
         if publish:
-            github.publish(manifest, summary, report, job["url"])
+            github.publish(manifest, summary, report.replace("(profiles/report.md)", f"({job['url']})"), job["url"])
         record["status"] = "completed"
         record["outcome"] = summary["outcome"]
         print(report, flush=True)  # noqa: T201
+        print(f"Local profiler report: {directory / 'profiles/report.md'}", flush=True)  # noqa: T201
         return summary["outcome"]
     except BaseException:
         record["status"] = "cancel_pending"
@@ -348,6 +355,9 @@ def main():
         parser.error("--rerun is only supported for manual runs")
     if args.command in {"prepare", "calibrate", "compare"} and args.publish:
         parser.error("Preparation, calibration, and pre-PR comparisons do not publish PR statuses")
+    if args.command not in {"doctor", "prepare"} and not args.dry_run:
+        import hta.trace_analysis  # noqa: F401
+
     env = load_env(args.env_file)
     if args.command == "doctor":
         print(json.dumps(HyperAI(env).inventory(), indent=2))  # noqa: T201

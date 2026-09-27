@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -85,43 +86,43 @@ def run(environment):
             "TOKENIZERS_PARALLELISM": "false",
         }
     )
+
+    def run_child(side, seed, profile=False):
+        stem = f"{side}-{seed}" + ("-profile" if profile else "")
+        output = ROOT / f"{stem}.json"
+        command = [
+            sys.executable,
+            str(ROOT / ("rollout_workload.py" if config.get("kind") == "vllm-rollout" else "workload.py")),
+            "--model-path",
+            str(environment / "model"),
+            "--checkout",
+            str(work / side),
+            "--manifest",
+            str(ROOT / "manifest.json"),
+            "--data",
+            str(data),
+            "--side",
+            side,
+            "--seed",
+            str(seed),
+            "--output",
+            str(output),
+        ]
+        if profile:
+            command += ["--profile-dir", str(ROOT / f"{side}-profile")]
+        with (ROOT / f"{stem}.log").open("w") as log:
+            before = time.perf_counter()
+            subprocess.run(command, cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+        record = json.loads(output.read_text())
+        record["workload_seconds"] = time.perf_counter() - before
+        return record
+
     records = []
     started = time.perf_counter()
     for index, seed in enumerate(config["seeds"]):
         # Alternate order to reduce drift caused by temperature or competing workloads.
         for side in ("base", "head") if index % 2 == 0 else ("head", "base"):
-            output = ROOT / f"{side}-{seed}.json"
-            with (ROOT / f"{side}-{seed}.log").open("w") as log:
-                before = time.perf_counter()
-                subprocess.run(
-                    [
-                        sys.executable,
-                        str(ROOT / ("rollout_workload.py" if config.get("kind") == "vllm-rollout" else "workload.py")),
-                        "--model-path",
-                        str(environment / "model"),
-                        "--checkout",
-                        str(work / side),
-                        "--manifest",
-                        str(ROOT / "manifest.json"),
-                        "--data",
-                        str(data),
-                        "--side",
-                        side,
-                        "--seed",
-                        str(seed),
-                        "--output",
-                        str(output),
-                    ],
-                    cwd=work,
-                    env=env,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    check=True,
-                )
-                elapsed = time.perf_counter() - before
-            record = json.loads(output.read_text())
-            record["workload_seconds"] = elapsed
-            records.append(record)
+            records.append(run_child(side, seed))
             print(f"Completed {side}, seed {seed}", flush=True)  # noqa: T201
     result = {
         "manifest_id": manifest["id"],
@@ -130,6 +131,18 @@ def run(environment):
         "comparison_seconds": time.perf_counter() - started,
     }
     (ROOT / "result.json").write_text(json.dumps(result, indent=2, allow_nan=False))
+    # Profiling starts after all timing samples, in fresh processes with the same first seed.
+    # Persist timings first so a CUPTI/capture failure cannot destroy already completed measurements.
+    result["profiles"] = {}
+    for side in ("base", "head"):
+        run_child(side, config["seeds"][0], profile=True)
+        archive = Path(shutil.make_archive(str(ROOT / f"{side}-profile"), "zip", ROOT / f"{side}-profile"))
+        result["profiles"][side] = {
+            "file": archive.name,
+            "bytes": archive.stat().st_size,
+            "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+        }
+        (ROOT / "result.json").write_text(json.dumps(result, indent=2, allow_nan=False))
 
 
 if __name__ == "__main__":

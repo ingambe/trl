@@ -226,7 +226,7 @@ resolution. A `cancel_pending` record is retried on restart. No result from eith
 `environment.py`, `job.py`, `workload.py`, the manifest and `result.json` format are provider-independent. `hyperai.py` is the only cloud
 adapter. A future provider needs `validate(manifest)` for read-only configuration checks before reserving budget, plus
 `submit(bundle, timeout_seconds)`, `status(job_id)`,
-`result(job_id)`, and `cancel(job_id)`, with a provider-side deadline and normalized terminal states. Keep authentication
+`result(job_id)`, `download_profile(job_id, side, destination)`, and `cancel(job_id)`, with a provider-side deadline and normalized terminal states. Keep authentication
 and upload logic in the adapter; add explicit provider selection only when a second provider is implemented.
 
 ## Local tests
@@ -277,3 +277,59 @@ The result includes total variation, KL and Jensen–Shannon divergence, top tok
 records `output_tokens`. The normal comparator still rejects differing rollout tokens; inspect the saved diagnostic
 results even when that gate fails. One fixed history and one paired seed cannot establish downstream quality or
 general numerical equivalence, and this diagnostic is not a performance qualification.
+
+## Before/after PyTorch and HTA profiles
+
+Every comparison now runs a separate profiling pair after all unprofiled timing samples, using the first paired seed
+and the same immutable commits, model, tokenized data, and prepared environment. Each capture follows the workload's
+normal warm-up and covers two complete rollout phases (including all turns, weight sync, CPU tool feedback, and final
+sleep), or two SFT optimizer steps. Profiles with fewer available steps capture those steps. Initialization, held-out
+scoring, and the extra LoRA parity diagnostic are outside the captured window. SFT repeats its normal warm-up training
+before the two captured steps. These instrumented runs never enter the latency/quality comparator or its timing totals.
+Allow for two additional model starts and profiler overhead inside the existing job deadline and reservation.
+
+Update the local controller dependencies with `pip install -r tools/pr_benchmark/requirements-controller.txt`.
+HTA runs **locally**, after downloading the traces; no GPU environment rebuild is needed. PyTorch collects the trace;
+HTA analyzes it and writes an augmented trace with queue-length and memcpy-bandwidth counters. It is not a second
+independent profiler. The controller records the analysis package versions alongside the pinned HTA version.
+
+The run directory retains:
+
+```text
+base-profile.zip / head-profile.zip       # checksummed original capture archives
+profiles/report.md                       # before/after temporal breakdown and artifact links
+profiles/summary.json                    # complete HTA tables, observed memcpy bytes, analysis environment
+profiles/kernel-deltas.csv               # per-kernel time changes (missing kernels remain explicit)
+profiles/{base,head}/
+  metadata.json                          # commit, seed, workload, capture window, GPU packages
+  trace.json.gz                          # CPU/CUDA Chrome trace: operators, shapes, allocations
+  trace_with_counters.json.gz             # HTA queue-length and memory-copy bandwidth timeline
+  memory-events.json.gz                   # timestamped PyTorch allocation/deallocation events
+  operators-*.txt                         # all operators grouped by input shape, CPU/CUDA time and memory
+  hta-*.csv                              # kernels, kernel types, temporal/idle breakdown, idle intervals,
+                                         # CPU launch/GPU delays, memory bandwidth, queue length
+```
+
+Open either Chrome trace in [Perfetto](https://ui.perfetto.dev/) or `chrome://tracing`. The rollout trace annotates
+whole phases, each turn, CPU tools, sync, tensor loading, wake, cache reset, and sleep. HTA's memory-copy bandwidth is
+for observed memcpy/memset operations; it does not measure bandwidth within compute kernels. The existing
+`weight_transfer_bytes` counter still measures logical tensor payload, not PCIe traffic. HTA 0.5 does not recognize
+CUDA Graph launches in its launch/queue analyses; the report flags that limitation whenever replays are present.
+Use the raw GPU timeline and temporal/kernel totals for graph execution. Full Python call-tree collection is disabled: it produced a 160 MB compressed trace and excessive postprocessing
+on this small workload. Operator/shape/memory profiling still adds overhead: use these traces to locate bottlenecks, then validate changes with the unprofiled
+paired measurements. One captured seed is diagnostic evidence, not a confidence interval or quality qualification.
+
+Artifacts are downloaded and analyzed before the quality gate, so traces remain available when the gate rejects a
+candidate. Missing CUDA kernels (for example, unavailable CUPTI), mismatched provenance, or invalid downloads fail the
+run rather than silently claiming a complete profile. Raw archives survive an HTA analysis failure. Downloads are
+bounded to 256 MB per archive and 2 GB expanded per side; raw outputs also remain in the Hyper.ai job. Profiling or
+analysis failure never erases already completed unprofiled results, but the run cannot publish a passing status.
+
+Rerun HTA locally without spending GPU time:
+
+```bash
+python tools/pr_benchmark/analyze_profiles.py ~/.local/state/trl-pr-benchmark/runs/RUN_ID
+```
+
+Reference: [PyTorch Profiler](https://docs.pytorch.org/docs/stable/profiler.html) and
+[HTA trace analysis](https://hta.readthedocs.io/en/latest/source/api/trace_analysis_api.html).
