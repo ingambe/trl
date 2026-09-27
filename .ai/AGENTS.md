@@ -81,6 +81,14 @@ There are no `slow` tests: use tiny models, and put tests that need several GPUs
 
 ## Documentation
 
+### GitHub issues
+
+- Lead with the affected workflow and concrete impact.
+- Explain the cause with exact code links and the enclosing call flow or loop; use short annotated pseudocode when helpful.
+- Include a minimal, self-contained, verified reproducer with adjacent **Observed** and **Expected** outputs.
+- Put dependency versions and the affected revision in **System Info**; omit clone/install tutorials and branch-development history.
+- Distinguish defects from intentional trade-offs. Keep necessary caveats brief; avoid speculative requirements and oversized acceptance checklists.
+
 ### Docstrings
 
 Docstrings must follow the repository format below. Do **not** convert docstrings to other styles (Google, NumPy, etc.).
