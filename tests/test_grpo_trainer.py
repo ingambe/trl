@@ -1766,6 +1766,7 @@ class TestGRPOTrainer(TrlTestCase):
 
         # Enable the correction after construction so that no vLLM server is required.
         trainer.use_vllm = True
+        trainer.vllm_generation = SimpleNamespace(sleep=lambda: None)
         trainer.vllm_importance_sampling_correction = True
         trainer.vllm_importance_sampling_mode = vllm_importance_sampling_mode
 
@@ -1790,19 +1791,6 @@ class TestGRPOTrainer(TrlTestCase):
 
         trainer._generate = generate_with_one_unscorable_token
 
-        # Snapshot the divergence metric as soon as it is produced. Reading `_metrics` after training is useless,
-        # because the dict is cleared on every log.
-        original_score = trainer._generate_and_score_completions
-        recorded_metrics = []
-
-        def record_metrics(inputs):
-            outputs = original_score(inputs)
-            for key in ["sampling/sampling_logp_difference/mean", "sampling/sampling_logp_difference/max"]:
-                recorded_metrics.extend((key, value) for value in trainer._metrics["train"][key])
-            return outputs
-
-        trainer._generate_and_score_completions = record_metrics
-
         # Capture the off-policy mask, the third consumer of the sampling logprobs.
         original_off_policy_mask = trainer.get_off_policy_mask
         off_policy_masks = []
@@ -1815,13 +1803,17 @@ class TestGRPOTrainer(TrlTestCase):
         trainer.get_off_policy_mask = record_off_policy_mask
 
         # Assert on every loss the trainer actually returns. The aggregate reported in `log_history` is not a
-        # reliable witness here, since it can stay finite while an individual step's loss carries NaN.
+        # reliable witness here, since it can stay finite while an individual step's loss carries NaN. Also snapshot
+        # the divergence metric, which is produced in the loss and cleared from `_metrics` on every log.
         original_compute_loss = trainer._compute_loss
         losses = []
+        recorded_metrics = []
 
         def record_loss(model, inputs):
             loss = original_compute_loss(model, inputs)
             losses.append(loss)
+            for key in ["sampling/sampling_logp_difference/mean", "sampling/sampling_logp_difference/max"]:
+                recorded_metrics.extend((key, value) for value in trainer._metrics["train"][key])
             return loss
 
         trainer._compute_loss = record_loss
@@ -1850,6 +1842,49 @@ class TestGRPOTrainer(TrlTestCase):
                 "an unscorable token caused sequences to be dropped by the off-policy mask, even though the "
                 "threshold is high enough to keep every sequence"
             )
+
+    def test_vllm_importance_sampling_skips_old_logps_forward_when_aligned(self):
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+
+        training_args = GRPOConfig(
+            output_dir=self.tmp_dir,
+            per_device_train_batch_size=3,
+            num_generations=3,
+            max_completion_length=8,
+            max_steps=1,
+            report_to="none",
+        )
+        trainer = GRPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            reward_funcs="trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5",
+            args=training_args,
+            train_dataset=dataset,
+        )
+
+        # Enable the correction after construction so that no vLLM server is required.
+        trainer.use_vllm = True
+        trainer.vllm_generation = SimpleNamespace(sleep=lambda: None)
+        trainer.vllm_importance_sampling_correction = True
+        original_generate = trainer._generate
+
+        def generate_with_sampling_logps(prompts):
+            trainer.use_vllm = False
+            try:
+                outputs = list(original_generate(prompts))
+            finally:
+                trainer.use_vllm = True
+            outputs[4] = [[-0.5] * len(ids) for ids in outputs[1]]
+            return tuple(outputs)
+
+        trainer._generate = generate_with_sampling_logps
+
+        with patch.object(
+            trainer, "_get_per_token_logps_and_entropies", wraps=trainer._get_per_token_logps_and_entropies
+        ) as get_per_token_logps:
+            trainer.train()
+
+        # Generation and optimization are aligned, so the training forward is the only actor forward
+        assert get_per_token_logps.call_count == 1
 
     def test_train_with_off_policy_mask(self):
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
