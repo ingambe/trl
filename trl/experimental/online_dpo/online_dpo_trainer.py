@@ -840,6 +840,7 @@ class OnlineDPOTrainer(_BaseTrainer):
                             self._sync_fsdp2_params_to_vllm(self.model)
                     else:
                         # DeepSpeed ZeRO-3 with PEFT
+                        weights = []
                         for name, param in self.model.named_parameters():
                             # When using PEFT, we need to recover the original parameter name
                             name = name.removeprefix("base_model.model.").replace(".base_layer", "")
@@ -854,8 +855,10 @@ class OnlineDPOTrainer(_BaseTrainer):
                             if self.vllm_mode == "server" and self.accelerator.is_main_process:
                                 self.vllm_client.update_named_param(name, param.data)
                             elif self.vllm_mode == "colocate":
-                                llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                                llm_model.load_weights([(name, param.data)])
+                                weights.append((name, param.data))
+                        if self.vllm_mode == "colocate":
+                            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+                            llm_model.load_weights(weights)
                 finally:
                     # Unmerge adapters while parameters are still gathered
                     self.model.unmerge_adapter()
@@ -873,6 +876,11 @@ class OnlineDPOTrainer(_BaseTrainer):
                     self._sync_fsdp1_params_to_vllm(self.model)  # use memory-efficient post-order traversal for FSDP
                 elif fsdp_version == 2:
                     self._sync_fsdp2_params_to_vllm(self.model)
+            elif self.vllm_mode == "colocate" and not zero_stage_3:
+                llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+                llm_model.load_weights(
+                    (self._fix_param_name_to_vllm(name), param.data) for name, param in self.model.named_parameters()
+                )
             else:
                 for name, param in self.model.named_parameters():
                     name = self._fix_param_name_to_vllm(name)

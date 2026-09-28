@@ -32,6 +32,10 @@ from transformers.utils import is_liger_kernel_available, is_peft_available, is_
 from trl.generation.vllm_generation import VLLMGeneration
 
 
+if is_peft_available():
+    from peft import LoraConfig, get_peft_model
+
+
 # ============================================================================
 # Silence transformers "LOAD REPORT" tables
 # ============================================================================
@@ -411,3 +415,16 @@ def tiny_llama():
         eos_token="<eos>",
     )
     return LlamaForCausalLM(config), tokenizer
+
+
+@pytest.fixture
+def peft_vllm_generation(vllm_generation):
+    vllm_generation.model = get_peft_model(
+        torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)),
+        LoraConfig(r=1, lora_alpha=1, target_modules=["0", "1"]),
+    )
+    # Dyadic values keep merge and unmerge exact
+    with torch.no_grad():
+        for parameter in vllm_generation.model.parameters():
+            parameter.fill_(0.25)
+    return vllm_generation
