@@ -17,7 +17,7 @@
 import logging
 import math
 import os
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -472,31 +472,32 @@ class VLLMGeneration:
                     for name, param in module.get_base_layer().named_parameters(recurse=False)
                 ]
                 model.merge_adapter()
+                try:
+                    # Read the vLLM weights while parameters are gathered
+                    if self._dist.is_fsdp:  # note if using FSDP, gather_params is a no-op
+                        # For PEFT with FSDP we need to use the memory efficient post-order traversal
+                        yield from self._iter_fsdp_params(model)
+                    else:
+                        # DeepSpeed ZeRO-3 with PEFT
+                        for name, param in model.named_parameters():
+                            # When using PEFT, we need to recover the original parameter name
+                            name = name.removeprefix("base_model.model.").replace(".base_layer", "")
+                            # Skip PEFT layers: they don't exist in vLLM, and they are merged already.
+                            if model.prefix in name:
+                                continue
+                            # When module to save, remove its prefix and discard the original module
+                            if "original_module" in name:
+                                continue
+                            name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
 
-                # Read the vLLM weights while parameters are gathered
-                if self._dist.is_fsdp:  # note if using FSDP, gather_params is a no-op
-                    # For PEFT with FSDP we need to use the memory efficient post-order traversal
-                    yield from self._iter_fsdp_params(model)
-                else:
-                    # DeepSpeed ZeRO-3 with PEFT
-                    for name, param in model.named_parameters():
-                        # When using PEFT, we need to recover the original parameter name
-                        name = name.removeprefix("base_model.model.").replace(".base_layer", "")
-                        # Skip PEFT layers: they don't exist in vLLM, and they are merged already.
-                        if model.prefix in name:
-                            continue
-                        # When module to save, remove its prefix and discard the original module
-                        if "original_module" in name:
-                            continue
-                        name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
-
-                        yield name, param.data
-                # Unmerge adapters while parameters are still gathered
-                model.unmerge_adapter()
-                # bitsandbytes merges replace the parameter, so re-register the original
-                for base_layer, name, param, data in originals:
-                    param.data.copy_(data)
-                    base_layer.register_parameter(name, param)
+                            yield name, param.data
+                finally:
+                    # Unmerge adapters while parameters are still gathered
+                    model.unmerge_adapter()
+                    # bitsandbytes merges replace the parameter, so re-register the original
+                    for base_layer, name, param, data in originals:
+                        param.data.copy_(data)
+                        base_layer.register_parameter(name, param)
                 # Parameters will automatically be repartitioned when exiting the context
         else:
             # For non-PEFT models, simply gather (if needed) and read each parameter individually.
@@ -532,13 +533,15 @@ class VLLMGeneration:
                     for name, param in self._iter_named_params()
                 ]
             if accelerator.is_main_process:
-                self.vllm_client.update_named_params(self._weight_metadata, self._iter_named_params())
+                with closing(self._iter_named_params()) as params:
+                    self.vllm_client.update_named_params(self._weight_metadata, params)
             else:
                 for _ in self._iter_named_params():  # take part in the gather collectives
                     pass
         elif self.mode == "colocate":
-            for name, param in self._iter_named_params():
-                self.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights([(name, param)])
+            with closing(self._iter_named_params()) as params:
+                for name, param in params:
+                    self.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights([(name, param)])
 
         # Reset cache on vLLM
         if self.mode == "server" and accelerator.is_main_process:
