@@ -308,6 +308,8 @@ def main():
             started = time.perf_counter()
             with span("rollout_phase", profiling):
                 result = trainer._generate(prompts)
+                # The trainer puts vLLM to sleep after each rollout
+                engine.sleep()
             torch.cuda.synchronize()
             duration = time.perf_counter() - started
             sleeping = sleeping and engine.llm.llm_engine.is_sleeping()
