@@ -90,6 +90,7 @@ def _make_server_generation(accelerator, *, max_completion_length):
     generation = object.__new__(VLLMGeneration)
     generation.accelerator = accelerator
     generation.mode = "server"
+    generation._weights_dirty = False
     generation.temperature = 1.0
     generation.top_p = 1.0
     generation.top_k = -1

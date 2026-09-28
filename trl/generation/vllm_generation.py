@@ -291,6 +291,8 @@ class VLLMGeneration:
         # Tensor names, dtypes and shapes streamed to the server on each weight sync. Collected on the first sync, as
         # it requires gathering the parameters, and constant afterwards.
         self._weight_metadata = None
+        # Set during a weight sync, so a failed one is retried before generating
+        self._weights_dirty = False
 
         self._init_vllm()
 
@@ -522,6 +524,7 @@ class VLLMGeneration:
 
         Handles FSDP, DeepSpeed, PEFT weight synchronization.
         """
+        self._weights_dirty = True
         # Wake up vLLM weights before loading to ensure device memory is mapped. Without this, load_weights() writes to
         # freed/unmapped memory when sleep mode is active, which crashes on backends with strict physical memory
         # management (e.g., Ascend NPU). See https://github.com/huggingface/trl/issues/5142
@@ -561,6 +564,7 @@ class VLLMGeneration:
             self.vllm_client.reset_prefix_cache()
         elif self.mode == "colocate":
             self.llm.reset_prefix_cache()
+        self._weights_dirty = False
 
     def sleep(self):
         if self.mode == "colocate" and self.enable_sleep_mode and not self._kv_cache_sleeping:
@@ -640,7 +644,8 @@ class VLLMGeneration:
         # Sleep level 2 discards the weights, so waking up isn't enough: they must be re-pushed from the training
         # model. vLLM's `reload_weights` can't be used here, as it reloads the initial checkpoint from disk rather
         # than the current training weights. See https://github.com/vllm-project/vllm/issues/29341
-        if self.mode == "colocate" and self.enable_sleep_mode and self._llm_weights_sleeping:
+        # A sync that failed midway left the weights partially updated, so it is retried too
+        if self._weights_dirty or (self.mode == "colocate" and self.enable_sleep_mode and self._llm_weights_sleeping):
             self.sync_weights()
 
         # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
