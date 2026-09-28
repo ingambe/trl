@@ -22,10 +22,12 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from accelerate import Accelerator
 from transformers.utils import is_liger_kernel_available, is_peft_available, is_torch_xpu_available
 
 # Apply TRL's compatibility patches before test modules import transformers' Trainer, which imports peft (#7871)
 import trl  # noqa: F401
+from trl.generation.vllm_generation import VLLMGeneration
 
 
 # ============================================================================
@@ -331,10 +333,6 @@ def undo_liger_kernel_patching(monkeypatch):
 
 @pytest.fixture
 def vllm_generation(monkeypatch):
-    from accelerate import Accelerator
-
-    from trl.generation.vllm_generation import VLLMGeneration
-
     monkeypatch.setattr(VLLMGeneration, "_init_vllm", lambda self: None)
     generation = VLLMGeneration(torch.nn.Linear(1, 1), Accelerator(cpu=True), None)
     generation.llm = Mock()
