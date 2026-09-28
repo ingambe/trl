@@ -215,6 +215,8 @@ class VLLMGeneration:
             - "terratorch" will use the TerraTorch model implementation.
         trust_remote_code (`bool`, *optional*, defaults to `False`):
             Trust remote code (e.g., from HuggingFace) when downloading the model and tokenizer.
+        cast_lm_head_to_fp32 (`bool`, *optional*, defaults to `False`):
+            Whether to compute the language modeling head in float32 in colocate mode. Requires vLLM 0.26.0 or later.
 
         > Parameters for generation:
 
@@ -274,6 +276,7 @@ class VLLMGeneration:
         enable_sleep_mode: bool = False,
         model_impl: str = "auto",
         trust_remote_code: bool = False,
+        cast_lm_head_to_fp32: bool = False,
         # Generation configuration
         repetition_penalty: float = 1.0,
         temperature: float = 1.0,
@@ -309,6 +312,7 @@ class VLLMGeneration:
         self.enable_sleep_mode = enable_sleep_mode
         self.model_impl = model_impl
         self.trust_remote_code = trust_remote_code
+        self.cast_lm_head_to_fp32 = cast_lm_head_to_fp32
 
         # Generation configuration
         self.repetition_penalty = repetition_penalty
@@ -416,6 +420,16 @@ class VLLMGeneration:
                     if isinstance(module, bnb.nn.Linear8bitLt):
                         raise ValueError("vLLM does not support in-flight 8-bit quantization.")
 
+            hf_overrides = None
+            if self.cast_lm_head_to_fp32:
+                if is_vllm_available(min_version="0.26.0"):
+                    hf_overrides = {"head_dtype": "float32"}
+                else:
+                    logger.warning(
+                        "`cast_lm_head_to_fp32=True` requires vLLM 0.26.0 or later to run the vLLM lm_head in float32. "
+                        "Generation will use the model dtype for the lm_head."
+                    )
+
             # Build LLM initialization kwargs
             self.llm = LLM(
                 model=model.name_or_path,
@@ -436,6 +450,7 @@ class VLLMGeneration:
                 # Important so temperature scaling/logit tweaking affects the TIS log probs
                 logprobs_mode="processed_logprobs",
                 trust_remote_code=self.trust_remote_code,
+                hf_overrides=hf_overrides,
                 # Not passed otherwise: vLLM < 0.28 doesn't accept it
                 **({"return_sampling_mask": True} if self.return_sampling_mask else {}),
                 # The extensible KV cache (vLLM >= 0.34) caps torch's allocator for the whole process and keeps the cap
