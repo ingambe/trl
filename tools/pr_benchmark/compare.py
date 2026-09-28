@@ -140,7 +140,14 @@ def compare(result, manifest):
 
         means = {
             key: {side: statistics.mean(r[key] for r in runs[side]) for side in runs}
-            for key in ("generation_seconds", "update_seconds", "peak_memory_bytes", "eval_reward")
+            for key in (
+                "generation_seconds",
+                "update_seconds",
+                "peak_memory_bytes",
+                "init_peak_device_bytes",
+                "train_peak_device_bytes",
+                "eval_reward",
+            )
         }
         logp = "sampling/sampling_logp_difference/mean"
         parameters = max(
@@ -217,8 +224,12 @@ def markdown(summary, manifest):
             f"{means['generation_seconds']['head']:.3f} |",
             f"| Steady backward + optimizer seconds | {means['update_seconds']['base']:.3f} | "
             f"{means['update_seconds']['head']:.3f} |",
-            f"| Peak memory (GB) | {means['peak_memory_bytes']['base'] / 1e9:.3f} | "
+            f"| Peak torch-allocated memory (GB) | {means['peak_memory_bytes']['base'] / 1e9:.3f} | "
             f"{means['peak_memory_bytes']['head'] / 1e9:.3f} |",
+            f"| Peak device memory during construction (GB) | {means['init_peak_device_bytes']['base'] / 1e9:.3f} | "
+            f"{means['init_peak_device_bytes']['head'] / 1e9:.3f} |",
+            f"| Peak device memory during training (GB) | {means['train_peak_device_bytes']['base'] / 1e9:.3f} | "
+            f"{means['train_peak_device_bytes']['head'] / 1e9:.3f} |",
             f"| Held-out greedy reward | {means['eval_reward']['base']:.4f} | {means['eval_reward']['head']:.4f} |",
             f"| Max vLLM/trainer logprob gap | {training['max_logprob_gap']['base']:.3g} | "
             f"{training['max_logprob_gap']['head']:.3g} |",

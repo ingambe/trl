@@ -21,7 +21,9 @@ import math
 import os
 import subprocess
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -70,42 +72,63 @@ def main():
             if state.global_step > config["warmup_steps"]:
                 timings["steady_seconds"] += time.perf_counter() - self.step_started
 
+    @contextmanager
+    def device_peak(key):
+        # Device-wide, so vLLM's own allocator counts too; the torch allocator's peak misses it
+        done = threading.Event()
+
+        def sample():
+            while not done.wait(0.005):
+                free, total = torch.cuda.mem_get_info(int(os.environ.get("LOCAL_RANK", "0")))
+                device[key] = max(device[key], total - free)
+
+        device[key] = 0
+        thread = threading.Thread(target=sample)
+        thread.start()
+        try:
+            yield
+        finally:
+            done.set()
+            thread.join()
+
     timings = {"steady_seconds": 0.0, "generation_seconds": 0.0}
+    device = {}
     share = "vllm_share_weights" in GRPOConfig.__dataclass_fields__
-    trainer = GRPOTrainer(
-        model=str(args.model_path),
-        reward_funcs=reward,
-        processing_class=tokenizer,
-        args=GRPOConfig(
-            output_dir=str(args.output.parent / "checkpoints"),
-            model_init_kwargs={"dtype": "bfloat16", "attn_implementation": "sdpa"},
-            use_vllm=True,
-            vllm_mode="colocate",
-            vllm_enable_sleep_mode=True,
-            **({"vllm_share_weights": True} if share else {}),
-            vllm_gpu_memory_utilization=0.35,
-            vllm_max_model_length=config["context_tokens"],
-            max_completion_length=config["completion_tokens"],
-            num_generations=config["num_generations"],
-            per_device_train_batch_size=config["batch_size"],
-            gradient_accumulation_steps=1,
-            max_steps=config["steps"],
-            learning_rate=config["learning_rate"],
-            lr_scheduler_type="constant",
-            warmup_steps=0,
-            weight_decay=0.0,
-            optim="adamw_torch",
-            bf16=True,
-            seed=args.seed,
-            data_seed=args.seed,
-            logging_steps=1,
-            report_to="none",
-            save_strategy="no",
-            disable_tqdm=True,
-        ),
-        train_dataset=Dataset.from_dict({"prompt": train_prompts}),
-        callbacks=[Timer()],
-    )
+    with device_peak("init_peak_device_bytes"):
+        trainer = GRPOTrainer(
+            model=str(args.model_path),
+            reward_funcs=reward,
+            processing_class=tokenizer,
+            args=GRPOConfig(
+                output_dir=str(args.output.parent / "checkpoints"),
+                model_init_kwargs={"dtype": "bfloat16", "attn_implementation": "sdpa"},
+                use_vllm=True,
+                vllm_mode="colocate",
+                vllm_enable_sleep_mode=True,
+                **({"vllm_share_weights": True} if share else {}),
+                vllm_gpu_memory_utilization=0.35,
+                vllm_max_model_length=config["context_tokens"],
+                max_completion_length=config["completion_tokens"],
+                num_generations=config["num_generations"],
+                per_device_train_batch_size=config["batch_size"],
+                gradient_accumulation_steps=1,
+                max_steps=config["steps"],
+                learning_rate=config["learning_rate"],
+                lr_scheduler_type="constant",
+                warmup_steps=0,
+                weight_decay=0.0,
+                optim="adamw_torch",
+                bf16=True,
+                seed=args.seed,
+                data_seed=args.seed,
+                logging_steps=1,
+                report_to="none",
+                save_strategy="no",
+                disable_tqdm=True,
+            ),
+            train_dataset=Dataset.from_dict({"prompt": train_prompts}),
+            callbacks=[Timer()],
+        )
     generate_and_score = trainer._generate_and_score_completions
 
     def timed_generate_and_score(inputs):
@@ -121,8 +144,9 @@ def main():
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
-    trainer.train()
-    torch.cuda.synchronize()
+    with device_peak("train_peak_device_bytes"):
+        trainer.train()
+        torch.cuda.synchronize()
     train_seconds = time.perf_counter() - started
     peak = torch.cuda.max_memory_allocated()
     if trainer.state.global_step != config["steps"]:
@@ -153,6 +177,7 @@ def main():
         **timings,
         "update_seconds": timings["steady_seconds"] - timings["generation_seconds"],
         "peak_memory_bytes": peak,
+        **device,
         "eval_reward": sum(reward(completions)) / len(completions),
         "parameter_sum": fingerprint,
         "trajectory": trajectory,
