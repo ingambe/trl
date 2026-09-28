@@ -42,6 +42,7 @@ from .vllm_client import VLLMClient
 
 if is_vllm_available():
     from vllm import LLM, RequestOutput, SamplingParams
+    from vllm.device_allocator.cumem import CuMemAllocator, unmap_and_release
     from vllm.sampling_params import StructuredOutputsParams
 
 
@@ -175,6 +176,11 @@ class VLLMGeneration:
         enable_sleep_mode (`bool`, *optional*, defaults to `False`):
             Whether to enable sleep mode for the engine to offload weights/cache during the optimizer step. Keeps GPU
             memory usage low, but waking the engine adds host–device transfer latency.
+        share_weights (`bool`, *optional*, defaults to `False`):
+            Whether the model's parameters use vLLM's weight memory instead of their own copy, so optimizer steps
+            update vLLM in place and no weights are published. Parameters whose shape or dtype differs from vLLM's are
+            still published. Sleep mode then only releases the KV cache. Requires `mode="colocate"`,
+            `tensor_parallel_size=1`, no FSDP or DeepSpeed ZeRO-3, and no PEFT or quantization.
         model_impl (`str`, *optional*, defaults to `"auto"`):
             Model implementation to use for vLLM.
             - "auto" will try to use the vLLM implementation, if it exists, and fall back to the Transformers
@@ -239,6 +245,7 @@ class VLLMGeneration:
         max_model_length: int | None = None,
         max_num_seqs: int | None = None,
         enable_sleep_mode: bool = False,
+        share_weights: bool = False,
         model_impl: str = "auto",
         trust_remote_code: bool = False,
         cast_lm_head_to_fp32: bool = False,
@@ -274,6 +281,7 @@ class VLLMGeneration:
         self.max_model_length = max_model_length
         self.max_num_seqs = max_num_seqs
         self.enable_sleep_mode = enable_sleep_mode
+        self.share_weights = share_weights
         self.model_impl = model_impl
         self.trust_remote_code = trust_remote_code
         self.cast_lm_head_to_fp32 = cast_lm_head_to_fp32
@@ -293,6 +301,8 @@ class VLLMGeneration:
         self._weight_metadata = None
         # Set during a weight sync, so a failed one is retried before generating
         self._weights_dirty = False
+        # vLLM names of the parameters that use vLLM's weight memory, and are therefore never published
+        self._shared_names = set()
 
         self._init_vllm()
 
@@ -353,6 +363,18 @@ class VLLMGeneration:
                     elif isinstance(module, bnb.nn.Linear8bitLt):
                         raise ValueError("vLLM does not support in-flight 8-bit quantization.")
 
+            if self.share_weights and (
+                self.tensor_parallel_size > 1
+                or self._dist.is_fsdp
+                or self._dist.is_zero3
+                or is_peft_model(model)
+                or quantization is not None
+            ):
+                raise ValueError(
+                    "`share_weights=True` requires `tensor_parallel_size=1`, no FSDP or DeepSpeed ZeRO-3, and no PEFT "
+                    "or quantization."
+                )
+
             hf_overrides = None
             if self.cast_lm_head_to_fp32:
                 if is_vllm_available(min_version="0.26.0"):
@@ -383,11 +405,11 @@ class VLLMGeneration:
                 trust_remote_code=self.trust_remote_code,
                 hf_overrides=hf_overrides,
             )
-            if self.enable_sleep_mode:
-                self.llm.sleep(level=2)
-            # Sleep level 2 discards the weights; track it so that generate() knows it must re-push them
-            self._llm_weights_sleeping = self.enable_sleep_mode
-            self._kv_cache_sleeping = self.enable_sleep_mode
+            if self.share_weights:
+                self._shared_names = self._share_weights()
+            self._llm_weights_sleeping = False
+            self._kv_cache_sleeping = False
+            self.sleep()
         else:
             raise ValueError(f"vllm_mode must be either 'server' or 'colocate', got '{self.mode}'.")
 
@@ -395,6 +417,30 @@ class VLLMGeneration:
         # desynchronization and seems to lead to DeepSpeed hanging during initialization. To prevent this, we
         # synchronize all processes after vLLM has been fully initialized.
         accelerator.wait_for_everyone()
+
+    def _share_weights(self) -> set[str]:
+        """Point the model's parameters at vLLM's weights, and return the vLLM names of the shared ones."""
+        vllm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+        views = {name: param.data for name, param in vllm_model.named_parameters()}
+        # Fused layers (e.g. qkv_proj) stack several model parameters along their output dimension
+        for module_name, module in vllm_model.named_modules():
+            fused = module_name.rpartition(".")[2]
+            parts = vllm_model.packed_modules_mapping.get(fused)
+            if parts:
+                prefix = module_name.removesuffix(fused)
+                for name, param in module.named_parameters(recurse=False):
+                    for part, view in zip(parts, param.data.split(module.output_sizes), strict=True):
+                        views[f"{prefix}{part}.{name}"] = view
+
+        shared = set()
+        for name, param in self.model.named_parameters():
+            name = self._fix_param_name_to_vllm(name)
+            view = views.get(name)
+            if view is not None and view.shape == param.shape and view.dtype == param.dtype:
+                view.copy_(param.data)
+                param.data = view
+                shared.add(name)
+        return shared
 
     def _fix_param_name_to_vllm(self, name: str, extra_prefixes: list[str] | None = None) -> str:
         """Fix parameter name for vLLM compatibility."""
@@ -557,7 +603,7 @@ class VLLMGeneration:
                     for name, param in params:
                         load_weights([(name, param)])
                 else:
-                    load_weights(params)
+                    load_weights((name, param) for name, param in params if name not in self._shared_names)
 
         # Reset cache on vLLM
         if self.mode == "server" and accelerator.is_main_process:
@@ -568,8 +614,19 @@ class VLLMGeneration:
 
     def sleep(self):
         if self.mode == "colocate" and self.enable_sleep_mode and not self._kv_cache_sleeping:
-            self.llm.sleep(level=2)
-            self._llm_weights_sleeping = True
+            if self.share_weights:
+                # The model trains on vLLM's weights, so only the KV cache is released, as vLLM's own sleep would
+                core = self.llm.llm_engine.engine_core.engine_core
+                core.pause_scheduler(clear_cache=True)
+                for data in CuMemAllocator.get_instance().pointer_to_data.values():
+                    if data.tag == "kv_cache":
+                        unmap_and_release(data.handle)
+                core.model_executor.is_sleeping = True
+                core.model_executor.sleeping_tags = {"kv_cache"}
+            else:
+                # Sleep level 2 discards the weights; track it so that generate() knows it must re-push them
+                self.llm.sleep(level=2)
+                self._llm_weights_sleeping = True
             self._kv_cache_sleeping = True
 
     def _place_features(self, features: dict | None, prompt_ids: list[int]) -> dict | None:

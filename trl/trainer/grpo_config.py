@@ -166,6 +166,11 @@ class GRPOConfig(_BaseConfig):
             Control the tensor parallel size for vLLM. This setting only applies when `vllm_mode` is set to
             `"colocate"`. If you are using `vllm_mode="server"`, this parameter must be passed separately when
             launching the vLLM server via the `--vllm_tensor_parallel_size` flag.
+        vllm_share_weights (`bool`, *optional*, defaults to `False`):
+            Whether the trained model uses vLLM's weight memory instead of its own copy, so optimizer steps update vLLM
+            in place and no weights are published. Sleep mode then only releases the KV cache. Requires
+            `vllm_mode="colocate"`, `vllm_tensor_parallel_size=1`, no FSDP or DeepSpeed ZeRO-3, and no PEFT or
+            quantization.
 
         > Parameters that control the training
 
@@ -671,6 +676,15 @@ class GRPOConfig(_BaseConfig):
             "help": "Control the tensor parallel size for vLLM. This setting only applies when `vllm_mode` is set "
             "to `'colocate'`. If you are using `vllm_mode='server'`, this parameter must be passed separately when "
             "launching the vLLM server via the `--vllm_tensor_parallel_size` flag."
+        },
+    )
+    vllm_share_weights: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether the trained model uses vLLM's weight memory instead of its own copy, so optimizer steps "
+            "update vLLM in place and no weights are published. Sleep mode then only releases the KV cache. Requires "
+            "`vllm_mode='colocate'`, `vllm_tensor_parallel_size=1`, no FSDP or DeepSpeed ZeRO-3, and no PEFT or "
+            "quantization."
         },
     )
 

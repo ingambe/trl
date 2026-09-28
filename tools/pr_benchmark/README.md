@@ -266,6 +266,10 @@ again. Compare a pushed branch before opening a PR (never publishes a status):
   --repo OWNER/REPO --base-ref BASE_SHA --ref HEAD_SHA --profile vllm-rollout --env-file ~/.config/trl-bench/env
 ```
 
+`--profile vllm-rollout-dense` runs the same workload without LoRA: each phase updates the norm weights instead of
+the adapter, and the frozen-weight check covers every other parameter. A checkout whose `GRPOConfig` has
+`vllm_share_weights` enables it, so the comparison measures shared weights against weight publication.
+
 `--serious` selects a longer workload on one RTX 5090: three warm-up and twelve measured phases, eight distinct
 prompts of up to 768 tokens, six turns of 64 generated tokens, 1,536-token context. It is still synthetic and unscored:
 longer runs do not establish task quality. Never pool results from different GPUs.

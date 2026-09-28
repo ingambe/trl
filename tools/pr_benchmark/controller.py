@@ -328,7 +328,9 @@ def main():
     parser.add_argument("--ref", default="main", help="Commit or ref to calibrate, or the candidate to compare")
     parser.add_argument("--base-ref", default="main", help="Base commit/ref for a pre-PR compare")
     parser.add_argument("--env-file", type=Path)
-    parser.add_argument("--profile", choices=["sft-3090", "smoke", "vllm-rollout"], default="sft-3090")
+    parser.add_argument(
+        "--profile", choices=["sft-3090", "smoke", "vllm-rollout", "vllm-rollout-dense"], default="sft-3090"
+    )
     parser.add_argument("--serious", action="store_true", help="Longer vllm-rollout workload on one RTX 5090")
     parser.add_argument(
         "--author", action="append", help="Allowed PR author; default is your authenticated GitHub user"
