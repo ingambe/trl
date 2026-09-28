@@ -837,43 +837,44 @@ class OnlineDPOTrainer(_BaseTrainer):
                     for name, param in module.get_base_layer().named_parameters(recurse=False)
                 ]
                 self.model.merge_adapter()
-
-                # Update vLLM weights while parameters are gathered
-                if self.is_fsdp_enabled:  # note if using FSDP, gather_if_zero3 is nullcontext
+                try:
                     # Update vLLM weights while parameters are gathered
-                    # For PEFT with FSDP we need to use the memory efficient post-order traversal
-                    fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
-                    fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
-                    if fsdp_version == 1:
-                        self._sync_fsdp1_params_to_vllm(
-                            self.model
-                        )  # use memory-efficient post-order traversal for FSDP
-                    elif fsdp_version == 2:
-                        self._sync_fsdp2_params_to_vllm(self.model)
-                else:
-                    # DeepSpeed ZeRO-3 with PEFT
-                    for name, param in self.model.named_parameters():
-                        # When using PEFT, we need to recover the original parameter name
-                        name = name.removeprefix("base_model.model.").replace(".base_layer", "")
-                        # Skip PEFT layers: they don’t exist in vLLM, and they are merged already.
-                        if self.model.prefix in name:
-                            continue
-                        # When module to save, remove its prefix and discard the original module
-                        if "original_module" in name:
-                            continue
-                        name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
+                    if self.is_fsdp_enabled:  # note if using FSDP, gather_if_zero3 is nullcontext
+                        # Update vLLM weights while parameters are gathered
+                        # For PEFT with FSDP we need to use the memory efficient post-order traversal
+                        fsdp_plugin = getattr(self.accelerator.state, "fsdp_plugin", None)
+                        fsdp_version = getattr(fsdp_plugin, "fsdp_version", 1) if fsdp_plugin else 1
+                        if fsdp_version == 1:
+                            self._sync_fsdp1_params_to_vllm(
+                                self.model
+                            )  # use memory-efficient post-order traversal for FSDP
+                        elif fsdp_version == 2:
+                            self._sync_fsdp2_params_to_vllm(self.model)
+                    else:
+                        # DeepSpeed ZeRO-3 with PEFT
+                        for name, param in self.model.named_parameters():
+                            # When using PEFT, we need to recover the original parameter name
+                            name = name.removeprefix("base_model.model.").replace(".base_layer", "")
+                            # Skip PEFT layers: they don’t exist in vLLM, and they are merged already.
+                            if self.model.prefix in name:
+                                continue
+                            # When module to save, remove its prefix and discard the original module
+                            if "original_module" in name:
+                                continue
+                            name = self._fix_param_name_to_vllm(name, extra_prefixes=["modules_to_save.default."])
 
-                        if self.vllm_mode == "server" and self.accelerator.is_main_process:
-                            self.vllm_client.update_named_param(name, param.data)
-                        elif self.vllm_mode == "colocate":
-                            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                            llm_model.load_weights([(name, param.data)])
-                # Unmerge adapters while parameters are still gathered
-                self.model.unmerge_adapter()
-                # bitsandbytes merges replace the parameter, so re-register the original
-                for base_layer, name, param, data in originals:
-                    param.data.copy_(data)
-                    base_layer.register_parameter(name, param)
+                            if self.vllm_mode == "server" and self.accelerator.is_main_process:
+                                self.vllm_client.update_named_param(name, param.data)
+                            elif self.vllm_mode == "colocate":
+                                llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+                                llm_model.load_weights([(name, param.data)])
+                finally:
+                    # Unmerge adapters while parameters are still gathered
+                    self.model.unmerge_adapter()
+                    # bitsandbytes merges replace the parameter, so re-register the original
+                    for base_layer, name, param, data in originals:
+                        param.data.copy_(data)
+                        base_layer.register_parameter(name, param)
                 # Parameters will automatically be repartitioned when exiting the context
         else:
             # For non-PEFT models, simply gather (if needed) and update each parameter individually.
