@@ -161,8 +161,10 @@ class GitHub:
         self.api(f"repos/{self.repo}/issues/{manifest['pr']}/comments", {"body": report})
 
 
-def manifest_for(github, pull, profile, environment_job=None, prepare=False):
+def manifest_for(github, pull, profile, environment_job=None, prepare=False, gpus=1):
     config = json.loads((ROOT / "profiles.json").read_text())[profile]
+    if gpus > 1:
+        config["gpus"] = gpus
     manifest = {
         "schema": 1,
         "repo": github.repo,
@@ -331,6 +333,13 @@ def main():
     parser.add_argument("--profile", choices=["sft-3090", "smoke", "vllm-rollout"], default="sft-3090")
     parser.add_argument("--serious", action="store_true", help="Longer vllm-rollout workload on one RTX 5090")
     parser.add_argument(
+        "--gpus",
+        type=int,
+        choices=[1, 2],
+        default=1,
+        help="Data-parallel vllm-rollout on 2 RTX 3090 (else 2 RTX 5090)",
+    )
+    parser.add_argument(
         "--author", action="append", help="Allowed PR author; default is your authenticated GitHub user"
     )
     parser.add_argument("--publish", action="store_true", help="Publish commit statuses and PR reports")
@@ -347,6 +356,8 @@ def main():
         if args.profile != "vllm-rollout":
             parser.error("--serious requires --profile vllm-rollout")
         args.profile = "vllm-rollout-serious"
+    if args.gpus > 1 and not args.profile.startswith("vllm-rollout"):
+        parser.error("--gpus 2 requires a vllm-rollout profile")
     if args.timeout_minutes <= 0 or args.daily_compute_minutes <= 0 or args.poll_seconds < 10:
         parser.error("Timeout/budget must be positive; polling must be at least 10 seconds")
     if args.command == "run" and not args.pr:
@@ -420,7 +431,12 @@ def main():
                         raise ValueError("PR must be open, ready for review, and from an explicitly allowed author")
                     continue
                 manifest = manifest_for(
-                    github, pull, args.profile, env.get("HYPERAI_ENVIRONMENT_JOB"), args.command == "prepare"
+                    github,
+                    pull,
+                    args.profile,
+                    env.get("HYPERAI_ENVIRONMENT_JOB"),
+                    args.command == "prepare",
+                    args.gpus,
                 )
                 if args.dry_run:
                     print(json.dumps(manifest, indent=2))  # noqa: T201
