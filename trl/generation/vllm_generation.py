@@ -302,7 +302,7 @@ class VLLMGeneration:
         # Set during a weight sync, so a failed one is retried before generating
         self._weights_dirty = False
         # vLLM names of the parameters that use vLLM's weight memory, and are therefore never published
-        self._shared_names = set()
+        self._shared_views = {}
 
         self._init_vllm()
 
@@ -406,7 +406,7 @@ class VLLMGeneration:
                 hf_overrides=hf_overrides,
             )
             if self.share_weights:
-                self._shared_names = self._share_weights()
+                self._shared_views = self._share_weights()
             self._llm_weights_sleeping = False
             self._kv_cache_sleeping = False
             self.sleep()
@@ -418,8 +418,8 @@ class VLLMGeneration:
         # synchronize all processes after vLLM has been fully initialized.
         accelerator.wait_for_everyone()
 
-    def _share_weights(self) -> set[str]:
-        """Point the model's parameters at vLLM's weights, and return the vLLM names of the shared ones."""
+    def _share_weights(self) -> dict[str, torch.Tensor]:
+        """Point the model's parameters at vLLM's weights, and return the shared views by vLLM name."""
         vllm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
         views = {name: param.data for name, param in vllm_model.named_parameters()}
         # Fused layers (e.g. qkv_proj) stack several model parameters along their output dimension
@@ -432,14 +432,14 @@ class VLLMGeneration:
                     for part, view in zip(parts, param.data.split(module.output_sizes), strict=True):
                         views[f"{prefix}{part}.{name}"] = view
 
-        shared = set()
+        shared = {}
         for name, param in self.model.named_parameters():
             name = self._fix_param_name_to_vllm(name)
             view = views.get(name)
             if view is not None and view.shape == param.shape and view.dtype == param.dtype:
                 view.copy_(param.data)
                 param.data = view
-                shared.add(name)
+                shared[name] = view
         return shared
 
     def _fix_param_name_to_vllm(self, name: str, extra_prefixes: list[str] | None = None) -> str:
@@ -603,7 +603,13 @@ class VLLMGeneration:
                     for name, param in params:
                         load_weights([(name, param)])
                 else:
-                    load_weights((name, param) for name, param in params if name not in self._shared_names)
+                    # A parameter whose storage was replaced (e.g. by loading a checkpoint) no longer aliases vLLM
+                    shared = self._shared_views
+                    load_weights(
+                        (name, param)
+                        for name, param in params
+                        if not (name in shared and param.is_set_to(shared[name]))
+                    )
 
         # Reset cache on vLLM
         if self.mode == "server" and accelerator.is_main_process:
