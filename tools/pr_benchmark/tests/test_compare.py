@@ -160,7 +160,6 @@ def test_rollout_quality_is_reported_beside_latency(rollout_measurements, damage
         for record in result["records"][1::2]:
             record["rollout_seconds"] = 12.0
     elif damage == "same_latency":
-        # Fewer transferred bytes alone are not a rollout speedup.
         for record in result["records"]:
             record["rollout_seconds"] = 10.0
     summary = comparison.compare(result, manifest)
