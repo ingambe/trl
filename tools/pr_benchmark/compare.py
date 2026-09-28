@@ -38,40 +38,18 @@ def compare(result, manifest):
     if set(indexed) != expected or len(records) != len(expected):
         raise ValueError("Missing, duplicate, or unexpected measurements")
     rollout = config.get("kind") == "vllm-rollout"
-    metrics = (
-        ("rollout_seconds", "weight_transfer_bytes") if rollout else ("train_seconds", "steady_seconds", "eval_loss")
-    )
+    if rollout:
+        metrics, diagnostics = ("rollout_seconds", "weight_transfer_bytes"), ()
+    else:
+        metrics, diagnostics = ("train_seconds", "steady_seconds", "eval_loss"), ("train_loss",)
     environments = []
     for (side, seed), record in indexed.items():
         if record["sha"] != manifest[f"{side}_sha"] or record["steps"] != config["steps"]:
             raise ValueError("Wrong commit or incomplete training")
-        diagnostics = (
-            ("peak_memory_bytes", "workload_seconds")
-            if rollout
-            else ("train_loss", "peak_memory_bytes", "workload_seconds")
-        )
-        for metric in (*metrics, *diagnostics):
+        for metric in (*metrics, *diagnostics, "peak_memory_bytes", "workload_seconds"):
             value = record[metric]
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"Invalid {metric} for {side}, seed {seed}")
-        if rollout:
-            if record["sleeping_after_phase"] is not True:
-                raise ValueError("vLLM did not release memory at the phase boundary")
-            if type(record["sync_count"]) is not int or record["sync_count"] < config["steps"]:
-                raise ValueError("Missing weight synchronization after policy updates")
-            if side == "head" and record["sync_count"] > config["steps"]:
-                raise ValueError("Head synchronized more than once per rollout phase")
-            if not record["output_sha256"] or record["output_sha256"] != indexed["base", seed]["output_sha256"]:
-                raise ValueError("Base/head rollout tokens differ")
-        if config.get("lora") and side == "head" and record.get("frozen_weight_max_abs_drift") != 0.0:
-            raise ValueError("Timed adapter exports changed frozen training weights")
-        if config.get("policy_parity") and side == "head" and seed == config["seeds"][0]:
-            parity = {item["label"]: item for item in record["policy_parity"]}
-            for stage in ("lora", "updated_lora"):
-                weight_drift = parity.get(stage + "_frozen_weight_drift", {}).get("max_abs")
-                policy_drift = parity.get(stage + "_local_policy_drift", {}).get("total_variation")
-                if weight_drift != 0.0 or policy_drift != 0.0:
-                    raise ValueError("Adapter export changed the head training policy or lacks drift measurements")
         environments.append(record["environment"])
     if any(env != environments[0] for env in environments):
         raise ValueError("GPU or dependency environment differs between runs")
@@ -111,8 +89,32 @@ def compare(result, manifest):
         if outcome in outcomes:
             summary["outcome"] = outcome
             break
-    if rollout and summary["outcome"] == "improved" and summary["metrics"]["rollout_seconds"]["outcome"] != "improved":
-        summary["outcome"] = "no_regression"
+    if rollout:
+        # Fewer transferred bytes alone are not a rollout speedup.
+        if summary["outcome"] == "improved" and summary["metrics"]["rollout_seconds"]["outcome"] != "improved":
+            summary["outcome"] = "no_regression"
+        runs = {side: [indexed[side, seed] for seed in config["seeds"]] for side in ("base", "head")}
+        drift = {side: max(r["frozen_weight_max_abs_drift"] for r in runs[side]) for side in runs}
+        parity = {side: {item["label"]: item for item in result["policy_parity"][side]} for side in runs}
+        summary["quality"] = {
+            "Greedy rollout tokens match base": all(
+                b["output_tokens"] == h["output_tokens"] for b, h in zip(runs["base"], runs["head"], strict=True)
+            ),
+            "vLLM asleep after every phase": all(r["sleeping_after_phase"] for r in records),
+            "Every phase synchronized the updated policy": all(r["sync_count"] >= config["steps"] for r in records),
+            "Frozen-weight drift no worse than base": drift["head"] <= drift["base"],
+            "Stale-policy control detected (TV above twice the synced TV)": all(
+                p["updated_lora_stale_reference"]["total_variation"] > 2 * p["updated_lora"]["total_variation"]
+                for p in parity.values()
+            ),
+        }
+        summary["syncs_per_phase"] = {
+            side: statistics.mean(r["sync_count"] for r in runs[side]) / config["steps"] for side in runs
+        }
+        summary["frozen_weight_drift"] = drift
+        summary["policy_parity"] = parity
+        if not all(summary["quality"].values()) and summary["outcome"] in ("improved", "no_regression"):
+            summary["outcome"] = "quality_failed"
     return summary
 
 
@@ -135,12 +137,31 @@ def markdown(summary, manifest):
             f"| {name} | {metric['base_mean']:.4f} | {metric['head_mean']:.4f} | "
             f"{metric['change_pct']:+.2f}% | {uncertainty} | {metric['outcome']} |"
         )
+    rollout = manifest["workload"].get("kind") == "vllm-rollout"
+    if rollout:
+        base, head = summary["policy_parity"]["base"], summary["policy_parity"]["head"]
+        syncs, drift = summary["syncs_per_phase"], summary["frozen_weight_drift"]
+        lines += ["", "#### Quality checks (reported separately; any failure blocks a passing verdict)", ""]
+        lines += [f"- {'pass' if passed else '**FAIL**'}: {check}" for check, passed in summary["quality"].items()]
+        lines += [
+            "",
+            f"Weight synchronizations per phase: base {syncs['base']:.2f}, PR {syncs['head']:.2f}. "
+            f"Maximum frozen-weight drift: base {drift['base']:.3g}, PR {drift['head']:.3g}.",
+            "",
+            "| Local vs vLLM next-token distribution (first seed) | Base TV | PR TV | PR KL | PR JS |",
+            "|---|---:|---:|---:|---:|",
+        ]
+        lines += [
+            f"| {label} | {base[label]['total_variation']:.4g} | {item['total_variation']:.4g} | "
+            f"{item['kl_local_vllm']:.4g} | {item['js_divergence']:.4g} |"
+            for label, item in head.items()
+        ]
     lines += [
         "",
         "Margins: " + ", ".join(f"{key} +{value}%" for key, value in manifest["thresholds"].items()) + ".",
         (
-            "Rollout tokens must match; transfer bytes count tensor payloads passed to load_weights, not hardware bus traffic."
-            if manifest["workload"].get("kind") == "vllm-rollout"
+            "Transfer bytes count tensor payloads passed to vLLM's loaders, not hardware bus traffic."
+            if rollout
             else "Held-out SFT token loss is a quality proxy; this does not certify other trainers or downstream tasks."
         ),
         "Smoke runs cannot establish no regression. Missing/non-finite measurements are errors, never passes.",

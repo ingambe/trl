@@ -119,7 +119,6 @@ def profile_run(tmp_path):
 
 
 def test_hta_identical_traces_and_counter_export(profile_run):
-    pytest.importorskip("hta")
     analyze(profile_run)
     summary = json.loads((profile_run / "profiles/summary.json").read_text())
     assert summary["sides"]["base"] == summary["sides"]["head"]
@@ -132,7 +131,6 @@ def test_hta_identical_traces_and_counter_export(profile_run):
 
 @pytest.mark.parametrize("failure", ["cpu-only", "wrong-sha", "partial-window"])
 def test_reject_incomplete_or_wrong_profile(profile_run, failure):
-    pytest.importorskip("hta")
     source = profile_run / "base"
     if failure == "cpu-only":
         with gzip.open(source / "trace.json.gz", "wt") as stream:
