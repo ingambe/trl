@@ -226,15 +226,76 @@ resolution. A `cancel_pending` record is retried on restart. No result from eith
 `environment.py`, `job.py`, `workload.py`, the manifest and `result.json` format are provider-independent. `hyperai.py` is the only cloud
 adapter. A future provider needs `validate(manifest)` for read-only configuration checks before reserving budget, plus
 `submit(bundle, timeout_seconds)`, `status(job_id)`,
-`result(job_id)`, and `cancel(job_id)`, with a provider-side deadline and normalized terminal states. Keep authentication
+`result(job_id)`, `download_profile(job_id, side, destination)` (rollout profiles only), and `cancel(job_id)`, with a provider-side deadline and normalized terminal states. Keep authentication
 and upload logic in the adapter; add explicit provider selection only when a second provider is implemented.
 
 ## Local tests
 
-The comparator tests need only pytest. They check regression decisions, uncertainty, and invalid measurements without
-mocking the cloud API. Provider behavior and GPU execution require the live smoke run described above.
+The tests need pytest plus the controller requirements (HTA for the profile-analysis tests). They check regression
+decisions, uncertainty, invalid measurements and HTA analysis of synthetic traces without mocking the cloud API.
+Provider behavior and GPU execution require the live smoke run described above.
 
 ```bash
-python -m pip install pytest
+python -m pip install pytest -r tools/pr_benchmark/requirements-controller.txt
 python -m pytest tools/pr_benchmark/tests -q
 ```
+
+## Multi-turn LoRA rollouts with before/after profiles
+
+The `vllm-rollout` profile measures colocated vLLM rollouts with a nonzero rank-8 LoRA adapter. Each phase applies a
+deterministic adapter update, then times GRPO's `_generate` through a four-turn `rollout_func` that appends fixed CPU
+feedback between turns, and ends with vLLM asleep (the handoff back to training). One warm-up and six measured phases
+run for each of five paired seeds; each seed rolls out two distinct prompts. The feedback is a fixed string, not GRPO's
+tool-calling loop: this is a systems workload, not a scored task, and reports no task success.
+
+Latency uses the same paired intervals as SFT on `rollout_seconds` (synchronization, all turns, and sleep) and
+`weight_transfer_bytes` (logical tensor payload handed to vLLM's `load_weights` or, for native adapters, the saved
+adapter tensors; not bus traffic). A transfer reduction alone is never reported as an improvement. Quality is reported
+separately and any failure turns a passing latency verdict into `quality_failed`; it never hides the timings:
+
+- greedy rollout tokens match base for every seed (native LoRA or a restoration fix can legitimately change them);
+- vLLM is asleep after every phase, and every phase synchronized the updated policy (syncs per phase are reported);
+- the maximum frozen-weight drift of the PR is no worse than base (both values are reported);
+- the stale-policy negative control is detected (see below).
+
+`requirements-gpu.txt` includes vLLM and PEFT, so an environment prepared before this profile existed must be prepared
+again. Compare a pushed branch before opening a PR (never publishes a status):
+
+```bash
+~/.local/share/trl-pr-benchmark/venv/bin/python tools/pr_benchmark/controller.py compare \
+  --repo OWNER/REPO --base-ref BASE_SHA --ref HEAD_SHA --profile vllm-rollout --env-file ~/.config/trl-bench/env
+```
+
+`--serious` selects a longer workload on one RTX 5090: three warm-up and twelve measured phases, eight distinct
+prompts of up to 768 tokens, six turns of 64 generated tokens, 1,536-token context. It is still synthetic and unscored:
+longer runs do not establish task quality. Never pool results from different GPUs.
+
+### Profiles and the distribution diagnostic
+
+After all timing samples, the job starts one extra process per side with the first seed. It captures the normal
+warm-up plus two complete phases with the PyTorch Profiler (CPU and CUDA activities, shapes, memory; no Python stacks),
+labelling each phase, turn, CPU feedback, `sync_weights`, `load_weights`, `add_lora`, `wake_up`, `sleep` and
+`reset_prefix_cache`. After the capture it compares full next-token distributions of the local policy and vLLM on one
+fixed history, for a zero adapter, a nonzero adapter and a second update. Each stage reports total variation, KL and
+Jensen–Shannon divergence against the local unmerged model, the BF16-merged model, and the local model after
+publication. The negative control compares vLLM with the previous stage's policy, standing in for a missed
+synchronization: its total variation must exceed twice the synced one. Only this process enables vLLM's
+full-vocabulary logprobs, so timed runs are unaffected. One seed and one history are diagnostic evidence, not a
+confidence interval.
+
+The controller downloads both archives and runs HTA locally (`requirements-controller.txt`). Nothing is uploaded: the
+report only names the local run directory, which keeps:
+
+```text
+runs/<run-id>/{base,head}-profile.zip   # checksummed capture archives, also kept as job outputs
+runs/<run-id>/profiles/report.md        # before/after HTA temporal breakdown and artifact links
+runs/<run-id>/profiles/summary.json     # all HTA tables, observed memcpy bytes by kind, analysis packages
+runs/<run-id>/profiles/kernel-deltas.csv
+runs/<run-id>/profiles/{base,head}/     # metadata.json, trace.json.gz, trace_with_counters.json.gz,
+                                        # operators-*.txt, hta-*.csv, policy-distributions.npz
+```
+
+Observed memcpy bytes come only from these single-seed instrumented captures; timed records report logical payload
+bytes only. HTA 0.5 does not recognize CUDA Graph launches in its launch/queue analyses; the report flags this when
+replays are present. Rerun the analysis without GPU time with
+`python tools/pr_benchmark/analyze_profiles.py ~/.local/state/trl-pr-benchmark/runs/RUN_ID`.

@@ -30,6 +30,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import quote
 
+from analyze_profiles import analyze
 from compare import compare, markdown
 from environment import environment_spec
 from hyperai import BUNDLE_FILES, TERMINAL, HyperAI
@@ -131,7 +132,7 @@ class GitHub:
 
     def current(self, manifest):
         if manifest["pr"] is None:
-            return True  # Calibration pins the same immutable commit on both sides.
+            return True  # Calibration and pre-PR comparisons pin immutable commits.
         pull = self.pull(manifest["pr"])
         return (
             pull["state"] == "open"
@@ -148,7 +149,13 @@ class GitHub:
 
     def publish(self, manifest, summary, report, url):
         outcome = summary["outcome"]
-        state = {"improved": "success", "no_regression": "success", "regression": "failure", "inconclusive": "error"}
+        state = {
+            "improved": "success",
+            "no_regression": "success",
+            "regression": "failure",
+            "quality_failed": "failure",
+            "inconclusive": "error",
+        }
         self.status(manifest, state[outcome], f"{outcome}; base {manifest['base_sha'][:12]}", url)
         # One immutable comment per tested pair retains the comparison history.
         self.api(f"repos/{self.repo}/issues/{manifest['pr']}/comments", {"body": report})
@@ -167,7 +174,11 @@ def manifest_for(github, pull, profile, environment_job=None, prepare=False):
         "prepare": prepare,
         "environment_job": None if prepare else environment_job,
         "workload": config,
-        "thresholds": {"train_seconds": 5.0, "steady_seconds": 5.0, "eval_loss": 1.0},
+        "thresholds": (
+            {"rollout_seconds": 5.0, "weight_transfer_bytes": 0.0}
+            if config.get("kind") == "vllm-rollout"
+            else {"train_seconds": 5.0, "steady_seconds": 5.0, "eval_loss": 1.0}
+        ),
         "harness": {
             name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in (*BUNDLE_FILES[:-1], "compare.py")
         },
@@ -277,6 +288,14 @@ def execute(args, github, provider, manifest, state, state_file, record=None):
             return "prepared"
         summary = compare(result, manifest)
         report = markdown(summary, manifest)
+        if manifest["workload"].get("kind") == "vllm-rollout":
+            for side in ("base", "head"):
+                provider.download_profile(job["id"], side, directory / f"{side}-profile.zip")
+            analyze(directory)
+            report += (
+                "\nProfiler diagnostics (separate instrumented runs, excluded from timing): before/after traces and HTA "
+                "tables are in the controller's local run directory, `profiles/report.md`.\n"
+            )
         save(directory / "summary.json", summary)
         (directory / "report.md").write_text(report)
         # Recheck after download/analysis so an obsolete comparison cannot publish a green status.
@@ -303,12 +322,14 @@ def execute(args, github, provider, manifest, state, state_file, record=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["doctor", "prepare", "calibrate", "run", "watch"])
+    parser.add_argument("command", choices=["doctor", "prepare", "calibrate", "compare", "run", "watch"])
     parser.add_argument("--repo", help="GitHub owner/repo containing the PR")
     parser.add_argument("--pr", type=int)
-    parser.add_argument("--ref", default="main", help="Commit or ref for a base-versus-itself calibration")
+    parser.add_argument("--ref", default="main", help="Commit or ref to calibrate, or the candidate to compare")
+    parser.add_argument("--base-ref", default="main", help="Base commit/ref for a pre-PR compare")
     parser.add_argument("--env-file", type=Path)
-    parser.add_argument("--profile", choices=["sft-3090", "smoke"], default="sft-3090")
+    parser.add_argument("--profile", choices=["sft-3090", "smoke", "vllm-rollout"], default="sft-3090")
+    parser.add_argument("--serious", action="store_true", help="Longer vllm-rollout workload on one RTX 5090")
     parser.add_argument(
         "--author", action="append", help="Allowed PR author; default is your authenticated GitHub user"
     )
@@ -322,15 +343,24 @@ def main():
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--state-dir", type=Path, default=Path.home() / ".local/state/trl-pr-benchmark")
     args = parser.parse_args()
+    if args.serious:
+        if args.profile != "vllm-rollout":
+            parser.error("--serious requires --profile vllm-rollout")
+        args.profile = "vllm-rollout-serious"
     if args.timeout_minutes <= 0 or args.daily_compute_minutes <= 0 or args.poll_seconds < 10:
         parser.error("Timeout/budget must be positive; polling must be at least 10 seconds")
     if args.command == "run" and not args.pr:
         parser.error("run requires --pr")
     if args.command == "watch" and args.rerun:
         parser.error("--rerun is only supported for manual runs")
-    if args.command in {"prepare", "calibrate"} and args.publish:
-        parser.error("Preparation and calibration do not publish PR statuses")
+    if args.command in {"prepare", "calibrate", "compare"} and args.publish:
+        parser.error("Preparation, calibration, and pre-PR comparisons do not publish PR statuses")
+    if args.profile.startswith("vllm-rollout") and args.command not in {"doctor", "prepare"} and not args.dry_run:
+        # Fail before spending compute if the local HTA analysis cannot run.
+        import hta.trace_analysis  # noqa: F401
     env = load_env(args.env_file)
+    if args.serious:
+        env["HYPERAI_RESOURCE"] = "rtx-5090"
     if args.command == "doctor":
         print(json.dumps(HyperAI(env).inventory(), indent=2))  # noqa: T201
         return 0
@@ -368,7 +398,7 @@ def main():
                         raise ValueError("Resume this state directory with its original --repo")
                     execute(args, github, provider, manifest, state, state_file, record)
         while True:
-            if args.command in {"prepare", "calibrate"}:
+            if args.command in {"prepare", "calibrate", "compare"}:
                 sha = github.api(f"repos/{args.repo}/commits/{quote(args.ref, safe='')}")["sha"]
                 pulls = [
                     {
@@ -376,7 +406,7 @@ def main():
                         "state": "open",
                         "draft": False,
                         "user": {"login": github.user},
-                        "base": {"ref": sha},
+                        "base": {"ref": args.base_ref if args.command == "compare" else sha},
                         "head": {"sha": sha},
                     }
                 ]

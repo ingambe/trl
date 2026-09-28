@@ -26,5 +26,41 @@
     "batch_size": 1,
     "gradient_accumulation_steps": 1,
     "seeds": [42]
+  },
+  "vllm-rollout": {
+    "kind": "vllm-rollout",
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "model_revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+    "dataset": "trl-lib/Capybara",
+    "dataset_revision": "e235e846458bff3398a88aed812347f7f0756520",
+    "train_examples": 32,
+    "eval_examples": 8,
+    "max_length": 128,
+    "steps": 6,
+    "warmup_steps": 1,
+    "batch_size": 2,
+    "turns": 4,
+    "prompt_tokens": 48,
+    "completion_tokens": 16,
+    "context_tokens": 512,
+    "seeds": [42, 43, 44, 45, 46]
+  },
+  "vllm-rollout-serious": {
+    "kind": "vllm-rollout",
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "model_revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+    "dataset": "trl-lib/Capybara",
+    "dataset_revision": "e235e846458bff3398a88aed812347f7f0756520",
+    "train_examples": 128,
+    "eval_examples": 32,
+    "max_length": 768,
+    "steps": 12,
+    "warmup_steps": 3,
+    "batch_size": 8,
+    "turns": 6,
+    "prompt_tokens": 768,
+    "completion_tokens": 64,
+    "context_tokens": 1536,
+    "seeds": [42, 43, 44, 45, 46]
   }
 }

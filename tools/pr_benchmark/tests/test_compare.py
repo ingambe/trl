@@ -110,3 +110,60 @@ def test_invalid_results_fail_closed(measurements, damage):
         result["manifest_id"] = "old-request"
     with pytest.raises(ValueError):
         comparison.compare(result, manifest)
+
+
+@pytest.fixture
+def rollout_measurements(measurements):
+    manifest, result = measurements
+    manifest["workload"].update(kind="vllm-rollout", steps=6)
+    manifest["thresholds"] = {"rollout_seconds": 5.0, "weight_transfer_bytes": 0.0}
+    for record in result["records"]:
+        head = record["side"] == "head"
+        record.update(
+            steps=6,
+            rollout_seconds=8.0 if head else 10.0,
+            weight_transfer_bytes=100 if head else 400,
+            sync_count=6 if head else 24,
+            sleeping_after_phase=True,
+            output_tokens=[[[1, 2]]],
+            frozen_weight_max_abs_drift=0.0,
+        )
+    parity = [
+        {"label": "updated_lora", "total_variation": 0.01, "kl_local_vllm": 0.001, "js_divergence": 0.001},
+        {"label": "updated_lora_stale_reference", "total_variation": 0.3, "kl_local_vllm": 0.5, "js_divergence": 0.1},
+    ]
+    result["policy_parity"] = {"base": parity, "head": copy.deepcopy(parity)}
+    return manifest, result
+
+
+@pytest.mark.parametrize(
+    "damage,outcome",
+    [
+        (None, "improved"),
+        ("tokens", "quality_failed"),
+        ("drift", "quality_failed"),
+        ("stale_control", "quality_failed"),
+        ("slower", "regression"),
+        ("same_latency", "no_regression"),
+    ],
+)
+def test_rollout_quality_is_reported_beside_latency(rollout_measurements, damage, outcome):
+    manifest, result = rollout_measurements
+    head = result["records"][1]
+    if damage == "tokens":
+        head["output_tokens"] = [[[1, 3]]]
+    elif damage == "drift":
+        head["frozen_weight_max_abs_drift"] = 0.001953125
+    elif damage == "stale_control":
+        result["policy_parity"]["head"][1]["total_variation"] = 0.01
+    elif damage == "slower":
+        for record in result["records"][1::2]:
+            record["rollout_seconds"] = 12.0
+    elif damage == "same_latency":
+        for record in result["records"]:
+            record["rollout_seconds"] = 10.0
+    summary = comparison.compare(result, manifest)
+    assert summary["outcome"] == outcome
+    report = comparison.markdown(summary, {**manifest, "profile": "vllm-rollout"})
+    assert "rollout_seconds" in report
+    assert ("**FAIL**" in report) == (outcome == "quality_failed")
