@@ -294,6 +294,15 @@ a LoRA profile, `--native-lora` has vLLM serve the adapter natively on commits t
 prompts of up to 768 tokens, six turns of 64 generated tokens, 1,536-token context. It is still synthetic and unscored:
 longer runs do not establish task quality. Never pool results from different GPUs.
 
+`vllm-rollout-medium` sits between the two: two warm-up and eight measured phases, four prompts of up to 256 tokens,
+four turns of 32 generated tokens, 768-token context, on one RTX 3090.
+
+The manual **GPU benchmark** workflow runs these comparisons from GitHub Actions as eleven parallel jobs: small
+(`vllm-rollout`), medium and large (`--serious`) rollouts, `grpo-train-dense` and `grpo-train-lora`, each on one and two
+GPUs, and `grpo-train-lora-3b` on two GPUs. Reports go to the run summary; run directories, profiles included, are
+uploaded as artifacts. It needs the `OPENBAYES_TOKEN` secret and the `HYPERAI_RUNTIME`, `HYPERAI_ENVIRONMENT_JOB` and
+`HYPERAI_ENVIRONMENT_JOB_3B` (the 3B environment) variables.
+
 ### Profiles and the distribution diagnostic
 
 After all timing samples, the job starts one extra process per side with the first seed. It captures the normal
