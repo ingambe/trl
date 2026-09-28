@@ -1898,6 +1898,8 @@ class DistillationTrainer(_BaseTrainer):
             ]
 
         prompt_ids_list, completion_ids_list, tool_mask_list, images, tool_images = self._generate(prompts)
+        if self.use_vllm:
+            self.vllm_generation.sleep()
 
         # Distillation has no reward: `get_reward` is logged under the environment's class name, never used in the loss
         for env_type in self._env_reward_types:
