@@ -86,48 +86,48 @@ def run(environment):
             "TOKENIZERS_PARALLELISM": "false",
         }
     )
+    rollout = config.get("kind") == "vllm-rollout"
 
-    def run_child(side, seed, profile=False):
-        stem = f"{side}-{seed}" + ("-profile" if profile else "")
-        output = ROOT / f"{stem}.json"
-        command = [
-            sys.executable,
-            str(ROOT / ("rollout_workload.py" if config.get("kind") == "vllm-rollout" else "workload.py")),
-            "--model-path",
-            str(environment / "model"),
-            "--checkout",
-            str(work / side),
-            "--manifest",
-            str(ROOT / "manifest.json"),
-            "--data",
-            str(data),
-            "--side",
-            side,
-            "--seed",
-            str(seed),
-            "--output",
-            str(output),
-        ]
-        if profile:
-            command += ["--profile-dir", str(ROOT / f"{side}-profile")]
+    def run_child(side, seed, stem, *extra):
+        output = work / f"{stem}.json"
         with (ROOT / f"{stem}.log").open("w") as log:
-            before = time.perf_counter()
-            try:
-                subprocess.run(command, cwd=work, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
-            except subprocess.CalledProcessError:
-                log.flush()
-                print((ROOT / f"{stem}.log").read_text()[-8000:], flush=True)  # noqa: T201
-                raise
-        record = json.loads(output.read_text())
-        record["workload_seconds"] = time.perf_counter() - before
-        return record
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / ("rollout_workload.py" if rollout else "workload.py")),
+                    "--model-path",
+                    str(environment / "model"),
+                    "--checkout",
+                    str(work / side),
+                    "--manifest",
+                    str(ROOT / "manifest.json"),
+                    "--data",
+                    str(data),
+                    "--side",
+                    side,
+                    "--seed",
+                    str(seed),
+                    "--output",
+                    str(output),
+                    *extra,
+                ],
+                cwd=work,
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                check=True,
+            )
+        return json.loads(output.read_text())
 
     records = []
     started = time.perf_counter()
     for index, seed in enumerate(config["seeds"]):
         # Alternate order to reduce drift caused by temperature or competing workloads.
         for side in ("base", "head") if index % 2 == 0 else ("head", "base"):
-            records.append(run_child(side, seed))
+            before = time.perf_counter()
+            record = run_child(side, seed, f"{side}-{seed}")
+            record["workload_seconds"] = time.perf_counter() - before
+            records.append(record)
             print(f"Completed {side}, seed {seed}", flush=True)  # noqa: T201
     result = {
         "manifest_id": manifest["id"],
@@ -136,20 +136,20 @@ def run(environment):
         "comparison_seconds": time.perf_counter() - started,
     }
     (ROOT / "result.json").write_text(json.dumps(result, indent=2, allow_nan=False))
-    # Profiling starts after all timing samples, in fresh processes with the same first seed.
-    # Persist timings first so a CUPTI/capture failure cannot destroy already completed measurements.
-    result["profiles"] = {}
-    for side in ("base", "head"):
-        run_child(side, config["seeds"][0], profile=True)
-        distributions = ROOT / f"{side}-{config['seeds'][0]}-policy-distributions.npz"
-        if distributions.exists():
-            shutil.copyfile(distributions, ROOT / f"{side}-profile/policy-distributions.npz")
-        archive = Path(shutil.make_archive(str(ROOT / f"{side}-profile"), "zip", ROOT / f"{side}-profile"))
-        result["profiles"][side] = {
-            "file": archive.name,
-            "bytes": archive.stat().st_size,
-            "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
-        }
+    if rollout:
+        # Profiles and the distribution diagnostic come from separate processes after all timing samples.
+        # Timings are persisted first so a capture failure cannot lose completed measurements.
+        result["profiles"], result["policy_parity"] = {}, {}
+        seed = config["seeds"][0]
+        for side in ("base", "head"):
+            directory = ROOT / f"{side}-profile"
+            record = run_child(side, seed, f"{side}-{seed}-profile", "--profile-dir", str(directory))
+            result["policy_parity"][side] = record["policy_parity"]
+            archive = Path(shutil.make_archive(str(directory), "zip", directory))
+            result["profiles"][side] = {
+                "bytes": archive.stat().st_size,
+                "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+            }
         (ROOT / "result.json").write_text(json.dumps(result, indent=2, allow_nan=False))
 
 
