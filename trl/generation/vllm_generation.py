@@ -586,6 +586,7 @@ class VLLMGeneration:
                     with self._dist.gather_params([param]):
                         yield name, param.data
 
+
     def sync_weights(self):
         """Synchronize model weights to vLLM.
 
@@ -605,20 +606,25 @@ class VLLMGeneration:
             # The server must know every tensor it is about to receive before the first one is broadcast, so the
             # parameters are walked once to collect their metadata, and streamed on subsequent passes.
             if self._weight_metadata is None:
-                self._weight_metadata = [
-                    (name, str(param.dtype).removeprefix("torch."), list(param.shape))
-                    for name, param in self._iter_named_params()
-                ]
-            if accelerator.is_main_process:
                 with closing(self._iter_named_params()) as params:
-                    self.vllm_client.update_named_params(self._weight_metadata, params)
-            else:
-                for _ in self._iter_named_params():  # take part in the gather collectives
-                    pass
-        elif self.mode == "colocate":
+                    self._weight_metadata = [
+                        (name, str(param.dtype).removeprefix("torch."), list(param.shape)) for name, param in params
+                    ]
             with closing(self._iter_named_params()) as params:
-                for name, param in params:
-                    self.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights([(name, param)])
+                if accelerator.is_main_process:
+                    self.vllm_client.update_named_params(self._weight_metadata, params)
+                else:
+                    for _ in params:  # take part in the gather collectives
+                        pass
+        elif self.mode == "colocate":
+            load_weights = self.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights
+            with closing(self._iter_named_params()) as params:
+                if self._dist.is_fsdp or (self._dist.is_zero3 and not is_peft_model(self.model)):
+                    # Gathered tensors are released as the stream advances
+                    for name, param in params:
+                        load_weights([(name, param)])
+                else:
+                    load_weights(params)
 
         # Reset cache on vLLM
         if self.mode == "server" and accelerator.is_main_process:
