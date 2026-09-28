@@ -21,8 +21,10 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from accelerate import Accelerator
 from transformers.utils import is_peft_available, is_torch_xpu_available
 
+from trl.generation.vllm_generation import VLLMGeneration
 from trl.import_utils import is_vllm_available
 
 
@@ -282,10 +284,6 @@ def cleanup_vllm_dist_env():
 
 @pytest.fixture
 def vllm_generation(monkeypatch):
-    from accelerate import Accelerator
-
-    from trl.generation.vllm_generation import VLLMGeneration
-
     monkeypatch.setattr(VLLMGeneration, "_init_vllm", lambda self: None)
     generation = VLLMGeneration(torch.nn.Linear(1, 1), Accelerator(cpu=True), None)
     generation.llm = Mock()
