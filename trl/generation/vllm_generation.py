@@ -630,6 +630,8 @@ class VLLMGeneration:
                         unmap_and_release(data.handle)
                 core.model_executor.is_sleeping = True
                 core.model_executor.sleeping_tags = {"kv_cache"}
+                # Like vLLM's own sleep, return the rollout's cached temporaries before training
+                empty_cache()
             else:
                 # Sleep level 2 discards the weights; track it so that generate() knows it must re-push them
                 self.llm.sleep(level=2)
