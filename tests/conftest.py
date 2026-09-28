@@ -23,6 +23,9 @@ from unittest.mock import Mock
 import pytest
 import torch
 from accelerate import Accelerator
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast
 from transformers.utils import is_liger_kernel_available, is_peft_available, is_torch_xpu_available
 
 from trl.generation.vllm_generation import VLLMGeneration
@@ -312,3 +315,17 @@ def vllm_generation(monkeypatch):
     generation = VLLMGeneration(torch.nn.Linear(1, 1), Accelerator(cpu=True), None)
     generation.llm = Mock()
     return generation
+
+
+@pytest.fixture
+def tiny_llama():
+    """Tiny untied Llama model and word-level tokenizer, built locally."""
+    config = LlamaConfig(
+        vocab_size=32, hidden_size=16, intermediate_size=32, num_hidden_layers=1, num_attention_heads=2
+    )
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({"<pad>": 0, "<eos>": 1, "a": 2}, unk_token="a")),
+        pad_token="<pad>",
+        eos_token="<eos>",
+    )
+    return LlamaForCausalLM(config), tokenizer
