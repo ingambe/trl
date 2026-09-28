@@ -1079,6 +1079,7 @@ class GRPOTrainer(_BaseTrainer):
                 enable_sleep_mode=args.vllm_enable_sleep_mode,
                 model_impl=args.vllm_model_impl,
                 trust_remote_code=args.trust_remote_code,
+                cast_lm_head_to_fp32=args.cast_lm_head_to_fp32,
                 # Generation configuration
                 repetition_penalty=self.repetition_penalty,
                 temperature=self.temperature,
