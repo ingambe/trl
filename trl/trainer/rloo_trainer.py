@@ -710,6 +710,7 @@ class RLOOTrainer(_BaseTrainer):
                 # Colocate mode configuration
                 tensor_parallel_size=args.vllm_tensor_parallel_size,
                 gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                kv_cache_memory_bytes=args.vllm_kv_cache_memory_bytes,
                 max_model_length=args.vllm_max_model_length,
                 max_num_seqs=args.per_device_train_batch_size
                 * args.vllm_tensor_parallel_size

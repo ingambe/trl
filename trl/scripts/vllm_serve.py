@@ -47,6 +47,8 @@ class ScriptArguments:
             device dedicated to generation powered by vLLM. Higher values will increase the KV cache size and thus
             improve the model's throughput. However, if the value is too high, it may cause out-of-memory (OOM) errors
             during initialization.
+        kv_cache_memory_bytes (`int`, *optional*):
+            KV cache size per GPU in bytes. When set, it replaces the cache size derived from `gpu_memory_utilization`.
         dtype (`str`, *optional*, defaults to `"auto"`):
             Data type to use for vLLM generation. If set to `"auto"`, the data type will be automatically determined
             based on the model configuration. Find the supported values in the vLLM documentation.
@@ -115,6 +117,13 @@ class ScriptArguments:
             "cache on the device dedicated to generation powered by vLLM. Higher values will increase the KV cache "
             "size and thus improve the model's throughput. However, if the value is too high, it may cause "
             "out-of-memory (OOM) errors during initialization."
+        },
+    )
+    kv_cache_memory_bytes: int | None = field(
+        default=None,
+        metadata={
+            "help": "KV cache size per GPU in bytes. When set, it replaces the cache size derived from "
+            "`gpu_memory_utilization`."
         },
     )
     dtype: str = field(
@@ -250,6 +259,8 @@ def build_command(script_args: ScriptArguments, extra_args: list[str] | None = N
     ]
     if script_args.revision is not None:
         command += ["--revision", script_args.revision]
+    if script_args.kv_cache_memory_bytes is not None:
+        command += ["--kv-cache-memory-bytes", str(script_args.kv_cache_memory_bytes)]
     if script_args.max_model_len is not None:
         command += ["--max-model-len", str(script_args.max_model_len)]
     if script_args.enable_prefix_caching is not None:

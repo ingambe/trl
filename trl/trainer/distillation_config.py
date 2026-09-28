@@ -123,6 +123,11 @@ class DistillationConfig(_BaseConfig):
 
         vllm_gpu_memory_utilization (`float`, *optional*, defaults to `0.3`):
             GPU memory utilization for the colocated student vLLM engine.
+        vllm_kv_cache_memory_bytes (`int`, *optional*):
+            KV cache size per GPU in bytes for vLLM. When set, it replaces the cache size derived from
+            `vllm_gpu_memory_utilization`. This setting only applies when `vllm_mode` is set to `"colocate"`. If you
+            are using `vllm_mode="server"`, this parameter must be passed separately when launching the vLLM server via
+            the `--kv_cache_memory_bytes` flag.
         vllm_max_model_length (`int`, *optional*):
             Maximum model sequence length for the colocated vLLM engine.
         vllm_tensor_parallel_size (`int`, *optional*, defaults to `1`):
@@ -340,6 +345,15 @@ class DistillationConfig(_BaseConfig):
     vllm_gpu_memory_utilization: float = field(
         default=0.3,
         metadata={"help": "GPU memory utilization for the colocated student vLLM engine."},
+    )
+    vllm_kv_cache_memory_bytes: int | None = field(
+        default=None,
+        metadata={
+            "help": "KV cache size per GPU in bytes for vLLM. When set, it replaces the cache size derived from "
+            "`vllm_gpu_memory_utilization`. This setting only applies when `vllm_mode` is set to `'colocate'`. If you "
+            "are using `vllm_mode='server'`, this parameter must be passed separately when launching the vLLM server "
+            "via the `--kv_cache_memory_bytes` flag."
+        },
     )
     vllm_max_model_length: int | None = field(
         default=None,

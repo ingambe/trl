@@ -89,6 +89,11 @@ class SSDConfig(_BaseConfig):
             Tensor parallel size for colocated vLLM.
         vllm_gpu_memory_utilization (`float`, *optional*, defaults to `0.3`):
             GPU memory utilization ratio for colocated vLLM.
+        vllm_kv_cache_memory_bytes (`int`, *optional*):
+            KV cache size per GPU in bytes for vLLM. When set, it replaces the cache size derived from
+            `vllm_gpu_memory_utilization`. This setting only applies when `vllm_mode` is set to `"colocate"`. If you
+            are using `vllm_mode="server"`, this parameter must be passed separately when launching the vLLM server via
+            the `--kv_cache_memory_bytes` flag.
         vllm_max_model_length (`int` or `None`, *optional*):
             Model context length for vLLM. Inferred from model config if not set.
         vllm_enable_sleep_mode (`bool`, *optional*, defaults to `False`):
@@ -217,6 +222,15 @@ class SSDConfig(_BaseConfig):
     vllm_gpu_memory_utilization: float = field(
         default=0.3,
         metadata={"help": "GPU memory utilization ratio for colocated vLLM."},
+    )
+    vllm_kv_cache_memory_bytes: int | None = field(
+        default=None,
+        metadata={
+            "help": "KV cache size per GPU in bytes for vLLM. When set, it replaces the cache size derived from "
+            "`vllm_gpu_memory_utilization`. This setting only applies when `vllm_mode` is set to `'colocate'`. If you "
+            "are using `vllm_mode='server'`, this parameter must be passed separately when launching the vLLM server "
+            "via the `--kv_cache_memory_bytes` flag."
+        },
     )
     vllm_max_model_length: int | None = field(
         default=None,

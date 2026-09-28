@@ -153,6 +153,11 @@ class RLOOConfig(_BaseConfig):
             Control the GPU memory utilization for vLLM. This setting only applies when `vllm_mode` is set to
             `"colocate"`. If you are using `vllm_mode="server"`, this parameter must be passed separately when
             launching the vLLM server via the `--vllm_gpu_memory_utilization` flag.
+        vllm_kv_cache_memory_bytes (`int`, *optional*):
+            KV cache size per GPU in bytes for vLLM. When set, it replaces the cache size derived from
+            `vllm_gpu_memory_utilization`. This setting only applies when `vllm_mode` is set to `"colocate"`. If you
+            are using `vllm_mode="server"`, this parameter must be passed separately when launching the vLLM server via
+            the `--kv_cache_memory_bytes` flag.
         vllm_max_model_length (`int`, *optional*):
             Context window for vLLM. Set it to at least the maximum prompt length in the dataset plus
             `max_completion_length`; if omitted, it is inferred from the model config.
@@ -475,6 +480,15 @@ class RLOOConfig(_BaseConfig):
             "help": "Control the GPU memory utilization for vLLM. This setting only applies when `vllm_mode` is set "
             "to `'colocate'`. If you are using `vllm_mode='server'`, this parameter must be passed separately when "
             "launching the vLLM server via the `--vllm_gpu_memory_utilization` flag."
+        },
+    )
+    vllm_kv_cache_memory_bytes: int | None = field(
+        default=None,
+        metadata={
+            "help": "KV cache size per GPU in bytes for vLLM. When set, it replaces the cache size derived from "
+            "`vllm_gpu_memory_utilization`. This setting only applies when `vllm_mode` is set to `'colocate'`. If you "
+            "are using `vllm_mode='server'`, this parameter must be passed separately when launching the vLLM server "
+            "via the `--kv_cache_memory_bytes` flag."
         },
     )
     vllm_max_model_length: int | None = field(

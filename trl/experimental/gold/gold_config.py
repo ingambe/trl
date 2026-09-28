@@ -127,6 +127,11 @@ class GOLDConfig(SFTConfig):
         vllm_gpu_memory_utilization (`float`, *optional*, defaults to `0.9`):
             GPU memory utilization for the colocated student vLLM engine (if `vllm_mode="colocate"`). It is recommended
             to set this to a low value if the student and teacher models share the same GPU.
+        vllm_kv_cache_memory_bytes (`int`, *optional*):
+            KV cache size per GPU in bytes for vLLM. When set, it replaces the cache size derived from
+            `vllm_gpu_memory_utilization`. This setting only applies when `vllm_mode` is set to `"colocate"`. If you
+            are using `vllm_mode="server"`, this parameter must be passed separately when launching the vLLM server via
+            the `--kv_cache_memory_bytes` flag.
         vllm_tensor_parallel_size (`int`, *optional*, defaults to `1`):
             Tensor parallel size for the colocated student vLLM engine (if `vllm_mode="colocate"`).
         vllm_structured_outputs_regex (`str`, *optional*):
@@ -396,6 +401,15 @@ class GOLDConfig(SFTConfig):
         default=0.9,
         metadata={
             "help": 'GPU memory utilization for the colocated vLLM engine when `vllm_mode="colocate"`. Lower values reduce contention when sharing a device with the student/teacher models.'
+        },
+    )
+    vllm_kv_cache_memory_bytes: int | None = field(
+        default=None,
+        metadata={
+            "help": "KV cache size per GPU in bytes for vLLM. When set, it replaces the cache size derived from "
+            "`vllm_gpu_memory_utilization`. This setting only applies when `vllm_mode` is set to `'colocate'`. If you "
+            "are using `vllm_mode='server'`, this parameter must be passed separately when launching the vLLM server "
+            "via the `--kv_cache_memory_bytes` flag."
         },
     )
     vllm_tensor_parallel_size: int = field(

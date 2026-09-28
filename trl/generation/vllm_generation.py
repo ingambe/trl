@@ -167,6 +167,10 @@ class VLLMGeneration:
             too high, it may cause out-of- memory (OOM) errors. This setting only applies when `mode` is set to
             `"colocate"`. If you are using `mode="server"`, this parameter must be passed separately when launching the
             vLLM server via the `--vllm_gpu_memory_utilization` flag.
+        kv_cache_memory_bytes (`int`, *optional*):
+            KV cache size per GPU in bytes. When set, it replaces the cache size derived from `gpu_memory_utilization`.
+            This setting only applies when `mode` is set to `"colocate"`. If you are using `mode="server"`, this
+            parameter must be passed separately when launching the vLLM server via the `--kv_cache_memory_bytes` flag.
         max_model_length (`int`, *optional*):
             Model context length (prompt and completion). Set it to at least the maximum prompt length in the dataset
             plus `max_completion_length`; if omitted, it is inferred from the model config.
@@ -236,6 +240,7 @@ class VLLMGeneration:
         # Colocate mode configuration
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
+        kv_cache_memory_bytes: int | None = None,
         max_model_length: int | None = None,
         max_num_seqs: int | None = None,
         enable_sleep_mode: bool = False,
@@ -271,6 +276,7 @@ class VLLMGeneration:
         # Colocate mode configuration
         self.tensor_parallel_size = tensor_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
+        self.kv_cache_memory_bytes = kv_cache_memory_bytes
         self.max_model_length = max_model_length
         self.max_num_seqs = max_num_seqs
         self.enable_sleep_mode = enable_sleep_mode
@@ -368,6 +374,7 @@ class VLLMGeneration:
                 model=model.name_or_path,
                 tensor_parallel_size=self.tensor_parallel_size,
                 gpu_memory_utilization=self.gpu_memory_utilization,
+                kv_cache_memory_bytes=self.kv_cache_memory_bytes,
                 max_model_len=self.max_model_length,
                 max_num_seqs=self.max_num_seqs,
                 enable_sleep_mode=self.enable_sleep_mode,
