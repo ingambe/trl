@@ -137,8 +137,7 @@ def run(environment):
     }
     (ROOT / "result.json").write_text(json.dumps(result, indent=2, allow_nan=False))
     if rollout:
-        # Profiles and the distribution diagnostic come from separate processes after all timing samples.
-        # Timings are persisted first so a capture failure cannot lose completed measurements.
+        # Profiled runs come after timing, which is saved first so a failed capture cannot lose it
         result["profiles"], result["policy_parity"] = {}, {}
         seed = config["seeds"][0]
         for side in ("base", "head"):
