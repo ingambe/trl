@@ -1608,6 +1608,7 @@ class GOLDTrainer(SFTTrainer):
             images=None,
             num_generations=self.num_generations,
         )
+        self.vllm_generation.sleep()
 
         self._process_completions_to_buffer(
             slices,
@@ -1784,6 +1785,7 @@ class GOLDTrainer(SFTTrainer):
             images=generate_images,
             num_generations=self.num_generations,
         )
+        self.vllm_generation.sleep()
 
         all_completion_texts = []
         for comp_ids in completion_ids:
