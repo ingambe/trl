@@ -18,6 +18,7 @@ import argparse
 import importlib.metadata
 import json
 import math
+import os
 import subprocess
 import sys
 import time
@@ -168,13 +169,19 @@ def main():
     manifest = json.loads(args.manifest.read_text())
     config = manifest["workload"].copy()
     profiling = args.profile_dir is not None
+    # Each data-parallel process rolls out its own prompts; rank 0 captures the profile and writes the record
+    rank, world_size = int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
     if profiling:
         config["steps"] = min(2, config["steps"])
     set_seed(args.seed)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, local_files_only=True)
     data = json.loads(args.data.read_text())
     prompts = [
-        tokenizer.decode(data["train"][(args.seed + index) % len(data["train"])][: config["prompt_tokens"]])
+        tokenizer.decode(
+            data["train"][(args.seed + rank * config["batch_size"] + index) % len(data["train"])][
+                : config["prompt_tokens"]
+            ]
+        )
         for index in range(config["batch_size"])
     ]
     tool_ids = tokenizer.encode("\nTool result: 42. Continue.\n", add_special_tokens=False)
@@ -279,7 +286,9 @@ def main():
     durations, outputs = [], []
     sleeping = True
     torch.cuda.reset_peak_memory_stats()
-    profiler = make_profiler(args.profile_dir, config["warmup_steps"], config["steps"]) if profiling else None
+    profiler = (
+        make_profiler(args.profile_dir, config["warmup_steps"], config["steps"]) if profiling and rank == 0 else None
+    )
     with profiler if profiler else nullcontext():
         for phase in range(config["warmup_steps"] + config["steps"]):
             # A real update between phases must invalidate the previous policy's KV
@@ -294,13 +303,20 @@ def main():
             with span("rollout_phase", profiling):
                 result = trainer._generate(prompts)
             torch.cuda.synchronize()
+            # The slowest process bounds a data-parallel rollout
             duration = time.perf_counter() - started
+            if world_size > 1:
+                duration = torch.tensor(duration, device="cuda")
+                torch.distributed.all_reduce(duration, op=torch.distributed.ReduceOp.MAX)
+                duration = duration.item()
             sleeping = sleeping and engine.llm.llm_engine.is_sleeping()
             if phase >= config["warmup_steps"]:
                 durations.append(duration)
                 outputs.append(result[1])
             if profiler:
                 profiler.step()
+    if rank > 0:
+        return
     record = {
         "side": args.side,
         "seed": args.seed,

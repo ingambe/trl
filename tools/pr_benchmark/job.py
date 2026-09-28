@@ -79,7 +79,7 @@ def run(environment):
     env = {key: os.environ[key] for key in ("PATH", "HOME", "LD_LIBRARY_PATH", "SSL_CERT_FILE") if key in os.environ}
     env.update(
         {
-            "CUDA_VISIBLE_DEVICES": "0",
+            "CUDA_VISIBLE_DEVICES": ",".join(str(index) for index in range(config.get("gpus", 1))),
             "HF_HUB_OFFLINE": "1",
             "HF_DATASETS_OFFLINE": "1",
             "PYTHONNOUSERSITE": "1",
@@ -87,13 +87,17 @@ def run(environment):
         }
     )
     rollout = config.get("kind") == "vllm-rollout"
+    # One data-parallel process per GPU, each with its own colocated vLLM engine
+    launcher = [sys.executable]
+    if config.get("gpus", 1) > 1:
+        launcher += ["-m", "torch.distributed.run", "--standalone", f"--nproc-per-node={config['gpus']}"]
 
     def run_child(side, seed, stem, *extra):
         output = work / f"{stem}.json"
         with (ROOT / f"{stem}.log").open("w") as log:
             subprocess.run(
                 [
-                    sys.executable,
+                    *launcher,
                     str(ROOT / ("rollout_workload.py" if rollout else "workload.py")),
                     "--model-path",
                     str(environment / "model"),
