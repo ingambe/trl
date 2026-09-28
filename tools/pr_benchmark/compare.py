@@ -48,7 +48,13 @@ def compare(result, manifest):
             raise ValueError("Wrong commit or incomplete training")
         for metric in (*metrics, *diagnostics, "peak_memory_bytes", "workload_seconds"):
             value = record[metric]
-            if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            # Sharing weights with vLLM legitimately publishes nothing
+            if (
+                not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+                or (value == 0 and metric != "weight_transfer_bytes")
+            ):
                 raise ValueError(f"Invalid {metric} for {side}, seed {seed}")
         environments.append(record["environment"])
     if any(env != environments[0] for env in environments):
