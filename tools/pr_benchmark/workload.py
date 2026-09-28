@@ -22,10 +22,7 @@ import platform
 import subprocess
 import sys
 import time
-from contextlib import nullcontext
 from pathlib import Path
-
-from profiling import make_profiler, save_profile_metadata
 
 
 def main():
@@ -37,7 +34,6 @@ def main():
     parser.add_argument("--side", choices=["base", "head"], required=True)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--profile-dir", type=Path)
     args = parser.parse_args()
     sys.path.insert(0, str(args.checkout))
 
@@ -50,12 +46,7 @@ def main():
 
     if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
         raise RuntimeError("This workload requires a CUDA GPU with BF16 support")
-    manifest = json.loads(args.manifest.read_text())
-    config = manifest["workload"].copy()
-    active_steps = min(2, config["steps"] - config["warmup_steps"])
-    if args.profile_dir:
-        config["steps"] = config["warmup_steps"] + active_steps
-    profiler = make_profiler(args.profile_dir, config["warmup_steps"], active_steps) if args.profile_dir else None
+    config = json.loads(args.manifest.read_text())["workload"]
     data = json.loads(args.data.read_text())
     set_seed(args.seed)
     model = AutoModelForCausalLM.from_pretrained(
@@ -80,8 +71,6 @@ def main():
             self.steady_started = None
 
         def on_step_end(self, args, state, control, **kwargs):
-            if profiler:
-                profiler.step()
             if state.global_step == config["warmup_steps"]:
                 torch.cuda.synchronize()
                 self.steady_started = time.perf_counter()
@@ -128,8 +117,7 @@ def main():
         callbacks=[timer],
     )
     torch.cuda.reset_peak_memory_stats()
-    with profiler if profiler else nullcontext():
-        trained = trainer.train()
+    trained = trainer.train()
     peak = torch.cuda.max_memory_allocated()
     if trainer.state.global_step != config["steps"]:
         raise RuntimeError("Training stopped before the requested step count")
@@ -173,8 +161,6 @@ def main():
         "environment": environment,
         "trajectory": [r for r in trainer.state.log_history if "loss" in r],
     }
-    if args.profile_dir:
-        save_profile_metadata(args.profile_dir, record, manifest, config["warmup_steps"], active_steps)
     args.output.write_text(json.dumps(record, allow_nan=False))
 
 
