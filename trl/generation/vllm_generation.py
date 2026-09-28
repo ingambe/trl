@@ -407,6 +407,7 @@ class VLLMGeneration:
             )
             if self.share_weights:
                 self._shared_views = self._share_weights()
+                empty_cache()  # return the model's replaced weight storage
             self._llm_weights_sleeping = False
             self._kv_cache_sleeping = False
             self.sleep()
