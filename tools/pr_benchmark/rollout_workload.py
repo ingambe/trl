@@ -153,7 +153,7 @@ def main():
     for name in ("model-path", "checkout", "data", "manifest", "output"):
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--side", choices=["base", "head"], required=True)
-    parser.add_argument("--seed", type=int, required=True)
+    parser.add_argument("--seeds", type=int, nargs="+", required=True)
     parser.add_argument("--profile-dir", type=Path)
     args = parser.parse_args()
     sys.path.insert(0, str(args.checkout))
@@ -173,17 +173,19 @@ def main():
     rank, world_size = int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
     if profiling:
         config["steps"] = min(2, config["steps"])
-    set_seed(args.seed)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, local_files_only=True)
     data = json.loads(args.data.read_text())
-    prompts = [
-        tokenizer.decode(
-            data["train"][(args.seed + rank * config["batch_size"] + index) % len(data["train"])][
-                : config["prompt_tokens"]
-            ]
-        )
-        for index in range(config["batch_size"])
-    ]
+
+    def prompts_for(seed):
+        return [
+            tokenizer.decode(
+                data["train"][(seed + rank * config["batch_size"] + index) % len(data["train"])][
+                    : config["prompt_tokens"]
+                ]
+            )
+            for index in range(config["batch_size"])
+        ]
+
     tool_ids = tokenizer.encode("\nTool result: 42. Continue.\n", add_special_tokens=False)
 
     def rollout(prompts, trainer):
@@ -226,18 +228,14 @@ def main():
                 bf16=True,
                 report_to="none",
                 save_strategy="no",
-                seed=args.seed,
+                seed=args.seeds[0],
             ),
-            train_dataset=Dataset.from_dict({"prompt": prompts}),
+            train_dataset=Dataset.from_dict({"prompt": prompts_for(args.seeds[0])}),
             reward_funcs=lambda completions, **kwargs: [0.0] * len(completions),
             rollout_func=rollout,
         )
     engine = trainer.vllm_generation
     lora_b = [param for name, param in trainer.model.named_parameters() if "lora_B" in name]
-    generator = torch.Generator(device="cuda").manual_seed(args.seed + 1000)
-    with torch.no_grad():
-        for param in lora_b:
-            param.normal_(std=0.01, generator=generator)
     frozen = {
         name: param.detach().cpu().clone()
         for name, param in trainer.model.named_parameters()
@@ -283,78 +281,94 @@ def main():
         engine.llm.wake_up = annotate(engine.llm.wake_up)
         engine.llm.sleep = annotate(engine.llm.sleep)
         engine.llm.reset_prefix_cache = annotate(engine.llm.reset_prefix_cache)
-    durations, outputs = [], []
-    sleeping = True
-    torch.cuda.reset_peak_memory_stats()
-    profiler = (
-        make_profiler(args.profile_dir, config["warmup_steps"], config["steps"]) if profiling and rank == 0 else None
-    )
-    with profiler if profiler else nullcontext():
-        for phase in range(config["warmup_steps"] + config["steps"]):
-            # A real update between phases must invalidate the previous policy's KV
-            with torch.no_grad():
-                for param in lora_b:
-                    param.add_(0.001)
-            trainer.state.global_step = phase
-            if phase == config["warmup_steps"]:
-                counters.update(dict.fromkeys(counters, 0))
-            torch.cuda.synchronize()
-            started = time.perf_counter()
-            with span("rollout_phase", profiling):
-                result = trainer._generate(prompts)
-            torch.cuda.synchronize()
-            # The slowest process bounds a data-parallel rollout
-            duration = time.perf_counter() - started
-            if world_size > 1:
-                duration = torch.tensor(duration, device="cuda")
-                torch.distributed.all_reduce(duration, op=torch.distributed.ReduceOp.MAX)
-                duration = duration.item()
-            sleeping = sleeping and engine.llm.llm_engine.is_sleeping()
-            if phase >= config["warmup_steps"]:
-                durations.append(duration)
-                outputs.append(result[1])
-            if profiler:
-                profiler.step()
-    if rank > 0:
-        return
-    record = {
-        "side": args.side,
-        "seed": args.seed,
-        "sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=args.checkout, text=True).strip(),
-        "steps": config["steps"],
-        "rollout_seconds": sum(durations),
-        "phase_seconds": durations,
-        **counters,
-        "sleeping_after_phase": sleeping,
-        "output_tokens": outputs,
-        "peak_memory_bytes": torch.cuda.max_memory_allocated(),
-        "frozen_weight_max_abs_drift": max(
-            (param.detach().cpu() - frozen[name]).abs().float().max().item()
-            for name, param in trainer.model.named_parameters()
-            if name in frozen
-        ),
-        "environment": {
-            "gpu": torch.cuda.get_device_name(),
-            "driver": subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"], text=True
-            ).strip(),
-            "packages": sorted(f"{d.metadata['Name']}=={d.version}" for d in importlib.metadata.distributions()),
-        },
-    }
-    if profiling:
-        # After the capture window, so the profile covers only complete rollout phases
-        record["policy_parity"] = policy_parity(
-            trainer, tokenizer(prompts[0])["input_ids"], args.profile_dir, args.seed
+    # One process runs every seed, so model loading and vLLM startup happen once per side
+    records = []
+    for seed in args.seeds:
+        seed_started = time.perf_counter()
+        set_seed(seed)
+        prompts = prompts_for(seed)
+        generator = torch.Generator(device="cuda").manual_seed(seed + 1000)
+        with torch.no_grad():
+            for param in lora_b:
+                param.normal_(std=0.01, generator=generator)
+        durations, outputs = [], []
+        sleeping = True
+        torch.cuda.reset_peak_memory_stats()
+        profiler = (
+            make_profiler(args.profile_dir, config["warmup_steps"], config["steps"])
+            if profiling and rank == 0
+            else None
         )
-        metadata = {
-            "manifest_id": manifest["id"],
-            **{key: record[key] for key in ("side", "sha", "seed", "environment")},
-            "workload": manifest["workload"],
-            "warmup_steps": config["warmup_steps"],
-            "active_steps": config["steps"],
+        with profiler if profiler else nullcontext():
+            for phase in range(config["warmup_steps"] + config["steps"]):
+                # A real update between phases must invalidate the previous policy's KV
+                with torch.no_grad():
+                    for param in lora_b:
+                        param.add_(0.001)
+                trainer.state.global_step = phase
+                if phase == config["warmup_steps"]:
+                    counters.update(dict.fromkeys(counters, 0))
+                torch.cuda.synchronize()
+                started = time.perf_counter()
+                with span("rollout_phase", profiling):
+                    result = trainer._generate(prompts)
+                    # As in GRPO's training step, vLLM sleeps right after generation
+                    engine.sleep()
+                torch.cuda.synchronize()
+                # The slowest process bounds a data-parallel rollout
+                duration = time.perf_counter() - started
+                if world_size > 1:
+                    duration = torch.tensor(duration, device="cuda")
+                    torch.distributed.all_reduce(duration, op=torch.distributed.ReduceOp.MAX)
+                    duration = duration.item()
+                sleeping = sleeping and engine.llm.llm_engine.is_sleeping()
+                if phase >= config["warmup_steps"]:
+                    durations.append(duration)
+                    outputs.append(result[1])
+                if profiler:
+                    profiler.step()
+        if rank > 0:
+            continue
+        record = {
+            "side": args.side,
+            "seed": seed,
+            "sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=args.checkout, text=True).strip(),
+            "steps": config["steps"],
+            "rollout_seconds": sum(durations),
+            "workload_seconds": time.perf_counter() - seed_started,
+            "phase_seconds": durations,
+            **counters,
+            "sleeping_after_phase": sleeping,
+            "output_tokens": outputs,
+            "peak_memory_bytes": torch.cuda.max_memory_allocated(),
+            "frozen_weight_max_abs_drift": max(
+                (param.detach().cpu() - frozen[name]).abs().float().max().item()
+                for name, param in trainer.model.named_parameters()
+                if name in frozen
+            ),
+            "environment": {
+                "gpu": torch.cuda.get_device_name(),
+                "driver": subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"], text=True
+                ).strip(),
+                "packages": sorted(f"{d.metadata['Name']}=={d.version}" for d in importlib.metadata.distributions()),
+            },
         }
-        (args.profile_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
-    args.output.write_text(json.dumps(record, indent=2, allow_nan=False))
+        if profiling:
+            # After the capture window, so the profile covers only complete rollout phases
+            record["policy_parity"] = policy_parity(
+                trainer, tokenizer(prompts[0])["input_ids"], args.profile_dir, seed
+            )
+            metadata = {
+                "manifest_id": manifest["id"],
+                **{key: record[key] for key in ("side", "sha", "seed", "environment")},
+                "workload": manifest["workload"],
+                "warmup_steps": config["warmup_steps"],
+                "active_steps": config["steps"],
+            }
+            (args.profile_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+        records.append(record)
+    args.output.write_text(json.dumps(records, indent=2, allow_nan=False))
 
 
 if __name__ == "__main__":

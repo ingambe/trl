@@ -245,7 +245,8 @@ python -m pytest tools/pr_benchmark/tests -q
 The `vllm-rollout` profile measures colocated vLLM rollouts with a nonzero rank-8 LoRA adapter. Each phase applies a
 deterministic adapter update, then times GRPO's `_generate` through a four-turn `rollout_func` that appends fixed CPU
 feedback between turns, and ends with vLLM asleep (the handoff back to training). One warm-up and six measured phases
-run for each of five paired seeds; each seed rolls out two distinct prompts. The feedback is a fixed string, not GRPO's
+run for each of five paired seeds; each seed rolls out two distinct prompts. One process per side runs all seeds, base then
+head, so model loading and vLLM startup happen once per side. The feedback is a fixed string, not GRPO's
 tool-calling loop: this is a systems workload, not a scored task, and reports no task success.
 
 Latency uses the same paired intervals as SFT on `rollout_seconds` (synchronization, all turns, and sleep) and
