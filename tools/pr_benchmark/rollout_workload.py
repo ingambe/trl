@@ -75,7 +75,7 @@ def policy_parity(trainer, history, directory, seed):
 
     engine = trainer.vllm_generation
     model = engine.model
-    # Sample one token and return the full-vocabulary distribution, without truncation or penalties.
+    # One token with its untruncated full-vocabulary distribution
     engine.temperature, engine.top_p, engine.top_k, engine.min_p = 1.0, 1.0, -1, 0.0
     engine.max_completion_length = 1
     engine.logprobs = -1
@@ -106,7 +106,7 @@ def policy_parity(trainer, history, directory, seed):
 
     previous = None
     for stage_index, stage in enumerate(("dense", "lora", "updated_lora")):
-        # Keep the timed model's A matrices; only B changes, so every stage is a distinct nonzero adapter.
+        # Only B changes, so each stage keeps the timed model's A matrices
         generator = torch.Generator(device="cuda").manual_seed(seed + stage_index)
         with torch.no_grad():
             for param in lora_b:
@@ -116,7 +116,7 @@ def policy_parity(trainer, history, directory, seed):
                     param.normal_(std=0.03 if stage == "lora" else 0.1, generator=generator)
         reference = local()
         if stage != "dense":
-            # Evaluate the BF16 merged inference policy, restoring the exact training weights afterwards.
+            # Unmerging is lossy, so keep exact copies to restore
             originals = {
                 param: param.detach().cpu().clone()
                 for module in model.modules()
@@ -129,7 +129,7 @@ def policy_parity(trainer, history, directory, seed):
             with torch.no_grad():
                 for param, original in originals.items():
                     param.copy_(original)
-        # vLLM is asleep after the timed phases, so this standalone call publishes the current policy on every revision.
+        # vLLM is asleep here, so generate publishes the current policy itself
         _, _, logprobs, token_ids = engine.generate([history], images=None, num_generations=1)
         actual = torch.full((model.config.vocab_size,), float("nan"))
         actual[torch.tensor(token_ids[0][0])] = torch.tensor(logprobs[0][0])
@@ -138,9 +138,9 @@ def policy_parity(trainer, history, directory, seed):
         record(stage, reference, actual)
         if stage != "dense":
             record(stage + "_merged_reference", merged_reference, actual)
-            # Negative control: the previous stage's policy stands in for a missed synchronization.
+            # Negative control: the previous policy stands in for a missed sync
             record(stage + "_stale_reference", previous, actual)
-        # Publishing must not change the training policy itself.
+        # Publishing must not change the training policy
         record(stage + "_local_policy_drift", reference, local())
         previous = reference
     np.savez_compressed(directory / "policy-distributions.npz", **arrays)
@@ -189,14 +189,14 @@ def main():
             for history, completion, ids in zip(histories, completions, tokens, strict=True):
                 history.extend(ids)
                 completion.extend(ids)
-                # Deterministic CPU tool feedback; all turns keep the same policy.
+                # Deterministic CPU tool feedback
                 if turn + 1 < config["turns"]:
                     with span("cpu_tool", profiling):
                         history.extend(tool_ids)
                         completion.extend(tool_ids)
         return {"prompt_ids": initial, "completion_ids": completions, "logprobs": None}
 
-    # The distribution diagnostic needs full-vocabulary logprobs; only the separate profiled process enables them.
+    # Full-vocabulary logprobs are only needed by the profiled diagnostic
     llm = partial(generation_module.LLM, max_logprobs=-1) if profiling else generation_module.LLM
     with patch.object(generation_module, "LLM", llm):
         trainer = GRPOTrainer(
@@ -237,7 +237,7 @@ def main():
         if "base_layer.weight" in name
     }
 
-    # Count publications through vLLM's loaders: full tensors via load_weights, native adapters via add_lora.
+    # Count publications: full tensors via load_weights, native adapters via add_lora
     counters = {"weight_transfer_bytes": 0, "sync_count": 0, "load_weights_calls": 0, "add_lora_calls": 0}
     sync_weights = engine.sync_weights
     loader = engine.llm.llm_engine.model_executor.driver_worker.model_runner.model
@@ -262,7 +262,7 @@ def main():
 
     def counted_add_lora(request):
         counters["add_lora_calls"] += 1
-        # Tensor payload = file size minus the 8-byte length prefix and JSON header; the tensors are not read.
+        # Payload is the file size minus the 8-byte length prefix and JSON header, without reading tensors
         path = Path(request.lora_path) / "adapter_model.safetensors"
         with path.open("rb") as stream:
             counters["weight_transfer_bytes"] += path.stat().st_size - 8 - int.from_bytes(stream.read(8), "little")
@@ -282,7 +282,7 @@ def main():
     profiler = make_profiler(args.profile_dir, config["warmup_steps"], config["steps"]) if profiling else None
     with profiler if profiler else nullcontext():
         for phase in range(config["warmup_steps"] + config["steps"]):
-            # A real update between phases must invalidate the previous policy's KV.
+            # A real update between phases must invalidate the previous policy's KV
             with torch.no_grad():
                 for param in lora_b:
                     param.add_(0.001)
@@ -326,7 +326,7 @@ def main():
         },
     }
     if profiling:
-        # Runs after the capture window, so the profile covers only complete rollout phases.
+        # After the capture window, so the profile covers only complete rollout phases
         record["policy_parity"] = policy_parity(
             trainer, tokenizer(prompts[0])["input_ids"], args.profile_dir, args.seed
         )
