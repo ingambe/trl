@@ -117,10 +117,21 @@ class HyperAI:
 
     def validate(self, manifest):
         inventory = self.inventory()
+        expected_gpus = 0 if self.prepare else manifest["workload"].get("gpus", 1)
+        if expected_gpus > 1:
+            # Two RTX 3090 when offered, else two RTX 5090; --serious asks for RTX 5090 only
+            for model in ("5090",) if "5090" in self.resource else ("3090", "5090"):
+                offered = [
+                    r["name"]
+                    for r in inventory["resources"]
+                    if r["gpu"] and r["gpu"]["count"] == expected_gpus and model in r["gpu"]["name"]
+                ]
+                if offered:
+                    self.resource = offered[0]
+                    break
         selected = [r for r in inventory["resources"] if r["name"] == self.resource]
         if not selected:
             raise ValueError("Requested GPU resource unavailable; run doctor and set HYPERAI_RESOURCE")
-        expected_gpus = 0 if self.prepare else 1
         if not selected[0]["gpu"] or selected[0]["gpu"]["count"] != expected_gpus:
             raise ValueError(f"This operation requires {expected_gpus} GPUs")
         supported = {
