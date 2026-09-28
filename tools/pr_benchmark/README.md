@@ -266,6 +266,10 @@ again. Compare a pushed branch before opening a PR (never publishes a status):
   --repo OWNER/REPO --base-ref BASE_SHA --ref HEAD_SHA --profile vllm-rollout --env-file ~/.config/trl-bench/env
 ```
 
+`--gpus 2` runs any `vllm-rollout` profile data-parallel on two GPUs of one allocation: two RTX 3090 when the account
+offers them, otherwise two RTX 5090 (the report names the GPU). Each process rolls out its own prompts with its own
+colocated vLLM engine. A phase lasts as long as its slowest process; rank 0 records the tokens, memory and profile.
+
 `--serious` selects a longer workload on one RTX 5090: three warm-up and twelve measured phases, eight distinct
 prompts of up to 768 tokens, six turns of 64 generated tokens, 1,536-token context. It is still synthetic and unscored:
 longer runs do not establish task quality. Never pool results from different GPUs.
