@@ -245,8 +245,9 @@ def main():
         with torch.no_grad():
             for param in updated:
                 param.normal_(std=0.01, generator=generator)
+    # Dense snapshots are the whole model, so copy asynchronously into pinned memory
     frozen = {
-        name: param.detach().cpu().clone()
+        name: torch.empty(param.shape, dtype=param.dtype, pin_memory=True).copy_(param, non_blocking=True)
         for name, param in trainer.model.named_parameters()
         if ("base_layer.weight" in name if peft else "norm" not in name)
     }
@@ -327,7 +328,7 @@ def main():
         "output_tokens": outputs,
         "peak_memory_bytes": torch.cuda.max_memory_allocated(),
         "frozen_weight_max_abs_drift": max(
-            (param.detach().cpu() - frozen[name]).abs().float().max().item()
+            (param.detach() - frozen[name].to(param.device)).abs().max().item()
             for name, param in trainer.model.named_parameters()
             if name in frozen
         ),
