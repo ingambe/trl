@@ -62,6 +62,9 @@ Concretely:
 - Do not add defensive code, fallback paths, or configuration options "just in case". Only handle cases that actually exist today.
 - Avoid `hasattr` and `getattr`. Their use is almost always a symptom of overly defensive programming or a disguised version check (e.g., "this attribute was added in version X"). Instead, either drop the conditional entirely or express the version check explicitly with a version comparison. There is nearly always a cleaner alternative.
 - When in doubt, prefer less code. Every new function, parameter, or branch is maintenance burden. The best abstraction is often no abstraction.
+- Prefer an explicit call at each call site over a flag or context manager that changes what a method does.
+- Put imports at module top; optional dependencies go under the existing guard, e.g. `if is_peft_available():`.
+- Keep comments and docstrings short, matching the surrounding density. Don't document edge cases nobody hits, and don't add docs pages for internal behavior changes.
 
 ### Tests
 
@@ -79,9 +82,10 @@ There are no `slow` tests: use tiny models, and put tests that need several GPUs
 - Exercise the faulty caller; mock external dependencies without bypassing the bug.
 - Minimize the diff to changes required for the fix, regression coverage, or clarity. Avoid unrelated refactoring and renaming.
 
-### Branch names
+### Branches and commits
 
 - Name branches `<fix|feat|perf|docs|experiment>/<kebab-description>`, with `issue-<N>-` for a fork issue and a `-upstream` suffix for branches based on huggingface/trl main; never use a `claude/` prefix.
+- Squash each PR to a single commit before review.
 
 ## Documentation
 
