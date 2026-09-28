@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -50,6 +51,11 @@ from .testing_utils import (
     require_vllm,
 )
 
+
+if Version(transformers.__version__) >= Version("5.8.0"):
+    from transformers.generation import ContinuousBatchingConfig
+    from transformers.generation.continuous_batching.continuous_api import ContinuousMixin
+    from transformers.generation.continuous_batching.requests import GenerationOutput
 
 if is_peft_available():
     import peft
@@ -214,28 +220,18 @@ class TestTransformersContinuousBatchingContract:
     """Contract tests for the transformers CB API that GRPOTrainer depends on."""
 
     def test_generation_output_has_logprobs_field(self):
-        from transformers.generation.continuous_batching.requests import GenerationOutput
-
         output = GenerationOutput(request_id="req_0")
         assert output.logprobs == [], "GenerationOutput.logprobs must default to an empty list"
 
     def test_generation_output_logprobs_accepts_floats(self):
-        from transformers.generation.continuous_batching.requests import GenerationOutput
-
         output = GenerationOutput(request_id="req_0", generated_tokens=[1, 2, 3], logprobs=[-0.1, -0.5, -0.3])
         assert output.logprobs == [-0.1, -0.5, -0.3]
 
     def test_continuous_batching_config_has_return_logprobs(self):
-        from transformers.generation import ContinuousBatchingConfig
-
         cfg = ContinuousBatchingConfig(return_logprobs=True)
         assert cfg.return_logprobs is True
 
     def test_generate_batch_accepts_continuous_batching_config(self):
-        import inspect
-
-        from transformers.generation.continuous_batching.continuous_api import ContinuousMixin
-
         sig = inspect.signature(ContinuousMixin.generate_batch)
         assert "continuous_batching_config" in sig.parameters, (
             "generate_batch() must accept a continuous_batching_config parameter"
@@ -4966,3 +4962,55 @@ class TestGRPOTrainerVLM(TrlTestCase):
         for n, param in previous_trainable_params.items():
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
+
+def test_cast_lm_head_to_fp32_projects_in_fp32_under_autocast(tiny_llama, tmp_path):
+    model, tokenizer = tiny_llama
+    trainer = GRPOTrainer(
+        model=model.to(torch.bfloat16),
+        processing_class=tokenizer,
+        reward_funcs=lambda completions, **kwargs: [0.0] * len(completions),
+        args=GRPOConfig(
+            output_dir=str(tmp_path),
+            use_cpu=True,
+            report_to="none",
+            cast_lm_head_to_fp32=True,
+            per_device_train_batch_size=2,
+            num_generations=2,
+        ),
+        train_dataset=Dataset.from_dict({"prompt": ["a", "a"]}),
+    )
+    head = trainer.model.lm_head
+    hidden = torch.randn(3, 16, dtype=torch.bfloat16)
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        logits = head(hidden)
+
+    assert logits.dtype == torch.float32
+    torch.testing.assert_close(logits, torch.nn.functional.linear(hidden.float(), head.weight), rtol=0, atol=0)
+
+
+def test_cast_lm_head_to_fp32_sets_vllm_head_dtype(tiny_llama, tmp_path):
+    model, tokenizer = tiny_llama
+    with (
+        patch("trl.generation.vllm_generation.is_vllm_available", return_value=True),
+        patch("trl.generation.vllm_generation.LLM", create=True) as llm,
+    ):
+        GRPOTrainer(
+            model=model,
+            processing_class=tokenizer,
+            reward_funcs=lambda completions, **kwargs: [0.0] * len(completions),
+            args=GRPOConfig(
+                output_dir=str(tmp_path),
+                use_cpu=True,
+                report_to="none",
+                cast_lm_head_to_fp32=True,
+                per_device_train_batch_size=2,
+                num_generations=2,
+                use_vllm=True,
+                vllm_mode="colocate",
+            ),
+            train_dataset=Dataset.from_dict({"prompt": ["a", "a"]}),
+        )
+
+    assert llm.call_args.kwargs["hf_overrides"] == {"head_dtype": "float32"}
