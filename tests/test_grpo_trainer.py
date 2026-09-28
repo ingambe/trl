@@ -1768,6 +1768,7 @@ class TestGRPOTrainer(TrlTestCase):
         trainer.use_vllm = True
         trainer.vllm_importance_sampling_correction = True
         trainer.vllm_importance_sampling_mode = vllm_importance_sampling_mode
+        trainer.vllm_generation = MagicMock()
 
         # Wrap the real `_generate` and inject an unscorable token into its own output, so the shapes come from the
         # trainer rather than being fixed here.
@@ -1790,19 +1791,6 @@ class TestGRPOTrainer(TrlTestCase):
 
         trainer._generate = generate_with_one_unscorable_token
 
-        # Snapshot the divergence metric as soon as it is produced. Reading `_metrics` after training is useless,
-        # because the dict is cleared on every log.
-        original_score = trainer._generate_and_score_completions
-        recorded_metrics = []
-
-        def record_metrics(inputs):
-            outputs = original_score(inputs)
-            for key in ["sampling/sampling_logp_difference/mean", "sampling/sampling_logp_difference/max"]:
-                recorded_metrics.extend((key, value) for value in trainer._metrics["train"][key])
-            return outputs
-
-        trainer._generate_and_score_completions = record_metrics
-
         # Capture the off-policy mask, the third consumer of the sampling logprobs.
         original_off_policy_mask = trainer.get_off_policy_mask
         off_policy_masks = []
@@ -1818,10 +1806,15 @@ class TestGRPOTrainer(TrlTestCase):
         # reliable witness here, since it can stay finite while an individual step's loss carries NaN.
         original_compute_loss = trainer._compute_loss
         losses = []
+        recorded_metrics = []
 
         def record_loss(model, inputs):
+            assert "old_per_token_logps" not in inputs
             loss = original_compute_loss(model, inputs)
             losses.append(loss)
+            # Snapshot the divergence metric here: `_metrics` is cleared on every log.
+            for key in ["sampling/sampling_logp_difference/mean", "sampling/sampling_logp_difference/max"]:
+                recorded_metrics.extend((key, value) for value in trainer._metrics["train"][key])
             return loss
 
         trainer._compute_loss = record_loss
