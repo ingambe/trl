@@ -92,7 +92,7 @@ def run(environment):
     if config.get("gpus", 1) > 1:
         launcher += ["-m", "torch.distributed.run", "--standalone", f"--nproc-per-node={config['gpus']}"]
 
-    def run_child(side, seed, stem, *extra):
+    def run_child(side, stem, *extra):
         output = work / f"{stem}.json"
         with (ROOT / f"{stem}.log").open("w") as log:
             subprocess.run(
@@ -109,8 +109,6 @@ def run(environment):
                     str(data),
                     "--side",
                     side,
-                    "--seed",
-                    str(seed),
                     "--output",
                     str(output),
                     *extra,
@@ -125,14 +123,20 @@ def run(environment):
 
     records = []
     started = time.perf_counter()
-    for index, seed in enumerate(config["seeds"]):
-        # Alternate order to reduce drift caused by temperature or competing workloads.
-        for side in ("base", "head") if index % 2 == 0 else ("head", "base"):
-            before = time.perf_counter()
-            record = run_child(side, seed, f"{side}-{seed}")
-            record["workload_seconds"] = time.perf_counter() - before
-            records.append(record)
-            print(f"Completed {side}, seed {seed}", flush=True)  # noqa: T201
+    if rollout:
+        # One process per side runs every seed, so vLLM starts once per side instead of once per seed
+        for side in ("base", "head"):
+            records += run_child(side, side, "--seeds", *map(str, config["seeds"]))
+            print(f"Completed {side}", flush=True)  # noqa: T201
+    else:
+        for index, seed in enumerate(config["seeds"]):
+            # Alternate order to reduce drift caused by temperature or competing workloads.
+            for side in ("base", "head") if index % 2 == 0 else ("head", "base"):
+                before = time.perf_counter()
+                record = run_child(side, f"{side}-{seed}", "--seed", str(seed))
+                record["workload_seconds"] = time.perf_counter() - before
+                records.append(record)
+                print(f"Completed {side}, seed {seed}", flush=True)  # noqa: T201
     result = {
         "manifest_id": manifest["id"],
         "records": records,
@@ -146,7 +150,9 @@ def run(environment):
         seed = config["seeds"][0]
         for side in ("base", "head"):
             directory = ROOT / f"{side}-profile"
-            record = run_child(side, seed, f"{side}-{seed}-profile", "--profile-dir", str(directory))
+            (record,) = run_child(
+                side, f"{side}-{seed}-profile", "--seeds", str(seed), "--profile-dir", str(directory)
+            )
             result["policy_parity"][side] = record["policy_parity"]
             archive = Path(shutil.make_archive(str(directory), "zip", directory))
             result["profiles"][side] = {
