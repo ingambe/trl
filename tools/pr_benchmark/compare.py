@@ -38,8 +38,11 @@ def compare(result, manifest):
     if set(indexed) != expected or len(records) != len(expected):
         raise ValueError("Missing, duplicate, or unexpected measurements")
     rollout = config.get("kind") == "vllm-rollout"
+    grpo = config.get("kind") == "grpo-train"
     if rollout:
         metrics, diagnostics = ("rollout_seconds", "weight_transfer_bytes"), ()
+    elif grpo:
+        metrics, diagnostics = ("train_seconds", "steady_seconds"), ("generation_seconds", "update_seconds")
     else:
         metrics, diagnostics = ("train_seconds", "steady_seconds", "eval_loss"), ("train_loss",)
     environments = []
@@ -121,6 +124,45 @@ def compare(result, manifest):
         summary["policy_parity"] = parity
         if not all(summary["quality"].values()) and summary["outcome"] in ("improved", "no_regression"):
             summary["outcome"] = "quality_failed"
+    if grpo:
+        runs = {side: [indexed[side, seed] for seed in config["seeds"]] for side in ("base", "head")}
+
+        def gap(key):
+            return max(
+                abs(b[key] - h[key])
+                for base, head in zip(runs["base"], runs["head"], strict=True)
+                for b, h in zip(base["trajectory"], head["trajectory"], strict=True)
+                if b[key] is not None and h[key] is not None
+            )
+
+        def worst(side, key):
+            return max((step[key] or 0.0) for r in runs[side] for step in r["trajectory"])
+
+        means = {
+            key: {side: statistics.mean(r[key] for r in runs[side]) for side in runs}
+            for key in ("generation_seconds", "update_seconds", "peak_memory_bytes", "eval_reward")
+        }
+        logp = "sampling/sampling_logp_difference/mean"
+        parameters = max(
+            abs(h["parameter_sum"] - b["parameter_sum"]) / abs(b["parameter_sum"])
+            for b, h in zip(runs["base"], runs["head"], strict=True)
+        )
+        summary["training"] = {
+            "means": means,
+            "max_step_gap": {key: gap(key) for key in ("loss", "reward", "grad_norm")},
+            "max_logprob_gap": {side: worst(side, logp) for side in runs},
+            "parameter_sum_relative_gap": parameters,
+        }
+        summary["quality"] = {
+            "Per-step rewards match base (max gap <= 1e-3)": summary["training"]["max_step_gap"]["reward"] <= 1e-3,
+            "Held-out reward no worse than base (-0.02 tolerance)": means["eval_reward"]["head"]
+            >= means["eval_reward"]["base"] - 0.02,
+            "vLLM/trainer logprob gap no worse than base": summary["training"]["max_logprob_gap"]["head"]
+            <= 1.1 * summary["training"]["max_logprob_gap"]["base"] + 1e-4,
+            "Final parameters match base (relative sum gap <= 1e-4)": parameters <= 1e-4,
+        }
+        if not all(summary["quality"].values()) and summary["outcome"] in ("improved", "no_regression"):
+            summary["outcome"] = "quality_failed"
     return summary
 
 
@@ -162,12 +204,37 @@ def markdown(summary, manifest):
             f"{item['kl_local_vllm']:.4g} | {item['js_divergence']:.4g} |"
             for label, item in head.items()
         ]
+    if "training" in summary:
+        training = summary["training"]
+        means, steps = training["means"], training["max_step_gap"]
+        lines += ["", "#### Quality checks (reported separately; any failure blocks a passing verdict)", ""]
+        lines += [f"- {'pass' if passed else '**FAIL**'}: {check}" for check, passed in summary["quality"].items()]
+        lines += [
+            "",
+            "| Mean per run | Base | PR |",
+            "|---|---:|---:|",
+            f"| Steady generation + scoring seconds | {means['generation_seconds']['base']:.3f} | "
+            f"{means['generation_seconds']['head']:.3f} |",
+            f"| Steady backward + optimizer seconds | {means['update_seconds']['base']:.3f} | "
+            f"{means['update_seconds']['head']:.3f} |",
+            f"| Peak memory (GB) | {means['peak_memory_bytes']['base'] / 1e9:.3f} | "
+            f"{means['peak_memory_bytes']['head'] / 1e9:.3f} |",
+            f"| Held-out greedy reward | {means['eval_reward']['base']:.4f} | {means['eval_reward']['head']:.4f} |",
+            f"| Max vLLM/trainer logprob gap | {training['max_logprob_gap']['base']:.3g} | "
+            f"{training['max_logprob_gap']['head']:.3g} |",
+            "",
+            f"Largest per-step gap to base: loss {steps['loss']:.3g}, reward {steps['reward']:.3g}, "
+            f"grad norm {steps['grad_norm']:.3g}. Final parameter-sum relative gap: "
+            f"{training['parameter_sum_relative_gap']:.3g}.",
+        ]
     lines += [
         "",
         "Margins: " + ", ".join(f"{key} +{value}%" for key, value in manifest["thresholds"].items()) + ".",
         (
             "Transfer bytes count tensor payloads passed to vLLM's loaders, not hardware bus traffic."
             if rollout
+            else "Held-out reward uses the synthetic length reward; it is not a scored task benchmark."
+            if "training" in summary
             else "Held-out SFT token loss is a quality proxy; this does not certify other trainers or downstream tasks."
         ),
         "Smoke runs cannot establish no regression. Missing/non-finite measurements are errors, never passes.",

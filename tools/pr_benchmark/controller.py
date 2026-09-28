@@ -177,6 +177,8 @@ def manifest_for(github, pull, profile, environment_job=None, prepare=False):
         "thresholds": (
             {"rollout_seconds": 5.0, "weight_transfer_bytes": 0.0}
             if config.get("kind") == "vllm-rollout"
+            else {"train_seconds": 5.0, "steady_seconds": 5.0}
+            if config.get("kind") == "grpo-train"
             else {"train_seconds": 5.0, "steady_seconds": 5.0, "eval_loss": 1.0}
         ),
         "harness": {
@@ -329,7 +331,9 @@ def main():
     parser.add_argument("--base-ref", default="main", help="Base commit/ref for a pre-PR compare")
     parser.add_argument("--env-file", type=Path)
     parser.add_argument(
-        "--profile", choices=["sft-3090", "smoke", "vllm-rollout", "vllm-rollout-dense"], default="sft-3090"
+        "--profile",
+        choices=["sft-3090", "smoke", "vllm-rollout", "vllm-rollout-dense", "grpo-train-dense"],
+        default="sft-3090",
     )
     parser.add_argument("--serious", action="store_true", help="Longer vllm-rollout workload on one RTX 5090")
     parser.add_argument(

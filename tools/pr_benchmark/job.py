@@ -87,6 +87,9 @@ def run(environment):
         }
     )
     rollout = config.get("kind") == "vllm-rollout"
+    script = {"vllm-rollout": "rollout_workload.py", "grpo-train": "grpo_workload.py"}.get(
+        config.get("kind"), "workload.py"
+    )
 
     def run_child(side, seed, stem, *extra):
         output = work / f"{stem}.json"
@@ -94,7 +97,7 @@ def run(environment):
             subprocess.run(
                 [
                     sys.executable,
-                    str(ROOT / ("rollout_workload.py" if rollout else "workload.py")),
+                    str(ROOT / script),
                     "--model-path",
                     str(environment / "model"),
                     "--checkout",

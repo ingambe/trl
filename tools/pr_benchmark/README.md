@@ -270,6 +270,12 @@ again. Compare a pushed branch before opening a PR (never publishes a status):
 the adapter, and the frozen-weight check covers every other parameter. A checkout whose `GRPOConfig` has
 `vllm_share_weights` enables it, so the comparison measures shared weights against weight publication.
 
+`--profile grpo-train-dense` runs real `GRPOTrainer.train()` instead: 30 AdamW steps on the dense model with colocated
+vLLM, eight completions of up to 64 tokens per step and a deterministic length reward. It compares training time, with
+generation and backward/optimizer time reported separately, and checks quality against base: per-step rewards, the
+vLLM/trainer sampling logprob gap, final parameters and a held-out greedy reward. The reward is synthetic, so this is
+not a scored task benchmark.
+
 `--serious` selects a longer workload on one RTX 5090: three warm-up and twelve measured phases, eight distinct
 prompts of up to 768 tokens, six turns of 64 generated tokens, 1,536-token context. It is still synthetic and unscored:
 longer runs do not establish task quality. Never pool results from different GPUs.
