@@ -17,7 +17,7 @@
 import logging
 import math
 import os
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -610,13 +610,15 @@ class VLLMGeneration:
                     for name, param in self._iter_named_params()
                 ]
             if accelerator.is_main_process:
-                self.vllm_client.update_named_params(self._weight_metadata, self._iter_named_params())
+                with closing(self._iter_named_params()) as params:
+                    self.vllm_client.update_named_params(self._weight_metadata, params)
             else:
                 for _ in self._iter_named_params():  # take part in the gather collectives
                     pass
         elif self.mode == "colocate":
-            for name, param in self._iter_named_params():
-                self.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights([(name, param)])
+            with closing(self._iter_named_params()) as params:
+                for name, param in params:
+                    self.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights([(name, param)])
 
         # Reset cache on vLLM
         if self.mode == "server" and accelerator.is_main_process:
