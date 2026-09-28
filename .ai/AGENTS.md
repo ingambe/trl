@@ -73,6 +73,10 @@ Concretely:
 - Exercise the faulty caller; mock external dependencies without bypassing the bug.
 - Minimize the diff to changes required for the fix, regression coverage, or clarity. Avoid unrelated refactoring and renaming.
 
+### Branch names
+
+- Name branches `<fix|feat|perf|docs|experiment>/<kebab-description>`, with `issue-<N>-` for a fork issue and a `-upstream` suffix for branches based on huggingface/trl main; never use a `claude/` prefix.
+
 ## Documentation
 
 ### GitHub issues
