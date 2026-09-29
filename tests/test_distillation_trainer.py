@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import json
 import os
 from collections import defaultdict
@@ -2951,3 +2952,27 @@ class TestDistillationTrainerVLM(TrlTestCase):
         assert torch.isfinite(torch.tensor(train_loss))
         assert trainer.state.log_history[-1]["tools/call_frequency"] == pytest.approx(1 / 2)
         assert trainer.state.log_history[-1]["tools/failure_frequency"] == pytest.approx(0.0)
+
+
+def test_micro_batches_crop_completion_padding(tiny_llama, tmp_path):
+    model, tokenizer = tiny_llama
+    trainer = DistillationTrainer(
+        model=model,
+        teacher_model=copy.deepcopy(model),
+        processing_class=tokenizer,
+        args=DistillationConfig(
+            output_dir=str(tmp_path),
+            report_to="none",
+            bf16=False,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=4,
+            max_completion_length=32,
+            max_steps=1,
+        ),
+        train_dataset=Dataset.from_dict({"prompt": ["a", "a a", "a a a", "a a a a"]}),
+    )
+    trainer.train()
+
+    widths = [batch["completion_ids"].size(1) for batch in trainer._buffered_inputs]
+    assert widths == [batch["completion_mask"].sum(1).max().item() for batch in trainer._buffered_inputs]
+    assert min(widths) < 32
