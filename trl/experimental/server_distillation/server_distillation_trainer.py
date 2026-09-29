@@ -60,9 +60,8 @@ def _jsd_divergence(student_log_probs, teacher_log_probs, beta, support_mask=Non
             return F.kl_div(teacher_log_probs, student_log_probs, reduction="none", log_target=True)
         else:
             beta_t = torch.tensor(beta, dtype=student_log_probs.dtype, device=student_log_probs.device)
-            mixture_log_probs = torch.logsumexp(
-                torch.stack([student_log_probs + torch.log1p(-beta_t), teacher_log_probs + torch.log(beta_t)]),
-                dim=0,
+            mixture_log_probs = torch.logaddexp(
+                student_log_probs + torch.log1p(-beta_t), teacher_log_probs + torch.log(beta_t)
             )
             kl_teacher = F.kl_div(mixture_log_probs, teacher_log_probs, reduction="none", log_target=True)
             kl_student = F.kl_div(mixture_log_probs, student_log_probs, reduction="none", log_target=True)
