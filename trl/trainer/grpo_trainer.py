@@ -1066,6 +1066,8 @@ class GRPOTrainer(_BaseTrainer):
         # Buffers for user-logged data from reward functions, flushed after gathering
         self._pending_extra_logs = defaultdict(list)
         self._pending_metrics = defaultdict(list)
+        # Loss metrics per micro-batch, reduced across processes in `log`
+        self._pending_loss_metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
 
         # Ensure each process receives a unique seed to prevent duplicate completions when generating with
         # transformers if num_generations exceeds per_device_train_batch_size. We could skip it if we use vLLM, but
@@ -3045,6 +3047,10 @@ class GRPOTrainer(_BaseTrainer):
             per_token_loss = per_token_loss + self.beta * per_token_kl
 
         mode = "train" if self.model.training else "eval"
+
+        def log_metric(key, reduction, value):
+            self._pending_loss_metrics[mode][key, reduction].append(value.detach())
+
         # Count the rows skipped for their zero advantage too
         num_sequences = inputs.get("num_sequences", per_token_loss.size(0))
         if self.loss_type in ["grpo", "sapo"]:
@@ -3107,7 +3113,7 @@ class GRPOTrainer(_BaseTrainer):
 
             loss = loss - apply_coef * entropy_loss
 
-            self._metrics[mode]["policy_loss"].append(self.accelerator.gather(policy_loss).nanmean().item())
+            log_metric("policy_loss", "mean", policy_loss)
 
             # Adaptive update. Gated on train mode so evaluation cannot mutate the entropy controller state.
             if self.use_adaptive_entropy and mode == "train":
@@ -3145,7 +3151,7 @@ class GRPOTrainer(_BaseTrainer):
         if self.aux_loss_enabled:
             normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0
             loss = loss + self.router_aux_loss_coef * aux_loss / normalizer
-            self._metrics[mode]["aux_loss"].append(self.accelerator.gather_for_metrics(aux_loss).mean().item())
+            log_metric("aux_loss", "mean", aux_loss)
 
         # Log the metrics
         def masked_seq_mean(x):
@@ -3153,73 +3159,47 @@ class GRPOTrainer(_BaseTrainer):
                 return x.squeeze(1)
             return (x * mask).sum(-1) / mask.sum(-1)
 
-        def global_masked_mean(x):
+        def masked_sum_and_count(x):
             if x.shape[1] == 1:  # when importance_sampling_level == "sequence": one value per sequence
-                local_sum, local_count = x.sum(), torch.tensor(float(x.shape[0]), device=x.device)
-            else:
-                local_sum, local_count = (x * mask).sum(), mask.sum().float()
-            totals = self.accelerator.reduce(torch.stack([local_sum, local_count]), reduction="sum")
-            return (totals[0] / totals[1].clamp(min=1.0)).item()
+                return torch.stack([x.sum(), x.new_full((), x.shape[0])])
+            return torch.stack([(x * mask).sum(), mask.sum().float()])
 
         if self.beta != 0.0:
-            self._metrics[mode]["kl"].append(global_masked_mean(per_token_kl))
+            log_metric("kl", "ratio", masked_sum_and_count(per_token_kl))
 
-        self._metrics[mode]["entropy"].append(global_masked_mean(entropies))
+        log_metric("entropy", "ratio", masked_sum_and_count(entropies))
 
         if self.use_vllm and self.vllm_importance_sampling_correction:
             delta = torch.abs(old_per_token_logps - inputs["sampling_per_token_logps"])
             # Exclude tokens vLLM could not score (NaN) from the reported divergence
-            delta = delta[mask.bool() & ~torch.isnan(delta)]
-            mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=delta.device)
-            max_delta = torch.max(delta) if delta.numel() > 0 else torch.tensor(0.0, device=delta.device)
-            self._metrics[mode]["sampling/sampling_logp_difference/mean"].append(
-                self.accelerator.gather(mean_delta).mean().item()
-            )
-            self._metrics[mode]["sampling/sampling_logp_difference/max"].append(
-                self.accelerator.gather(max_delta).max().item()
-            )
-            if sequence_level_is:
-                flat_is_ratio = vllm_importance_sampling_ratio.flatten()
-            else:
-                flat_is_ratio = vllm_importance_sampling_ratio[mask.bool()]
-
-            min_importance_sampling_ratio = (
-                torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=delta.device)
-            )
-            mean_importance_sampling_ratio = (
-                torch.mean(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=delta.device)
-            )
-            max_importance_sampling_ratio = (
-                torch.max(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=delta.device)
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/min"].append(
-                nanmin(self.accelerator.gather(min_importance_sampling_ratio)).item()
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/mean"].append(
-                self.accelerator.gather(mean_importance_sampling_ratio).nanmean().item()
-            )
-            self._metrics[mode]["sampling/importance_sampling_ratio/max"].append(
-                nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
-            )
+            delta_mask = mask.bool() & ~torch.isnan(delta)
+            delta = torch.where(delta_mask, delta, 0.0)
+            log_metric("sampling/sampling_logp_difference/mean", "mean", delta.sum() / delta_mask.sum().clamp(min=1))
+            log_metric("sampling/sampling_logp_difference/max", "max", delta.max())
+            is_ratio = vllm_importance_sampling_ratio
+            is_mask = torch.ones_like(is_ratio, dtype=torch.bool) if sequence_level_is else mask.bool()
+            min_is_ratio = torch.where(is_mask.any(), torch.where(is_mask, is_ratio, torch.inf).min(), 0.0)
+            masked_is_ratio = torch.where(is_mask, is_ratio, 0.0)
+            mean_is_ratio = masked_is_ratio.sum() / is_mask.sum().clamp(min=1)
+            log_metric("sampling/importance_sampling_ratio/min", "min", min_is_ratio)
+            log_metric("sampling/importance_sampling_ratio/mean", "mean", mean_is_ratio)
+            log_metric("sampling/importance_sampling_ratio/max", "max", masked_is_ratio.max())
 
         if self.loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo"]:
             # Compute the clipped probability ratios
             is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages < 0)
             is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages > 0)
             is_region_clipped = is_low_clipped | is_high_clipped
-            self._metrics[mode]["clip_ratio/low_mean"].append(global_masked_mean(is_low_clipped.float()))
-            self._metrics[mode]["clip_ratio/high_mean"].append(global_masked_mean(is_high_clipped.float()))
-            self._metrics[mode]["clip_ratio/region_mean"].append(global_masked_mean(is_region_clipped.float()))
-            # Reduce locally first: ranks can hold different numbers of rows
-            gathered_low_clip = self.accelerator.gather(nanmin(masked_seq_mean(is_low_clipped.float())))
-            self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
-            gathered_high_clip = self.accelerator.gather(nanmax(masked_seq_mean(is_high_clipped.float())))
-            self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
+            log_metric("clip_ratio/low_mean", "ratio", masked_sum_and_count(is_low_clipped.float()))
+            log_metric("clip_ratio/high_mean", "ratio", masked_sum_and_count(is_high_clipped.float()))
+            log_metric("clip_ratio/region_mean", "ratio", masked_sum_and_count(is_region_clipped.float()))
+            log_metric("clip_ratio/low_min", "min", masked_seq_mean(is_low_clipped.float()))
+            log_metric("clip_ratio/high_max", "max", masked_seq_mean(is_high_clipped.float()))
         elif self.loss_type == "cispo":
             is_cispo_clipped = (coef_1 > self.epsilon_high) & (advantages > 0)
-            self._metrics[mode]["cispo_clip_ratio"].append(global_masked_mean(is_cispo_clipped.float()))
+            log_metric("cispo_clip_ratio", "ratio", masked_sum_and_count(is_cispo_clipped.float()))
         elif self.loss_type == "vespo":
-            self._metrics[mode]["vespo/phi_seq_mean"].append(global_masked_mean(phi_seq))
+            log_metric("vespo/phi_seq_mean", "ratio", masked_sum_and_count(phi_seq))
 
         return loss
 
@@ -3235,6 +3215,24 @@ class GRPOTrainer(_BaseTrainer):
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         mode = "train" if self.model.training else "eval"
+        for (key, reduction), values in self._pending_loss_metrics[mode].items():
+            # Reduce min and max locally first: processes can hold different numbers of rows
+            if reduction == "min":
+                values = [nanmin(value) for value in values]
+            elif reduction == "max":
+                values = [nanmax(value) for value in values]
+            gathered = self.accelerator.gather(torch.stack(values)).unflatten(0, (self.accelerator.num_processes, -1))
+            if reduction == "ratio":
+                values = gathered[..., 0].sum(0) / gathered[..., 1].sum(0).clamp(min=1.0)
+            elif reduction == "mean":
+                values = gathered.nanmean(0)
+            elif reduction == "min":
+                values = torch.stack([nanmin(value) for value in gathered.unbind(1)])
+            else:
+                values = torch.stack([nanmax(value) for value in gathered.unbind(1)])
+            self._metrics[mode][key].extend(values.tolist())
+        self._pending_loss_metrics[mode].clear()
+
         # Average the metrics
         metrics = {}
         for key, val in self._metrics[mode].items():
