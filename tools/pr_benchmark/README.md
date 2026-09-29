@@ -280,7 +280,8 @@ the adapter, and the frozen-weight check covers every other parameter. On every 
 vLLM, eight completions of up to 64 tokens per step and a deterministic length reward. It compares training time, with
 generation and backward/optimizer time reported separately, and checks quality against base: per-step rewards, the
 vLLM/trainer sampling logprob gap, final parameters and a greedy reward on 128 held-out prompts. The reward is synthetic, so this is
-not a scored task benchmark.
+not a scored task benchmark. `--profile grpo-train-dense-binary` scores 1 only within 25%
+of the target length, else 0, so some groups get equal rewards and have zero advantage.
 
 `--profile grpo-train-lora` trains an `all-linear` rank-16 LoRA instead, with completions of up to 256 tokens. LoRA
 training is not bitwise reproducible even main against main, so it runs ten seeds and only the held-out reward and the
