@@ -210,8 +210,9 @@ not a currency/billing guarantee. Use one state directory for the account so sep
 the same budget. Hyper.ai storage charges are outside this limit.
 
 The remote `timeout` bounds a running task even if the controller goes offline. It cannot bound time queued before the
-command starts; the local controller separately bounds queue/allocation time. Ctrl-C/SIGTERM attempts to stop the active
-job and confirms terminal status. Never infer that a stopped local process means remote compute is stopped.
+command starts; the local controller separately bounds queue/allocation time, extended by `--queue-minutes`. A job whose
+Hyper.ai pod failed to start is resubmitted, at most twice. Ctrl-C/SIGTERM attempts to stop the active job and confirms
+terminal status. Never infer that a stopped local process means remote compute is stopped.
 
 Restarting the same command resumes a recorded running job. Failed comparisons are not automatically rerun for the same
 comparison identity; use manual `run --rerun` or `calibrate --rerun` after resolving the problem. Infrastructure/API errors
