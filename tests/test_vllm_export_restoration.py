@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 from transformers.utils import is_bitsandbytes_available, is_peft_available
 
@@ -20,6 +21,7 @@ from .testing_utils import require_bitsandbytes, require_peft
 
 if is_peft_available():
     from peft import LoraConfig, get_peft_model
+    from peft.tuners.lora import Linear as LoraLinear
 
 if is_bitsandbytes_available():
     import bitsandbytes as bnb
@@ -40,6 +42,28 @@ def test_merged_export_restores_exact_base_weights(vllm_generation):
     vllm_generation.sync_weights()
 
     torch.testing.assert_close(layer.base_layer.weight, before, rtol=0, atol=0)
+
+
+@require_peft
+def test_failed_merge_restores_base_weights(peft_vllm_generation, monkeypatch):
+    model = peft_vllm_generation.model
+    before = {name: param.detach().clone() for name, param in model.named_parameters() if "base_layer" in name}
+    merge = LoraLinear.merge
+
+    def merge_oom_on_second_layer(self, *args, **kwargs):
+        if self is model.base_model.model[1]:
+            raise torch.cuda.OutOfMemoryError
+        return merge(self, *args, **kwargs)
+
+    monkeypatch.setattr(LoraLinear, "merge", merge_oom_on_second_layer)
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        peft_vllm_generation.sync_weights()
+    monkeypatch.setattr(LoraLinear, "merge", merge)
+    peft_vllm_generation.sync_weights()
+
+    for name, param in model.named_parameters():
+        if "base_layer" in name:
+            torch.testing.assert_close(param, before[name], rtol=0, atol=0)
 
 
 @require_peft
