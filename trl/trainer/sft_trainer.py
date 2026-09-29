@@ -1452,8 +1452,8 @@ class SFTTrainer(_BaseTrainer):
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
-        # Entropy and token accuracy are logged as sums over supervised tokens, divided by this count in `log`
-        self._num_supervised_tokens = {"train": 0, "eval": 0}
+        # Loss metrics per micro-batch, reduced across processes in `log`
+        self._pending_loss_metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._total_train_tokens = 0
 
         # Tensor parallel ranks are given the same batch, so a token count gathered across all processes repeats
@@ -1849,16 +1849,17 @@ class SFTTrainer(_BaseTrainer):
         # Without labels (popped by a `compute_loss_func` or label smoothing), the chunked forward runs the original one
         chunked = isinstance(outputs, _ChunkedCELMHeadOutput)
 
+        def log_metric(key, reduction, value):
+            self._pending_loss_metrics[mode][key, reduction].append(value.detach())
+
         # Compute entropy
         if chunked:
             # Use `num_valid_tokens` from the patched forward rather than recomputing from `labels`. Prompt-learning
             # PEFT (PromptTuning, P-Tuning) prepends `-100`-padded virtual tokens before delegating into the patched
             # forward, so the valid-token count over the padded labels can differ from the un-padded `labels[..., 1:]`
             # count by up to one per sequence; using the patched output keeps numerator and denominator aligned.
-            num_valid = self.accelerator.gather_for_metrics(outputs.num_valid_tokens).sum()
-            entropy_sum = self.accelerator.gather_for_metrics(outputs.entropy_sum).sum()
-            self._metrics[mode]["entropy"].append(entropy_sum.item())
-            self._num_supervised_tokens[mode] += num_valid.item()
+            log_metric("entropy", "sum", outputs.entropy_sum)
+            log_metric("num_supervised_tokens", "sum", outputs.num_valid_tokens)
         elif not self.args.use_liger_kernel:  # liger doesn't return logits
             with torch.no_grad():
                 if "shift_labels" in inputs:
@@ -1884,39 +1885,30 @@ class SFTTrainer(_BaseTrainer):
                 total_tokens = mask.sum()
                 correct_predictions = (predictions == shift_labels) & mask
                 correct_tokens = correct_predictions.sum()
-
-                # Gather counts across ranks; `log` divides the sums by the token count
-                entropy_sum = self.accelerator.gather_for_metrics(entropy_sum).sum()
-                total_tokens = self.accelerator.gather_for_metrics(total_tokens).sum()
-                correct_tokens = self.accelerator.gather_for_metrics(correct_tokens).sum()
-            self._metrics[mode]["entropy"].append(entropy_sum.item())
-            self._metrics[mode]["mean_token_accuracy"].append(correct_tokens.item())
-            self._num_supervised_tokens[mode] += total_tokens.item()
+            log_metric("entropy", "sum", entropy_sum)
+            log_metric("mean_token_accuracy", "sum", correct_tokens)
+            log_metric("num_supervised_tokens", "sum", total_tokens)
 
         if mode == "train":
             # When using padding-free, the attention_mask is not present in the inputs, instead we have cu_seq_lens_q,
             # cu_seq_lens_k, and max_length_k, max_length_q and position_ids.
             if "attention_mask" in inputs:
-                num_tokens_in_batch = self.accelerator.gather_for_metrics(inputs["attention_mask"].sum()).sum().item()
+                log_metric("num_tokens", "sum", inputs["attention_mask"].sum())
             elif "position_ids" in inputs:
                 local_num_tokens = torch.tensor(inputs["position_ids"].size(1), device=inputs["position_ids"].device)
-                num_tokens_in_batch = self.accelerator.gather_for_metrics(local_num_tokens).sum().item()
+                log_metric("num_tokens", "sum", local_num_tokens)
             else:
                 raise ValueError("Expected 'attention_mask' or 'position_ids' in inputs.")
-            self._total_train_tokens += num_tokens_in_batch // self._tp_size
-        self._metrics[mode]["num_tokens"] = [self._total_train_tokens]
 
         if chunked:
-            correct = self.accelerator.gather_for_metrics(outputs.num_correct_tokens).sum()
-            self._metrics[mode]["mean_token_accuracy"].append(correct.item())
+            log_metric("mean_token_accuracy", "sum", outputs.num_correct_tokens)
         elif self.args.use_liger_kernel:
             if hasattr(outputs, "token_accuracy") and outputs.token_accuracy is not None:
                 # Liger returns the local accuracy: weight it by the local number of supervised tokens
                 shift_labels = inputs["shift_labels"] if "shift_labels" in inputs else labels[..., 1:]
                 num_valid = (shift_labels != -100).sum()
-                correct = self.accelerator.gather_for_metrics(outputs.token_accuracy * num_valid).sum()
-                self._metrics[mode]["mean_token_accuracy"].append(correct.item())
-                self._num_supervised_tokens[mode] += self.accelerator.gather_for_metrics(num_valid).sum().item()
+                log_metric("mean_token_accuracy", "sum", outputs.token_accuracy * num_valid)
+                log_metric("num_supervised_tokens", "sum", num_valid)
             else:
                 warnings.warn(
                     "liger-kernel did not return token_accuracy when requested. The mean_token_accuracy metric will "
@@ -1925,9 +1917,7 @@ class SFTTrainer(_BaseTrainer):
                 )
         # Log auxiliary loss if enabled (applies to both Liger and non-Liger)
         if self.aux_loss_enabled:
-            aux_loss = outputs.aux_loss
-            aux_loss = self.accelerator.gather_for_metrics(aux_loss).mean().item()
-            self._metrics[mode]["aux_loss"].append(aux_loss)
+            log_metric("aux_loss", "mean", outputs.aux_loss)
 
         return (loss, outputs) if return_outputs else loss
 
@@ -1943,11 +1933,21 @@ class SFTTrainer(_BaseTrainer):
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         mode = "train" if self.model.training else "eval"
+        for (key, reduction), values in self._pending_loss_metrics[mode].items():
+            gathered = self.accelerator.gather(torch.stack(values)).unflatten(0, (self.accelerator.num_processes, -1))
+            values = gathered.sum(0) if reduction == "sum" else gathered.mean(0)
+            self._metrics[mode][key].extend(values.tolist())
+        if self._pending_loss_metrics[mode]:
+            self._total_train_tokens += sum(self._metrics[mode].pop("num_tokens", [])) // self._tp_size
+            self._metrics[mode]["num_tokens"] = [self._total_train_tokens]
+        self._pending_loss_metrics[mode].clear()
+
+        # Entropy and token accuracy are sums over supervised tokens
+        num_supervised_tokens = sum(self._metrics[mode].pop("num_supervised_tokens", []))
         metrics = {}
         for key, val in self._metrics[mode].items():
             if key in ("entropy", "mean_token_accuracy"):
-                num_tokens = self._num_supervised_tokens[mode]
-                metrics[key] = sum(val) / num_tokens if num_tokens > 0 else 0.0
+                metrics[key] = sum(val) / num_supervised_tokens if num_supervised_tokens > 0 else 0.0
             else:
                 metrics[key] = sum(val) / len(val)  # average the metrics
 
@@ -1959,7 +1959,6 @@ class SFTTrainer(_BaseTrainer):
         logs.update(metrics)
         super().log(logs, start_time)
         self._metrics[mode].clear()
-        self._num_supervised_tokens[mode] = 0
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):

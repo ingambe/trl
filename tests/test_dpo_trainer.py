@@ -950,7 +950,7 @@ class TestDPOTrainer(TrlTestCase):
         }
 
         trainer.model.zero_grad()
-        trainer._metrics["train"].clear()
+        trainer._pending_loss_metrics["train"].clear()
         trainer.use_liger_kernel = False
         loss = trainer.compute_loss(trainer.model, inputs)
         loss.backward()
