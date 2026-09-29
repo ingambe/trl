@@ -32,7 +32,7 @@ def test_server_tool_continuations_keep_their_own_histories(server_tool_trainer)
         for result in (30, 35)
     ]
 
-    tool_mask, messages, completion_ids, logprobs, tool_count, failure_count, _ = trainer._tool_call_loop(
+    tool_mask, messages, completion_ids, logprobs, tool_count, failure_count, _, _ = trainer._tool_call_loop(
         prompts=prompts,
         prompt_ids=[[1], [1]],
         completion_ids=[[10], [20]],
@@ -95,3 +95,37 @@ def test_ranks_with_uneven_tool_calls_share_each_round(two_rank_server_tool_trai
     assert outputs_1[2] == [[11, 30, 130], [11, 35, 135]]
     request = trainer_0.vllm_generation.vllm_client.generate.call_args.kwargs
     assert request["prompts"] == [[1, 11, 30], [1, 11, 35]]
+
+
+def test_tool_loop_marks_rolled_back_tool_call_as_truncated(server_tool_trainer):
+    """A tool call dropped because its result would exceed max_completion_length must be flagged as truncated."""
+    trainer = server_tool_trainer
+    trainer.max_completion_length = 3
+    prompts = [[{"role": "user", "content": "Calculate 3 * 10 + 5."}] for _ in range(2)]
+    completions = [
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"type": "function", "function": {"name": "calculator", "arguments": {"result": result}}}
+                ],
+            }
+        ]
+        for result in (30, 35)
+    ]
+
+    # The first tool result overflows the completion budget and is rolled back
+    _, messages, completion_ids, _, _, _, _, tool_truncated = trainer._tool_call_loop(
+        prompts=prompts,
+        prompt_ids=[[1], [1]],
+        completion_ids=[[10, 11, 2], [20]],
+        completions=completions,
+        logprobs=[[-0.1, -0.1, -0.1], [-0.2]],
+        images=None,
+        multimodal_fields={},
+    )
+
+    assert completion_ids == [[10, 11, 2], [20, 35, 135]]
+    assert "tool_calls" in messages[0][-1], "The first sample must end on its unexecuted tool call."
+    assert tool_truncated == [True, False], "Only the sample whose tool call was rolled back is truncated."
