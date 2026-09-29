@@ -222,6 +222,15 @@ class HyperAI:
             {"userId": self.party, "jobId": job_id},
         )["job"]["status"]
 
+    def failed_to_start(self, job_id):
+        progress = self.query(
+            """query($userId: String!, $jobId: String!) {
+              job(userId: $userId, jobId: $jobId) { statusProgress { value } }
+            }""",
+            {"userId": self.party, "jobId": job_id},
+        )["job"]["statusProgress"]
+        return any(item["value"] == "Main pod failed to start" for item in progress or [])
+
     def cancel(self, job_id):
         self.query(
             """mutation($userId: String!, $jobId: String!) {
