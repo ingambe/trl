@@ -511,6 +511,17 @@ class TestSFTTrainer(TrlTestCase):
 
         assert trainer.state.log_history[-1]["train_loss"] is not None
 
+    def test_predict_returns_logits_with_chunked_nll(self):
+        dataset = Dataset.from_dict({"text": ["The sky is blue.", "Hello world"]})
+        training_args = SFTConfig(output_dir=self.tmp_dir, loss_type="chunked_nll", report_to="none")
+        trainer = SFTTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", args=training_args, train_dataset=dataset
+        )
+
+        output = trainer.predict(trainer.train_dataset)
+
+        assert output.predictions.shape == (*output.label_ids.shape, trainer.model.config.vocab_size)
+
     def test_train_nll_loss(self):
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
