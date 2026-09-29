@@ -1259,6 +1259,8 @@ class SFTTrainer(_BaseTrainer):
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+        # Token-weighted metrics are logged as sums, divided by their token count in `log`
+        self._metric_num_tokens = {"train": defaultdict(int), "eval": defaultdict(int)}
         self._total_train_tokens = 0
 
         # Tensor parallel ranks are given the same batch, so a token count gathered across all processes repeats
@@ -1693,8 +1695,10 @@ class SFTTrainer(_BaseTrainer):
         num_valid = self.accelerator.gather_for_metrics(outputs.label_mask.sum()).sum()
         entropy_sum = self.accelerator.gather_for_metrics(outputs.entropy.detach().sum()).sum()
         num_correct = self.accelerator.gather_for_metrics(outputs.is_top1.sum()).sum()
-        self._metrics[mode]["entropy"].append((entropy_sum / num_valid).item() if num_valid > 0 else 0.0)
-        self._metrics[mode]["mean_token_accuracy"].append((num_correct / num_valid).item() if num_valid > 0 else 0.0)
+        self._metrics[mode]["entropy"].append(entropy_sum.item())
+        self._metrics[mode]["mean_token_accuracy"].append(num_correct.item())
+        self._metric_num_tokens[mode]["entropy"] += num_valid.item()
+        self._metric_num_tokens[mode]["mean_token_accuracy"] += num_valid.item()
 
         if mode == "train":
             # When using padding-free, the attention_mask is not present in the inputs, instead we have cu_seq_lens_q,
@@ -1747,7 +1751,13 @@ class SFTTrainer(_BaseTrainer):
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         mode = "train" if self.model.training else "eval"
-        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
+        metrics = {}
+        for key, val in self._metrics[mode].items():
+            if key in self._metric_num_tokens[mode]:
+                num_tokens = self._metric_num_tokens[mode][key]
+                metrics[key] = sum(val) / num_tokens if num_tokens > 0 else 0.0
+            else:
+                metrics[key] = sum(val) / len(val)  # average the metrics
 
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
@@ -1757,6 +1767,7 @@ class SFTTrainer(_BaseTrainer):
         logs.update(metrics)
         super().log(logs, start_time)
         self._metrics[mode].clear()
+        self._metric_num_tokens[mode].clear()
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):

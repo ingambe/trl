@@ -999,6 +999,8 @@ class DPOTrainer(_BaseTrainer):
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+        # Token-weighted metrics are logged as sums, divided by their token count in `log`
+        self._metric_num_tokens = {"train": defaultdict(int), "eval": defaultdict(int)}
         self._total_train_tokens = 0
 
         # Tensor parallel ranks are given the same batch, so a token count gathered across all processes repeats
@@ -1575,11 +1577,11 @@ class DPOTrainer(_BaseTrainer):
         entropy_sum = (per_token_entropy * mask).sum()
         total_tokens = mask.sum()
 
-        # Gather counts across ranks and weight-average
+        # Gather counts across ranks
         entropy_sum = self.accelerator.gather_for_metrics(entropy_sum).sum()
         total_tokens = self.accelerator.gather_for_metrics(total_tokens).sum()
-        entropy = (entropy_sum / total_tokens).item() if total_tokens > 0 else 0.0
-        self._metrics[mode]["entropy"].append(entropy)
+        self._metrics[mode]["entropy"].append(entropy_sum.item())
+        self._metric_num_tokens[mode]["entropy"] += total_tokens.item()
 
         # Number of tokens
         if mode == "train":
@@ -1608,11 +1610,10 @@ class DPOTrainer(_BaseTrainer):
         correct_predictions = chosen_is_top1 & chosen_mask.bool()
         total_tokens = chosen_mask.sum()
         correct_tokens = correct_predictions.sum()
-        correct_tokens = self.accelerator.gather_for_metrics(correct_tokens)
-        total_tokens = self.accelerator.gather_for_metrics(total_tokens)
-        total_sum = total_tokens.sum()
-        accuracy = (correct_tokens.sum() / total_sum).item() if total_sum > 0 else 0.0
-        self._metrics[mode]["mean_token_accuracy"].append(accuracy)
+        correct_tokens = self.accelerator.gather_for_metrics(correct_tokens).sum()
+        total_tokens = self.accelerator.gather_for_metrics(total_tokens).sum()
+        self._metrics[mode]["mean_token_accuracy"].append(correct_tokens.item())
+        self._metric_num_tokens[mode]["mean_token_accuracy"] += total_tokens.item()
 
         # Rewards for chosen and rejected completions
         chosen_rewards = self.beta * chosen_logratios.detach()
@@ -1734,7 +1735,13 @@ class DPOTrainer(_BaseTrainer):
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         mode = "train" if self.model.training else "eval"
-        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
+        metrics = {}
+        for key, val in self._metrics[mode].items():
+            if key in self._metric_num_tokens[mode]:
+                num_tokens = self._metric_num_tokens[mode][key]
+                metrics[key] = sum(val) / num_tokens if num_tokens > 0 else 0.0
+            else:
+                metrics[key] = sum(val) / len(val)  # average the metrics
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
         if mode == "eval":
@@ -1742,6 +1749,7 @@ class DPOTrainer(_BaseTrainer):
         logs.update(metrics)
         super().log(logs, start_time)
         self._metrics[mode].clear()
+        self._metric_num_tokens[mode].clear()
 
     # During eval, Trainer calls prediction_step. If no labels are present in the inputs, it only runs forward and
     # returns logits. We override prediction_step to force compute_loss, because this trainer doesn't involve labels.
