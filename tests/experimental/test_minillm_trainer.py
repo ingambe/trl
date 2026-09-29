@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
+
 import pytest
 import torch
-from datasets import DatasetDict, load_dataset
+from datasets import Dataset, DatasetDict, load_dataset
 
 from trl.experimental.minillm import MiniLLMConfig, MiniLLMTrainer
 
@@ -80,3 +82,16 @@ class TestMiniLLMTrainer(TrlTestCase):
             assert set(trainer.eval_dataset.keys()) == {"data1", "data2"}
         else:
             assert trainer.eval_dataset is eval_dataset
+
+
+def test_skip_zero_advantages_turned_off_by_distillation_terms(tiny_llama, tmp_path):
+    model, tokenizer = tiny_llama
+    trainer = MiniLLMTrainer(
+        model=model,
+        teacher_model=copy.deepcopy(model),
+        processing_class=tokenizer,
+        args=MiniLLMConfig(output_dir=str(tmp_path), report_to="none", skip_zero_advantages=True),
+        train_dataset=Dataset.from_dict({"prompt": ["a", "a a"]}),
+    )
+
+    assert trainer.skip_zero_advantages is False
