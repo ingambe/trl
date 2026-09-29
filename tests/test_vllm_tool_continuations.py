@@ -65,3 +65,33 @@ def test_server_tool_continuations_keep_their_own_histories(server_tool_trainer)
         "The server must receive both distinct continuation histories in their original order."
     )
     assert request["n"] == 1, "Each continuation history must request exactly one completion."
+
+
+def test_ranks_with_uneven_tool_calls_share_each_round(two_rank_server_tool_trainers):
+    """A rank without tool calls must still join the generation round, and each rank must get its own completions."""
+    results_per_rank = [[None], [30, 35]]
+
+    def tool_call_loop(rank, trainer):
+        completions = []
+        for result in results_per_rank[rank]:
+            message = {"role": "assistant", "content": ""}
+            if result is not None:
+                function = {"name": "calculator", "arguments": {"result": result}}
+                message["tool_calls"] = [{"type": "function", "function": function}]
+            completions.append([message])
+        return trainer._tool_call_loop(
+            prompts=[[{"role": "user", "content": "Calculate."}] for _ in completions],
+            prompt_ids=[[1] for _ in completions],
+            completion_ids=[[10 + rank] for _ in completions],
+            completions=completions,
+            logprobs=None,
+            images=None,
+            multimodal_fields={},
+        )
+
+    (trainer_0, outputs_0), (_, outputs_1) = two_rank_server_tool_trainers([1, 2], tool_call_loop)
+
+    assert outputs_0[2] == [[10]]
+    assert outputs_1[2] == [[11, 30, 130], [11, 35, 135]]
+    request = trainer_0.vllm_generation.vllm_client.generate.call_args.kwargs
+    assert request["prompts"] == [[1, 11, 30], [1, 11, 35]]

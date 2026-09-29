@@ -16,7 +16,9 @@ import gc
 import logging
 import os
 import sys
+import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -116,11 +118,10 @@ def _make_server_generation(accelerator, *, max_completion_length):
     return generation
 
 
-@pytest.fixture
-def server_tool_trainer():
-    """Provide a two-sibling tool scenario; restore patched dependencies after the test."""
+def _make_server_tool_trainer(accelerator, num_samples):
+    """Build a GRPO trainer whose tool loop and server generation run unchanged, with a mocked vLLM client."""
     trainer = object.__new__(GRPOTrainer)
-    trainer.accelerator = SimpleNamespace(device=torch.device("cpu"), is_main_process=True, process_index=0)
+    trainer.accelerator = accelerator
     trainer.args = SimpleNamespace(report_to=[])
     trainer.model = SimpleNamespace(training=True, config=SimpleNamespace(max_position_embeddings=128))
     trainer.state = SimpleNamespace(global_step=0)
@@ -139,15 +140,27 @@ def server_tool_trainer():
     def calculator(result):
         return result
 
-    trainer._sync_tool_dicts = [{"calculator": calculator} for _ in range(2)]
-    trainer._async_tool_dicts = [{}, {}]
+    trainer._sync_tool_dicts = [{"calculator": calculator} for _ in range(num_samples)]
+    trainer._async_tool_dicts = [{} for _ in range(num_samples)]
+    return trainer
 
-    def encode_tool_result(messages):
-        # Synthetic tokenization: a result of "30" becomes token 30.
-        return [int(messages[-1]["content"])]
 
-    def decode_assistant_response(tokenizer, ids, prefix):
-        return {"role": "assistant", "content": str(ids[0])}
+def _encode_tool_result(messages):
+    # Synthetic tokenization: a result of "30" becomes token 30.
+    return [int(messages[-1]["content"])]
+
+
+def _decode_assistant_response(tokenizer, ids, prefix):
+    return {"role": "assistant", "content": str(ids[0])}
+
+
+@pytest.fixture
+def server_tool_trainer():
+    """Provide a two-sibling tool scenario; restore patched dependencies after the test."""
+    accelerator = SimpleNamespace(
+        device=torch.device("cpu"), is_main_process=True, process_index=0, gather=lambda tensor: tensor
+    )
+    trainer = _make_server_tool_trainer(accelerator, num_samples=2)
 
     def gather_on_single_process(values):
         return values
@@ -155,12 +168,56 @@ def server_tool_trainer():
     # Patch only token formatting and distributed transport. The tool loop, single-turn generation, and server
     # grouping run unchanged. These replacements are active during yield and automatically restored afterward.
     with (
-        patch.object(trainer, "_get_tool_suffix_ids", side_effect=encode_tool_result),
-        patch("trl.trainer.grpo_trainer.parse_response", side_effect=decode_assistant_response),
+        patch.object(trainer, "_get_tool_suffix_ids", side_effect=_encode_tool_result),
+        patch("trl.trainer.grpo_trainer.parse_response", side_effect=_decode_assistant_response),
         patch("trl.generation.vllm_generation.gather_object", side_effect=gather_on_single_process),
         patch("trl.generation.vllm_generation.broadcast_object_list", return_value=None),
     ):
         yield trainer
+
+
+@pytest.fixture
+def two_rank_server_tool_trainers():
+    """Run a function on two ranks in threads, with collectives that block until both ranks call them."""
+    barrier = threading.Barrier(2, timeout=5)
+    slots = [None, None]
+    local = threading.local()
+
+    def all_gather(obj):
+        slots[local.rank] = obj
+        barrier.wait()
+        gathered = list(slots)
+        barrier.wait()
+        return gathered
+
+    def gather_object(values):
+        return [value for rank_values in all_gather(values) for value in rank_values]
+
+    def broadcast_object_list(obj_list, from_process=0):
+        obj_list[0] = all_gather(obj_list[0])[from_process]
+
+    def run_on_ranks(num_samples_per_rank, fn):
+        def run(rank):
+            local.rank = rank
+            accelerator = SimpleNamespace(
+                device=torch.device("cpu"),
+                is_main_process=rank == 0,
+                process_index=rank,
+                gather=lambda tensor: torch.stack(all_gather(tensor)),
+            )
+            trainer = _make_server_tool_trainer(accelerator, num_samples=num_samples_per_rank[rank])
+            with patch.object(trainer, "_get_tool_suffix_ids", side_effect=_encode_tool_result):
+                return trainer, fn(rank, trainer)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            return [future.result() for future in [executor.submit(run, rank) for rank in range(2)]]
+
+    with (
+        patch("trl.trainer.grpo_trainer.parse_response", side_effect=_decode_assistant_response),
+        patch("trl.generation.vllm_generation.gather_object", side_effect=gather_object),
+        patch("trl.generation.vllm_generation.broadcast_object_list", side_effect=broadcast_object_list),
+    ):
+        yield run_on_ranks
 
 
 # ============================================================================

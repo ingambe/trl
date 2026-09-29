@@ -824,7 +824,9 @@ class VLLMGeneration:
 
         # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
         if self.mode == "server":
-            all_prompts = gather_object(prompts)
+            # Ranks can hold different numbers of prompts (e.g. in the tool-calling loop)
+            gathered_prompts = gather_object([prompts])
+            all_prompts = [p for rank_prompts in gathered_prompts for p in rank_prompts]
             # Always gather images (even when None) to avoid deadlock: images may be None on some ranks
             # and non-None on others in mixed datasets, and gather_object is a collective operation.
             all_images = gather_object(images if images is not None else [None] * len(prompts))
@@ -881,10 +883,8 @@ class VLLMGeneration:
             # Duplicate prompt_ids to align with per-completion entries.
             all_prompt_ids = [ids for ids in all_prompt_ids for _ in range(num_generations)]
 
-            process_slice = slice(
-                accelerator.process_index * len(prompts),
-                (accelerator.process_index + 1) * len(prompts),
-            )
+            offset = sum(len(rank_prompts) for rank_prompts in gathered_prompts[: accelerator.process_index])
+            process_slice = slice(offset, offset + len(prompts))
             prompt_ids = all_prompt_ids[process_slice]
             completion_ids = all_completion_ids[process_slice]
             logprobs = all_logprobs[process_slice] if all_logprobs is not None else None
@@ -918,7 +918,6 @@ class VLLMGeneration:
             if self.tensor_parallel_size > 1:
                 # Gather prompts from all ranks in the TP group and flatten.
                 # Each rank starts with its own prompts; after gathering, all ranks see the full group set.
-                orig_size = len(prompts)
                 gathered_prompts = [None for _ in range(self.tensor_parallel_size)]
                 torch.distributed.all_gather_object(gathered_prompts, prompts, group=self.tp_group)
                 all_prompts = [p for sublist in gathered_prompts for p in sublist]
@@ -972,7 +971,8 @@ class VLLMGeneration:
                 # Slice completions for this rank within its TP group.
                 # Each rank generates all outputs — we keep only our share.
                 local_rank_in_group = torch.distributed.get_rank(group=self.tp_group)
-                tp_slice = slice(local_rank_in_group * orig_size, (local_rank_in_group + 1) * orig_size)
+                offset = sum(len(rank_prompts) for rank_prompts in gathered_prompts[:local_rank_in_group])
+                tp_slice = slice(offset, offset + len(prompts))
                 prompt_ids = all_prompt_ids[tp_slice]
                 completion_ids = all_completion_ids[tp_slice]
                 logprobs = all_logprobs[tp_slice] if all_logprobs is not None else None
