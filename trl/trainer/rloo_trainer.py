@@ -724,6 +724,8 @@ class RLOOTrainer(_BaseTrainer):
         # Buffers for user-logged data from reward functions, flushed after gathering
         self._pending_extra_logs = defaultdict(list)
         self._pending_metrics = defaultdict(list)
+        # Loss metrics per micro-batch, reduced across processes in `log`
+        self._pending_loss_metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
 
         # Ensure each process receives a unique seed to prevent duplicate completions when generating with
         # transformers if num_generations exceeds per_device_train_batch_size. We could skip it if we use vLLM, but
@@ -1812,31 +1814,31 @@ class RLOOTrainer(_BaseTrainer):
         # Log the metrics
         mode = "train" if self.model.training else "eval"
 
+        def log_metric(key, reduction, value):
+            self._pending_loss_metrics[mode][key, reduction].append(value.detach())
+
+        def sum_and_count(x):
+            return torch.stack([x.sum(), x.new_full((), x.numel())])
+
         # RLOO returns an unscaled loss (the HF Trainer divides by gradient accumulation), so add the aux term unscaled
         if self.aux_loss_enabled:
             loss = loss + self.router_aux_loss_coef * aux_loss
-            self._metrics[mode]["aux_loss"].append(self.accelerator.gather_for_metrics(aux_loss).mean().item())
+            log_metric("aux_loss", "mean", aux_loss)
 
         # Entropy
-        entropy_stats = self.accelerator.reduce(
-            torch.stack([(entropies * completion_mask).sum(), completion_mask.sum().float()]), reduction="sum"
+        log_metric(
+            "entropy", "ratio", torch.stack([(entropies * completion_mask).sum(), completion_mask.sum().float()])
         )
-        self._metrics[mode]["entropy"].append((entropy_stats[0] / entropy_stats[1].clamp(min=1.0)).item())
 
         # Compute the clipped probability ratios
         is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages < 0)
         is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages > 0)
         is_region_clipped = is_low_clipped | is_high_clipped
-        # Pad with NaN, which the reductions below ignore: ranks can hold different numbers of rows
-        pad = self.accelerator.pad_across_processes
-        gathered_low_clip = self.accelerator.gather(pad(is_low_clipped.float(), pad_index=float("nan")))
-        self._metrics[mode]["clip_ratio/low_mean"].append(gathered_low_clip.nanmean().item())
-        self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
-        gathered_high_clip = self.accelerator.gather(pad(is_high_clipped.float(), pad_index=float("nan")))
-        self._metrics[mode]["clip_ratio/high_mean"].append(gathered_high_clip.nanmean().item())
-        self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
-        gathered_clip_ratio = self.accelerator.gather(pad(is_region_clipped.float(), pad_index=float("nan")))
-        self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
+        log_metric("clip_ratio/low_mean", "ratio", sum_and_count(is_low_clipped.float()))
+        log_metric("clip_ratio/low_min", "min", is_low_clipped.float())
+        log_metric("clip_ratio/high_mean", "ratio", sum_and_count(is_high_clipped.float()))
+        log_metric("clip_ratio/high_max", "max", is_high_clipped.float())
+        log_metric("clip_ratio/region_mean", "ratio", sum_and_count(is_region_clipped.float()))
         return loss
 
     # During eval, Trainer calls prediction_step. If no labels are present in the inputs, it only runs forward and
@@ -1851,6 +1853,24 @@ class RLOOTrainer(_BaseTrainer):
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         mode = "train" if self.model.training else "eval"
+        for (key, reduction), values in self._pending_loss_metrics[mode].items():
+            # Reduce min and max locally first: processes can hold different numbers of rows
+            if reduction == "min":
+                values = [nanmin(value) for value in values]
+            elif reduction == "max":
+                values = [nanmax(value) for value in values]
+            gathered = self.accelerator.gather(torch.stack(values)).unflatten(0, (self.accelerator.num_processes, -1))
+            if reduction == "ratio":
+                values = gathered[..., 0].sum(0) / gathered[..., 1].sum(0).clamp(min=1.0)
+            elif reduction == "mean":
+                values = gathered.nanmean(0)
+            elif reduction == "min":
+                values = torch.stack([nanmin(value) for value in gathered.unbind(1)])
+            else:
+                values = torch.stack([nanmax(value) for value in gathered.unbind(1)])
+            self._metrics[mode][key].extend(values.tolist())
+        self._pending_loss_metrics[mode].clear()
+
         # Average the metrics
         metrics = {}
         for key, val in self._metrics[mode].items():
