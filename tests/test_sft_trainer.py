@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import collections
+import contextlib
 import copy
 import gc
 import json
@@ -2978,6 +2979,24 @@ class TestChunkedCrossEntropyLoss:
         labels_ref = labels[..., 1:].reshape(-1)
         valid = labels_ref != -100
         loss_r = F.cross_entropy(logits_ref[valid], labels_ref[valid], reduction="mean")
+        torch.testing.assert_close(loss_c, loss_r, atol=1e-5, rtol=1e-5)
+
+    def test_zero3_runs_the_largest_chunk_count_across_ranks(self):
+        # This rank has one supervised token; another rank needs 3 chunks, so all ranks gather the head 3 times
+        hidden, weight, labels = self._inputs(ignore_positions=slice(2, None), requires_grad=True)
+        gather_ctx = MagicMock(side_effect=lambda *params: contextlib.nullcontext())
+        with (
+            patch("trl.trainer.sft_trainer.is_deepspeed_zero3_enabled", return_value=True),
+            patch(
+                "torch.distributed.all_reduce", side_effect=lambda n_padded, op: n_padded.fill_(3 * self.CHUNK_SIZE)
+            ),
+            patch("trl.trainer.sft_trainer.maybe_gather_lm_head_ctx", gather_ctx),
+        ):
+            loss_c, *_ = _chunked_cross_entropy_loss(hidden, weight, self.CHUNK_SIZE, labels)
+            assert gather_ctx.call_count == 3
+            loss_c.backward()
+        assert gather_ctx.call_count == 6
+        loss_r, *_ = self._reference(hidden, weight, labels)
         torch.testing.assert_close(loss_c, loss_r, atol=1e-5, rtol=1e-5)
 
 
