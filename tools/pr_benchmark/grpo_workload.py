@@ -16,6 +16,7 @@
 
 import argparse
 import importlib.metadata
+import itertools
 import json
 import math
 import os
@@ -161,8 +162,19 @@ def main():
             else None,
             callbacks=[Timer(), MemoryBreakdown()],
         )
-    # Colocated vLLM reseeds the process with a fixed seed, so reseed for sampling to vary across seeds
-    set_seed(args.seed)
+    # Per-request sampling seeds, so a token flipped by rounding changes one completion instead of the whole batch
+    llm = trainer.vllm_generation.llm
+    generate = llm.generate
+    calls = itertools.count()
+
+    def seeded_generate(prompts, sampling_params, **kwargs):
+        call = next(calls)
+        requests = [sampling_params.clone() for _ in prompts]
+        for index, request in enumerate(requests):
+            request.seed = hash((args.seed, rank, call, index)) % 2**31
+        return generate(prompts, sampling_params=requests, **kwargs)
+
+    llm.generate = seeded_generate
     generate_and_score = trainer._generate_and_score_completions
 
     def timed_generate_and_score(inputs):
