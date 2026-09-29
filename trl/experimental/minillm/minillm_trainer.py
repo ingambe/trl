@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
+from accelerate.logging import get_logger
 from datasets import Dataset, IterableDataset
 from packaging.version import Version
 from transformers import (
@@ -38,6 +39,9 @@ from .minillm_config import MiniLLMConfig
 
 if is_peft_available():
     from peft import PeftConfig
+
+
+logger = get_logger(__name__)
 
 
 def dummy_reward_func(completions: list, **kwargs):
@@ -208,6 +212,13 @@ class MiniLLMTrainer(GRPOTrainer):
             peft_config=peft_config,
             rollout_func=rollout_func,
         )
+
+        if self.skip_zero_advantages and (args.rkl_advantage or args.single_step_decomposition):
+            logger.warning(
+                "`skip_zero_advantages=True` is turned off: the loss needs the completions with zero advantage "
+                "(rkl_advantage or single_step_decomposition)."
+            )
+            self.skip_zero_advantages = False
 
         if args.teacher_model_init_kwargs is None:
             teacher_model_init_kwargs = {}
