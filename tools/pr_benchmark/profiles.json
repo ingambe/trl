@@ -64,6 +64,24 @@
     "context_tokens": 512,
     "seeds": [42, 43, 44, 45, 46]
   },
+  "vllm-rollout-medium": {
+    "kind": "vllm-rollout",
+    "model": "Qwen/Qwen2.5-0.5B-Instruct",
+    "model_revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+    "dataset": "trl-lib/Capybara",
+    "dataset_revision": "e235e846458bff3398a88aed812347f7f0756520",
+    "train_examples": 64,
+    "eval_examples": 16,
+    "max_length": 384,
+    "steps": 8,
+    "warmup_steps": 2,
+    "batch_size": 4,
+    "turns": 4,
+    "prompt_tokens": 256,
+    "completion_tokens": 32,
+    "context_tokens": 768,
+    "seeds": [42, 43, 44, 45, 46]
+  },
   "vllm-rollout-serious": {
     "kind": "vllm-rollout",
     "model": "Qwen/Qwen2.5-0.5B-Instruct",

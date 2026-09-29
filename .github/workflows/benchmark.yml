@@ -1,0 +1,75 @@
+name: GPU benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Candidate commit or branch
+        required: true
+        default: main
+      base_ref:
+        description: Base commit or branch
+        required: true
+        default: main
+
+permissions: {}
+
+jobs:
+  benchmark:
+    permissions:
+      contents: read
+    name: ${{ matrix.benchmark }}, ${{ matrix.gpus }} GPU
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        benchmark: [rollout-small, rollout-medium, rollout-large, train-dense, train-lora, train-lora-3b]
+        gpus: [1, 2]
+        exclude:
+          - benchmark: train-lora-3b
+            gpus: 1
+        # Large rollouts run on RTX 5090, the others on RTX 3090
+        include:
+          - benchmark: rollout-small
+            args: --profile vllm-rollout
+          - benchmark: rollout-medium
+            args: --profile vllm-rollout-medium
+          - benchmark: rollout-large
+            args: --profile vllm-rollout --serious
+          - benchmark: train-dense
+            args: --profile grpo-train-dense
+          - benchmark: train-lora
+            args: --profile grpo-train-lora
+          - benchmark: train-lora-3b
+            args: --profile grpo-train-lora-3b
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install the controller
+        run: python -m pip install -r tools/pr_benchmark/requirements-controller.txt
+
+      - name: Compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OPENBAYES_TOKEN: ${{ secrets.OPENBAYES_TOKEN }}
+          HYPERAI_RUNTIME: ${{ vars.HYPERAI_RUNTIME }}
+          HYPERAI_ENVIRONMENT_JOB: ${{ matrix.benchmark == 'train-lora-3b' && vars.HYPERAI_ENVIRONMENT_JOB_3B || vars.HYPERAI_ENVIRONMENT_JOB }}
+          REF: ${{ inputs.ref }}
+          BASE_REF: ${{ inputs.base_ref }}
+        # The deadline includes time queued behind the other jobs
+        run: |
+          python tools/pr_benchmark/controller.py compare --repo "$GITHUB_REPOSITORY" --ref "$REF" \
+            --base-ref "$BASE_REF" ${{ matrix.args }} --gpus ${{ matrix.gpus }} --state-dir "$RUNNER_TEMP/trl-bench" \
+            --timeout-minutes 240 --daily-compute-minutes 240 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reports and profiles
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: benchmark-${{ matrix.benchmark }}-${{ matrix.gpus }}gpu
+          path: ${{ runner.temp }}/trl-bench/runs
