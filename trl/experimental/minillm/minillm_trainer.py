@@ -33,7 +33,6 @@ from transformers.utils import is_peft_available
 from ...models import prepare_deepspeed
 from ...trainer.grpo_trainer import GRPOTrainer, RewardFunc, RolloutFunc
 from ...trainer.utils import disable_dropout_in_model, get_config_model_id
-from ..utils import empty_cache
 from .minillm_config import MiniLLMConfig
 
 
@@ -414,9 +413,6 @@ class MiniLLMTrainer(GRPOTrainer):
             )
 
             loss += single_step_decomposition_loss
-
-        # Empty cache
-        empty_cache()
 
         # Return loss
         return (loss, student_outputs) if return_outputs else loss
