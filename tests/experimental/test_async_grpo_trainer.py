@@ -965,6 +965,22 @@ class TestPackingAwareBatching(TrlTestCase):
             assert collator.metrics["reward"] == [0.5]  # (1.0 + 0.0) / 2, over both samples
             assert collator.metrics["tools/call_frequency"] == [4.0]  # only the sample that carries it
 
+    def test_step_gradient_is_invariant_to_micro_batch_split(self, async_grpo_loss_trainer):
+        trainer, theta = async_grpo_loss_trainer
+        a, b, c, d = (_rollout_sample(n, advantage=adv) for n, adv in ((11, 1.0), (11, 1.0), (101, -1.0), (101, -1.0)))
+        collator = DataCollatorForRollout(pad_token_id=0, num_processes=1)
+        grads = []
+        for split in ([[a, b], [c, d]], [[a, c], [b, d]]):
+            theta.grad = None
+            batches, num_items_in_batch = trainer.get_batch_samples(
+                iter(collator([[mb]]) for mb in split), len(split), "cpu"
+            )
+            for inputs in batches:
+                trainer.compute_loss(trainer.model, inputs, num_items_in_batch=num_items_in_batch).backward()
+            grads.append(theta.grad.item())
+        # Global token mean over the step: (10 + 10 - 100 - 100) completion tokens weighted by advantage, over 220
+        assert grads == pytest.approx([180 / 220, 180 / 220])
+
 
 def _finalize(turns, rollout_id="r0", fork_threshold=1024):
     rows, _tally = _chain_to_sequences(turns, rollout_id, fork_threshold)
