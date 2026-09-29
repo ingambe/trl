@@ -1727,8 +1727,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 if isinstance(module, BaseTunerLayer)
                 for name, param in module.get_base_layer().named_parameters(recurse=False)
             ]
-            model.merge_adapter()
         try:
+            if is_peft_model(model):
+                model.merge_adapter()
             if self.accelerator.is_main_process and self.weight_transfer:
                 self.weight_transfer.send_weights(self._streaming_iter())
             else:

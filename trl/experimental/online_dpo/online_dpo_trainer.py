@@ -824,8 +824,8 @@ class OnlineDPOTrainer(_BaseTrainer):
                     if isinstance(module, BaseTunerLayer) and not zero_stage_3
                     for name, param in module.get_base_layer().named_parameters(recurse=False)
                 ]
-                self.model.merge_adapter()
                 try:
+                    self.model.merge_adapter()
                     # Update vLLM weights while parameters are gathered
                     if self.is_fsdp_enabled:  # note if using FSDP, gather_if_zero3 is nullcontext
                         # Update vLLM weights while parameters are gathered
