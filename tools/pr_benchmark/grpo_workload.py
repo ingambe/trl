@@ -161,6 +161,8 @@ def main():
             else None,
             callbacks=[Timer(), MemoryBreakdown()],
         )
+    # Colocated vLLM reseeds the process with a fixed seed, so reseed for sampling to vary across seeds
+    set_seed(args.seed)
     generate_and_score = trainer._generate_and_score_completions
 
     def timed_generate_and_score(inputs):
