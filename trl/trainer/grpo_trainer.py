@@ -1800,8 +1800,10 @@ class GRPOTrainer(_BaseTrainer):
             logprobs = None
 
         else:
-            # Regular generation path: left-pad token IDs into tensors
-            prompt_tensors = [torch.tensor(ids) for ids in prompt_ids]
+            # Regular generation path: left-pad token IDs into tensors. A rank without prompts generates from a dummy
+            # prompt to stay in sync with other ranks.
+            num_prompts = len(prompt_ids)
+            prompt_tensors = [torch.tensor(ids) for ids in prompt_ids or [[self._tokenizer.pad_token_id]]]
             padded_ids = pad(prompt_tensors, padding_value=self._tokenizer.pad_token_id, padding_side="left")
             attention_mask = pad([torch.ones_like(t) for t in prompt_tensors], padding_value=0, padding_side="left")
             generate_inputs = {"input_ids": padded_ids, "attention_mask": attention_mask}
@@ -1858,7 +1860,7 @@ class GRPOTrainer(_BaseTrainer):
             completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
             completion_ids = [
                 c[m].tolist() for c, m in zip(completion_ids.cpu(), completion_mask.bool().cpu(), strict=True)
-            ]
+            ][:num_prompts]
             logprobs = None  # not used in this case
 
         return completion_ids, logprobs
@@ -1927,7 +1929,7 @@ class GRPOTrainer(_BaseTrainer):
         tool_failure_count = 0
         iteration_num = 0
 
-        while idxs_with_tool and iteration_num < self.max_tool_calling_iterations:
+        while iteration_num < self.max_tool_calling_iterations:
             prompt_completion_tools = [prompts[i] for i in idxs_with_tool]  # select only prompts that need tool calls
             # Snapshot state so we can rollback tool results that would exceed max_completion_length
             completions_len_before = [len(completions[i]) for i in idxs_with_tool]
@@ -2039,8 +2041,10 @@ class GRPOTrainer(_BaseTrainer):
             prompt_completion_tool_ids = [
                 pct for pct, o in zip(prompt_completion_tool_ids, overlong, strict=True) if not o
             ]
-            if not idxs_with_tool:
-                break  # all overlong, exit tool loop
+            # Generation involves collectives, so keep every rank in the loop while any rank has tool calls
+            num_pending = self.accelerator.gather(torch.tensor(len(idxs_with_tool), device=self.accelerator.device))
+            if num_pending.sum() == 0:
+                break
 
             # Filter images and multimodal fields to match the current subset (index into full batch).
             # Merge tool response images so the model can see visual feedback during generation.
@@ -2061,7 +2065,7 @@ class GRPOTrainer(_BaseTrainer):
                     loop_multimodal_fields = dict(image_inputs)
                 else:
                     loop_multimodal_fields = {}
-            elif multimodal_fields:
+            elif multimodal_fields and idxs_with_tool:
                 if "num_images" not in multimodal_fields and images is not None:
                     multimodal_fields = {
                         **multimodal_fields,
