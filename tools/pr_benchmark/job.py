@@ -84,6 +84,8 @@ def run(environment):
             "HF_DATASETS_OFFLINE": "1",
             "PYTHONNOUSERSITE": "1",
             "TOKENIZERS_PARALLELISM": "false",
+            # Some provider hosts have no usable /dev/shm
+            "NCCL_SHM_DISABLE": "1",
         }
     )
     rollout = config.get("kind") == "vllm-rollout"
@@ -91,6 +93,9 @@ def run(environment):
     launcher = [sys.executable]
     if config.get("gpus", 1) > 1:
         launcher += ["-m", "torch.distributed.run", "--standalone", f"--nproc-per-node={config['gpus']}"]
+    script = {"vllm-rollout": "rollout_workload.py", "grpo-train": "grpo_workload.py"}.get(
+        config.get("kind"), "workload.py"
+    )
 
     def run_child(side, stem, *extra):
         output = work / f"{stem}.json"
@@ -98,7 +103,7 @@ def run(environment):
             subprocess.run(
                 [
                     *launcher,
-                    str(ROOT / ("rollout_workload.py" if rollout else "workload.py")),
+                    str(ROOT / script),
                     "--model-path",
                     str(environment / "model"),
                     "--checkout",
