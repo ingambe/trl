@@ -186,7 +186,7 @@ def test_rollout_quality_is_reported_beside_latency(rollout_measurements, damage
 )
 def test_grpo_quality_is_compared_per_seed(measurements, damage, outcome):
     manifest, result = measurements
-    manifest["workload"].update(kind="grpo-train", peft=True, steps=3)
+    manifest["workload"].update(kind="grpo-train", steps=3)
     manifest["thresholds"] = {"train_seconds": 5.0, "steady_seconds": 5.0}
     for index, record in enumerate(result["records"]):
         head = record["side"] == "head"
@@ -215,7 +215,7 @@ def test_grpo_quality_is_compared_per_seed(measurements, damage, outcome):
             init_peak_device_bytes=1,
             train_peak_device_bytes=1,
             eval_reward=0.4 if head and damage == "reward_drop" else 0.5,
-            parameter_sum=1.0,
+            parameter_sum=1.01 if head else 1.0,
             trajectory=trajectory,
         )
     if outcome is None:
