@@ -155,6 +155,28 @@ def _decode_assistant_response(tokenizer, ids, prefix):
 
 
 @pytest.fixture
+def server_tool_trainer():
+    """Provide a two-sibling tool scenario; restore patched dependencies after the test."""
+    accelerator = SimpleNamespace(
+        device=torch.device("cpu"), is_main_process=True, process_index=0, gather=lambda tensor: tensor
+    )
+    trainer = _make_server_tool_trainer(accelerator, num_samples=2)
+
+    def gather_on_single_process(values):
+        return values
+
+    # Patch only token formatting and distributed transport. The tool loop, single-turn generation, and server
+    # grouping run unchanged. These replacements are active during yield and automatically restored afterward.
+    with (
+        patch.object(trainer, "_get_tool_suffix_ids", side_effect=_encode_tool_result),
+        patch("trl.trainer.grpo_trainer.parse_response", side_effect=_decode_assistant_response),
+        patch("trl.generation.vllm_generation.gather_object", side_effect=gather_on_single_process),
+        patch("trl.generation.vllm_generation.broadcast_object_list", return_value=None),
+    ):
+        yield trainer
+
+
+@pytest.fixture
 def two_rank_server_tool_trainers():
     """Run a function on two ranks in threads, with collectives that block until both ranks call them."""
     barrier = threading.Barrier(2, timeout=5)
