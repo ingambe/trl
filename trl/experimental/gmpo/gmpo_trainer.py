@@ -117,7 +117,9 @@ class GMPOTrainer(GRPOTrainer):
         # GMPO aggregates with a plain mean over sequences, per token-norm
         # already lives inside the geometric mean.
         mode = "train" if self.model.training else "eval"
-        loss = per_sequence_loss.mean()
+        # Count the rows skipped for their zero advantage too
+        num_sequences = inputs.get("num_sequences", per_sequence_loss.size(0))
+        loss = per_sequence_loss.sum() / num_sequences
         normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0  # no accum in eval
         loss = loss / normalizer
 
@@ -147,9 +149,10 @@ class GMPOTrainer(GRPOTrainer):
         self._metrics[mode]["clip_ratio/low_mean"].append(global_masked_mean(is_low_clipped.float()))
         self._metrics[mode]["clip_ratio/high_mean"].append(global_masked_mean(is_high_clipped.float()))
         self._metrics[mode]["clip_ratio/region_mean"].append(global_masked_mean(is_region_clipped.float()))
-        gathered_low_clip = self.accelerator.gather(masked_seq_mean(is_low_clipped.float()))
+        # Reduce locally first: ranks can hold different numbers of rows
+        gathered_low_clip = self.accelerator.gather(nanmin(masked_seq_mean(is_low_clipped.float())))
         self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
-        gathered_high_clip = self.accelerator.gather(masked_seq_mean(is_high_clipped.float()))
+        gathered_high_clip = self.accelerator.gather(nanmax(masked_seq_mean(is_high_clipped.float())))
         self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
 
         return loss
