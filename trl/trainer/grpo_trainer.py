@@ -2149,6 +2149,8 @@ class GRPOTrainer(_BaseTrainer):
         tool_mask = [[1] * len(ids) for ids in completion_ids]  # 0 for tool result tokens, 1 elsewhere
         # Collect images from multimodal tool responses for the forward pass
         tool_images = [[] for _ in completion_ids]
+        # True when a sample stops with an unexecuted tool call
+        tool_truncated = [False] * len(completion_ids)
         tool_call_count = 0
         tool_failure_count = 0
         iteration_num = 0
@@ -2260,6 +2262,7 @@ class GRPOTrainer(_BaseTrainer):
                     del completions[idx_with_tool][completions_len_before[idx] :]
                     del tool_images[idx_with_tool][tool_images_len_before[idx] :]
                     del prompts[idx_with_tool][prompts_len_before[idx] :]
+                    tool_truncated[idx_with_tool] = True
             # Keep only non-overlong items for further processing
             idxs_with_tool = [idx for idx, o in zip(idxs_with_tool, overlong, strict=True) if not o]
             prompt_completion_tool_ids = [
@@ -2395,6 +2398,9 @@ class GRPOTrainer(_BaseTrainer):
             tool_calls = [tool_call for tool_call in tool_calls if tool_call]
             iteration_num += 1
 
+        for idx in idxs_with_tool:
+            tool_truncated[idx] = True
+
         return (
             tool_mask,
             completions,
@@ -2404,6 +2410,7 @@ class GRPOTrainer(_BaseTrainer):
             tool_call_count,
             tool_failure_count,
             tool_images,
+            tool_truncated,
         )
 
     def _generate(self, prompts: list):
@@ -2465,6 +2472,7 @@ class GRPOTrainer(_BaseTrainer):
 
         # Extract tool calls from the completions and (possibly) execute them
         tool_images = []
+        tool_truncated = [False] * len(completion_ids)
         if self.tools:
             (
                 tool_mask,
@@ -2475,6 +2483,7 @@ class GRPOTrainer(_BaseTrainer):
                 tool_call_count,
                 tool_failure_count,
                 tool_images,
+                tool_truncated,
             ) = self._tool_call_loop(
                 prompts, prompt_ids, completion_ids, completions, logprobs, sampling_mask, images, multimodal_fields
             )
@@ -2517,7 +2526,10 @@ class GRPOTrainer(_BaseTrainer):
 
         # Identify sequences that terminated with EOS and log their lengths
         eos_and_pad = [*self.eos_token_ids, self._tokenizer.pad_token_id]
-        is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids], device=device)
+        is_truncated = torch.tensor(
+            [ids[-1] not in eos_and_pad or t for ids, t in zip(completion_ids, tool_truncated, strict=True)],
+            device=device,
+        )
         agg_is_truncated = self.accelerator.gather(is_truncated)
         self._metrics[mode]["completions/clipped_ratio"].append(agg_is_truncated.float().mean().item())
         term_completion_lengths = agg_completion_lengths[~agg_is_truncated]
@@ -2547,6 +2559,7 @@ class GRPOTrainer(_BaseTrainer):
             extra_fields,
             images,
             tool_images,
+            is_truncated,
         )
 
     def _generate_and_score_completions(
@@ -2662,6 +2675,7 @@ class GRPOTrainer(_BaseTrainer):
             extra_fields,
             images,
             tool_images,
+            is_truncated,
         ) = self._generate(prompts)
         if self.use_vllm:
             self.vllm_generation.sleep()
@@ -2727,8 +2741,6 @@ class GRPOTrainer(_BaseTrainer):
 
         # If mask_truncated_completions is enabled, zero out truncated completions for attention and loss masking
         if self.mask_truncated_completions:
-            eos_and_pad = [*self.eos_token_ids, self._tokenizer.pad_token_id]
-            is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids_list], device=device)
             # Mask completion_mask for attention masking
             completion_mask = completion_mask * (~is_truncated).unsqueeze(1).int()
             # Also mask tool_mask for consistency in multi-turn training
