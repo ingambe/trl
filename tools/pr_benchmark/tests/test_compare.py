@@ -179,7 +179,8 @@ def test_rollout_quality_is_reported_beside_latency(rollout_measurements, damage
         (None, "improved"),
         ("outlier", "inconclusive"),
         ("worse", "quality_failed"),
-        ("reward_drop", "inconclusive"),
+        ("reward_drop", "quality_failed"),
+        ("train_reward_drop", "quality_failed"),
         ("missing", None),
     ],
 )
@@ -197,7 +198,12 @@ def test_grpo_quality_is_compared_per_seed(measurements, damage, outcome):
         elif head and damage == "missing" and index == 1:
             gaps[2] = None
         trajectory = [
-            {"loss": 0.1, "reward": 0.5, "grad_norm": 1.0, "sampling/sampling_logp_difference/mean": gap}
+            {
+                "loss": 0.1,
+                "reward": 0.4 if head and damage == "train_reward_drop" else 0.5,
+                "grad_norm": 1.0,
+                "sampling/sampling_logp_difference/mean": gap,
+            }
             for gap in gaps
         ]
         record.update(
@@ -208,7 +214,7 @@ def test_grpo_quality_is_compared_per_seed(measurements, damage, outcome):
             update_seconds=1.0,
             init_peak_device_bytes=1,
             train_peak_device_bytes=1,
-            eval_reward=0.0 if head and damage == "reward_drop" and index < 4 else 0.5,
+            eval_reward=0.4 if head and damage == "reward_drop" else 0.5,
             parameter_sum=1.0,
             trajectory=trajectory,
         )
