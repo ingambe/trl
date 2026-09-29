@@ -15,7 +15,7 @@
 import torch
 
 from ...trainer.grpo_trainer import GRPOTrainer
-from ...trainer.utils import get_config_model_id, nanmax, nanmin
+from ...trainer.utils import get_config_model_id
 from .gmpo_config import GMPOConfig
 
 
@@ -117,6 +117,10 @@ class GMPOTrainer(GRPOTrainer):
         # GMPO aggregates with a plain mean over sequences, per token-norm
         # already lives inside the geometric mean.
         mode = "train" if self.model.training else "eval"
+
+        def log_metric(key, reduction, value):
+            self._pending_loss_metrics[mode][key, reduction].append(value.detach())
+
         # Count the rows skipped for their zero advantage too
         num_sequences = inputs.get("num_sequences", per_sequence_loss.size(0))
         loss = per_sequence_loss.sum() / num_sequences
@@ -129,30 +133,24 @@ class GMPOTrainer(GRPOTrainer):
                 return x.squeeze(1)
             return (x * mask).sum(-1) / mask.sum(-1)
 
-        def global_masked_mean(x):
+        def masked_sum_and_count(x):
             if x.shape[1] == 1:  # when importance_sampling_level == "sequence": one value per sequence
-                local_sum, local_count = x.sum(), torch.tensor(float(x.shape[0]), device=x.device)
-            else:
-                local_sum, local_count = (x * mask).sum(), mask.sum().float()
-            totals = self.accelerator.reduce(torch.stack([local_sum, local_count]), reduction="sum")
-            return (totals[0] / totals[1].clamp(min=1.0)).item()
+                return torch.stack([x.sum(), x.new_full((), x.shape[0])])
+            return torch.stack([(x * mask).sum(), mask.sum().float()])
 
         if self.beta != 0.0:
-            self._metrics[mode]["kl"].append(global_masked_mean(per_token_kl))
+            log_metric("kl", "ratio", masked_sum_and_count(per_token_kl))
 
-        self._metrics[mode]["entropy"].append(global_masked_mean(entropies))
+        log_metric("entropy", "ratio", masked_sum_and_count(entropies))
 
         # Fraction of the tokens pushed into the clipped region, in log-space.
         is_low_clipped = (log_ratio < -self.epsilon_low) & (advantages_col < 0)
         is_high_clipped = (log_ratio > self.epsilon_high) & (advantages_col > 0)
         is_region_clipped = is_low_clipped | is_high_clipped
-        self._metrics[mode]["clip_ratio/low_mean"].append(global_masked_mean(is_low_clipped.float()))
-        self._metrics[mode]["clip_ratio/high_mean"].append(global_masked_mean(is_high_clipped.float()))
-        self._metrics[mode]["clip_ratio/region_mean"].append(global_masked_mean(is_region_clipped.float()))
-        # Reduce locally first: ranks can hold different numbers of rows
-        gathered_low_clip = self.accelerator.gather(nanmin(masked_seq_mean(is_low_clipped.float())))
-        self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
-        gathered_high_clip = self.accelerator.gather(nanmax(masked_seq_mean(is_high_clipped.float())))
-        self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
+        log_metric("clip_ratio/low_mean", "ratio", masked_sum_and_count(is_low_clipped.float()))
+        log_metric("clip_ratio/high_mean", "ratio", masked_sum_and_count(is_high_clipped.float()))
+        log_metric("clip_ratio/region_mean", "ratio", masked_sum_and_count(is_region_clipped.float()))
+        log_metric("clip_ratio/low_min", "min", masked_seq_mean(is_low_clipped.float()))
+        log_metric("clip_ratio/high_max", "max", masked_seq_mean(is_high_clipped.float()))
 
         return loss
