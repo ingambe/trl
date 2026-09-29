@@ -17,6 +17,7 @@ import logging
 import os
 import threading
 import traceback
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from types import SimpleNamespace
@@ -33,7 +34,7 @@ from transformers.utils import is_peft_available, is_torch_xpu_available
 
 # Apply TRL's compatibility patches before test modules import transformers' Trainer, which imports peft (#7871)
 import trl  # noqa: F401
-from trl import GRPOConfig, GRPOTrainer
+from trl import AsyncGRPOTrainer, GRPOConfig, GRPOTrainer
 from trl.generation.vllm_generation import VLLMGeneration
 from trl.import_utils import is_vllm_available
 
@@ -478,3 +479,31 @@ def colocate_grpo_trainer(monkeypatch, tmp_path, tiny_llama):
         trainer.vllm_generation.llm.reset_mock()  # forget the sleep at the end of engine init
         trainer.vllm_generation.llm.generate.return_value = []
         yield trainer
+
+
+@pytest.fixture
+def async_grpo_loss_trainer():
+    """Provide a single-rank AsyncGRPOTrainer whose model returns the scalar log-prob `theta` at every position."""
+    theta = torch.zeros((), requires_grad=True)
+
+    def model(input_ids, **kwargs):
+        shape = (1, input_ids.size(1))
+        return SimpleNamespace(log_probs=theta.expand(shape), entropy=torch.zeros(shape))
+
+    trainer = object.__new__(AsyncGRPOTrainer)
+    trainer.model = model
+    trainer.args = SimpleNamespace(
+        score_centering=False, vllm_importance_sampling_clip_min=0.5, vllm_importance_sampling_clip_max=5.0
+    )
+    trainer.accelerator = SimpleNamespace(
+        num_processes=1, reduce=lambda tensor, reduction: tensor, gather=lambda tensor: tensor
+    )
+    trainer.aux_loss_enabled = False
+    trainer.epsilon_low = trainer.epsilon_high = 0.2
+    trainer._metrics = {"train": defaultdict(list)}
+    trainer._step_forward_tokens = 0.0
+    trainer._step_trained_tokens = 0.0
+    trainer._step_seq_len_weighted = 0.0
+    trainer._step_samples = 0.0
+    trainer._step_forward_s = 0.0
+    return trainer, theta
