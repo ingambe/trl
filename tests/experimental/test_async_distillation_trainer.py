@@ -418,6 +418,25 @@ class TestPackingAwareBatching:
         single = DataCollatorForRollout(pad_token_id=0, teacher_top_k=TEACHER_TOP_K, num_processes=1)
         assert "teacher_id_idx" not in single([[[_rollout_sample(3)]]])
 
+    def test_step_gradient_is_invariant_to_micro_batch_split(self, async_distillation_loss_trainer):
+        trainer = async_distillation_loss_trainer
+        a, b, c, d = (_rollout_sample(n, top_k=1) for n in (11, 11, 101, 101))
+        for sample, token_id in zip((a, b, c, d), (1, 1, 2, 2), strict=True):
+            sample["input_ids"] = [token_id] * len(sample["input_ids"])
+        collator = DataCollatorForRollout(pad_token_id=0, teacher_top_k=1, num_processes=1)
+        grads = []
+        for split in ([[a, b, c, d]], [[a, b], [c, d]]):
+            trainer.model.zero_grad()
+            batches, num_items_in_batch = trainer.get_batch_samples(
+                iter(collator([[mb]]) for mb in split), len(split), "cpu"
+            )
+            assert num_items_in_batch == 220
+            for inputs in batches:
+                trainer.compute_loss(trainer.model, inputs, num_items_in_batch=num_items_in_batch).backward()
+            grads.append(trainer.model.get_output_embeddings().weight.grad.clone())
+        assert grads[0].norm() > 0
+        torch.testing.assert_close(grads[1], grads[0])
+
 
 class TestMetricReduction:
     """The value's shape and the key's suffix are the whole reduction API; nothing is registered or configured."""
