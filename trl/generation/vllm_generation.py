@@ -790,8 +790,8 @@ class VLLMGeneration:
             prompts: List of token ID lists, one per prompt (already tokenized).
             images: Optional list of image lists for VLM support. Each element is a list of PIL images for the
                 corresponding prompt, or `None` if no images for that prompt. `None` if no images at all.
-            num_generations: Number of times each original prompt is repeated in `prompts`. Server mode assumes
-                each group contains identical inputs and requests this many completions for its first entry. Pass 1
+            num_generations: Number of times each original prompt is repeated in `prompts`. In server mode, when
+                every group contains identical inputs, this many completions are requested for each first entry. Pass 1
                 after tool calls because histories can diverge.
             profiler: Optional profiler for performance tracking.
 
@@ -832,6 +832,11 @@ class VLLMGeneration:
             all_images = gather_object(images if images is not None else [None] * len(prompts))
             if all(img is None for img in all_images):
                 all_images = None
+
+            # Groups whose inputs differ (e.g. environments sampled per rollout) are generated one prompt at a time
+            inputs = all_prompts if all_images is None else list(zip(all_prompts, all_images, strict=True))
+            if any(inputs[i] != inputs[i - i % num_generations] for i in range(len(inputs))):
+                num_generations = 1
 
             if accelerator.is_main_process:
                 # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and
