@@ -791,6 +791,8 @@ class DistillationTrainer(_BaseTrainer):
 
         # Metrics & Logging
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+        # Loss metrics per micro-batch, reduced across processes in `log`
+        self._pending_loss_metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._total_train_tokens = 0
         self._current_train_step_time = 0.0
         self.log_completions = args.log_completions
@@ -1849,14 +1851,9 @@ class DistillationTrainer(_BaseTrainer):
             model, unwrapped_student, self._compute_loss, unwrapped_student, inputs, num_items_in_batch
         )
 
-        # Log the mean per-token student entropy (in nats). The reduction runs here, after `_forward_redirection`
-        # returns, so the `gather_for_metrics` collective does not run inside the DDP/FSDP-wrapped forward (a hang/
-        # ordering risk). Mirrors `SFTTrainer.compute_loss`.
+        # Log the mean per-token student entropy (in nats), reduced across processes in `log`
         mode = "train" if self.model.training else "eval"
-        num_valid_tokens = self.accelerator.gather_for_metrics(num_valid_tokens).sum()
-        entropy_sum = self.accelerator.gather_for_metrics(entropy_sum).sum()
-        entropy = (entropy_sum / num_valid_tokens).item() if num_valid_tokens > 0 else 0.0
-        self._metrics[mode]["entropy"].append(entropy)
+        self._pending_loss_metrics[mode]["entropy"].append(torch.stack([entropy_sum, num_valid_tokens]).detach())
 
         return (loss, None) if return_outputs else loss
 
@@ -1964,6 +1961,12 @@ class DistillationTrainer(_BaseTrainer):
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         mode = "train" if self.model.training else "eval"
+        for key, values in self._pending_loss_metrics[mode].items():
+            gathered = self.accelerator.gather(torch.stack(values)).unflatten(0, (self.accelerator.num_processes, -1))
+            values = gathered[..., 0].sum(0) / gathered[..., 1].sum(0).clamp(min=1.0)
+            self._metrics[mode][key].extend(values.tolist())
+        self._pending_loss_metrics[mode].clear()
+
         # Average the metrics
         metrics = {}
         for key, val in self._metrics[mode].items():
