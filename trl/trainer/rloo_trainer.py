@@ -1077,6 +1077,19 @@ class RLOOTrainer(_BaseTrainer):
                         }
                         for batch in generation_batches
                     ]
+                # Crop the completion columns that are padding in every row of the micro-batch
+                for batch in generation_batches:
+                    # Truncated completions can have an all-zero mask but still hold tokens (such as image placeholders)
+                    completion_length = max(int(batch["completion_lengths"].max()), 1)
+                    if self.pad_to_multiple_of is not None:
+                        completion_length = (
+                            math.ceil(completion_length / self.pad_to_multiple_of) * self.pad_to_multiple_of
+                        )
+                    for key in ["completion_ids", "completion_mask"]:
+                        batch[key] = batch[key][:, :completion_length]
+                    for key in ["token_type_ids", "mm_token_type_ids"]:  # span the prompt and the completion
+                        if key in batch:
+                            batch[key] = batch[key][:, : batch["prompt_ids"].size(1) + completion_length]
                 self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
             inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
         else:
@@ -1713,6 +1726,7 @@ class RLOOTrainer(_BaseTrainer):
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
+            "completion_lengths": torch.tensor([len(ids) for ids in completion_ids_list], device=device),
             "old_logps": old_logps,
             "advantages": advantages,
         }

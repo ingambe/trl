@@ -4887,3 +4887,33 @@ def test_skip_zero_advantages_keeps_the_update(tiny_llama, tmp_path, loss_type):
 
     assert num_rows == {False: 4, True: 2}
     torch.testing.assert_close(updated[True], updated[False])
+
+
+def test_micro_batches_crop_completion_padding(tiny_llama, tmp_path):
+    model, tokenizer = tiny_llama
+
+    def reward(completions, **kwargs):
+        return [float(len(c)) for c in completions]
+
+    trainer = GRPOTrainer(
+        model=model,
+        processing_class=tokenizer,
+        reward_funcs=reward,
+        args=GRPOConfig(
+            output_dir=str(tmp_path),
+            report_to="none",
+            bf16=False,
+            per_device_train_batch_size=1,
+            steps_per_generation=4,
+            num_generations=2,
+            max_completion_length=32,
+            mask_truncated_completions=True,  # truncated rows keep their tokens but get an all-zero mask
+            max_steps=1,
+        ),
+        train_dataset=Dataset.from_dict({"prompt": ["a", "a a", "a a a", "a a a a"]}),
+    )
+    trainer.train()
+
+    widths = [batch["completion_ids"].size(1) for batch in trainer._buffered_inputs]
+    assert widths == [batch["completion_lengths"].max().item() for batch in trainer._buffered_inputs]
+    assert min(widths) < 32
