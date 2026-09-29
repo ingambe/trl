@@ -611,8 +611,8 @@ class VLLMGeneration:
                     if isinstance(module, BaseTunerLayer) and not self._dist.is_zero3
                     for name, param in module.get_base_layer().named_parameters(recurse=False)
                 ]
-                model.merge_adapter()
                 try:
+                    model.merge_adapter()
                     with closing(self._iter_named_params()) as params:
                         yield params
                 finally:
