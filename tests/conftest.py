@@ -318,6 +318,12 @@ def undo_liger_kernel_patching(monkeypatch):
 @pytest.fixture
 def vllm_generation(monkeypatch):
     monkeypatch.setattr(VLLMGeneration, "_init_vllm", lambda self: None)
+    # Stand-in vLLM models declare their fused layers directly
+    monkeypatch.setattr(
+        "trl.generation.vllm_generation.supports_lora",
+        lambda model: "packed_modules_mapping" in vars(model),
+        raising=False,
+    )
     generation = VLLMGeneration(torch.nn.Linear(1, 1), Accelerator(cpu=True), None)
     generation.llm = Mock()
     return generation

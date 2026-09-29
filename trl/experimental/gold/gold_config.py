@@ -129,6 +129,12 @@ class GOLDConfig(SFTConfig):
             to set this to a low value if the student and teacher models share the same GPU.
         vllm_tensor_parallel_size (`int`, *optional*, defaults to `1`):
             Tensor parallel size for the colocated student vLLM engine (if `vllm_mode="colocate"`).
+        vllm_share_weights (`bool`, *optional*, defaults to `False`):
+            Whether the trained model uses vLLM's weight memory, so no weights are published and sleep only releases
+            the KV cache. Requires colocate mode without tensor parallelism, FSDP, ZeRO-3 or quantization. See the vLLM
+            integration guide.
+        vllm_native_lora (`bool`, *optional*, defaults to `False`):
+            With `vllm_share_weights=True` and PEFT, serve the adapter as a native vLLM LoRA instead of merging it.
         vllm_structured_outputs_regex (`str`, *optional*):
             Regex for vLLM structured outputs for the student model.
         vllm_server_base_url (`str`, *optional*):
@@ -401,6 +407,21 @@ class GOLDConfig(SFTConfig):
     vllm_tensor_parallel_size: int = field(
         default=1,
         metadata={"help": 'Tensor parallel size for the colocated vLLM engine when `vllm_mode="colocate"`.'},
+    )
+    vllm_share_weights: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether the trained model uses vLLM's weight memory, so no weights are published and sleep only "
+            "releases the KV cache. Requires colocate mode without tensor parallelism, FSDP, ZeRO-3 or quantization. "
+            "See the vLLM integration guide."
+        },
+    )
+    vllm_native_lora: bool = field(
+        default=False,
+        metadata={
+            "help": "With `vllm_share_weights=True` and PEFT, serve the adapter as a native vLLM LoRA instead of "
+            "merging it."
+        },
     )
     vllm_max_model_length: int | None = field(
         default=None,
