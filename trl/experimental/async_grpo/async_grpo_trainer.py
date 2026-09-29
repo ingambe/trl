@@ -1479,19 +1479,16 @@ class AsyncGRPOTrainer(_BaseTrainer):
         per_token_loss2 = coef_2 * advantages
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
 
-        # DDP/FSDP averages gradients across ranks (world_size).
-        # To get correct per-token normalization we scale by 1/tokens_per_rank
-        # = world_size / global_n_tokens, so after DDP averaging the effective
+        # DDP/FSDP averages gradients across ranks, and `num_items_in_batch` counts the whole step's tokens
         loss = (per_token_loss * completion_mask).sum()
         global_n_tokens = inputs["global_n_tokens"][0]
         world_size = self.accelerator.num_processes
-        tokens_per_rank = (global_n_tokens / world_size).clamp(min=1.0)
+        tokens_per_rank = (num_items_in_batch / world_size).clamp(min=1.0)
         loss = loss / tokens_per_rank.to(torch.float32)
         # For DAPO, we would scale like this instead:
         # loss = loss / max(per_token_loss.size(0), 1)
-        loss = loss / self.current_gradient_accumulation_steps
 
-        # The policy loss above is scaled for gradient accumulation (HF auto-scaling is off here), so scale aux too
+        # HF auto-scaling is off here, so scale the aux loss for gradient accumulation
         if self.aux_loss_enabled:
             aux_loss = outputs.aux_loss
             loss = loss + self.router_aux_loss_coef * aux_loss / self.current_gradient_accumulation_steps
@@ -1584,6 +1581,11 @@ class AsyncGRPOTrainer(_BaseTrainer):
         self._step_microbatches += 1
         self._current_train_step_time += time.perf_counter() - time_before
         return output
+
+    def get_batch_samples(self, epoch_iterator, num_batches, device):
+        batch_samples = list(itertools.islice(epoch_iterator, num_batches))
+        num_items_in_batch = sum(batch["global_n_tokens"][0] for batch in batch_samples)
+        return batch_samples, num_items_in_batch
 
     def _log_step_metrics(self) -> None:
         """Flush one optimizer step's worth of accounting: the time budget, what the batch held, and throughput.
