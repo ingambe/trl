@@ -136,6 +136,12 @@ class IWOPDConfig(_BaseConfig):
             GPU memory utilization for the colocated student vLLM engine.
         vllm_tensor_parallel_size (`int`, *optional*, defaults to `1`):
             Tensor parallel size for the colocated student vLLM engine.
+        vllm_share_weights (`bool`, *optional*, defaults to `False`):
+            Whether the trained model uses vLLM's weight memory, so no weights are published and sleep only releases
+            the KV cache. Requires colocate mode without tensor parallelism, FSDP, ZeRO-3 or quantization. See the vLLM
+            integration guide.
+        vllm_native_lora (`bool`, *optional*, defaults to `False`):
+            With `vllm_share_weights=True` and PEFT, serve the adapter as a native vLLM LoRA instead of merging it.
         vllm_max_model_length (`int` or `None`, *optional*):
             Maximum model sequence length for the colocated vLLM engine.
         vllm_model_impl (`str`, *optional*, defaults to `"vllm"`):
@@ -357,6 +363,21 @@ class IWOPDConfig(_BaseConfig):
     vllm_tensor_parallel_size: int = field(
         default=1,
         metadata={"help": "Tensor parallel size for the colocated student vLLM engine."},
+    )
+    vllm_share_weights: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether the trained model uses vLLM's weight memory, so no weights are published and sleep only "
+            "releases the KV cache. Requires colocate mode without tensor parallelism, FSDP, ZeRO-3 or quantization. "
+            "See the vLLM integration guide."
+        },
+    )
+    vllm_native_lora: bool = field(
+        default=False,
+        metadata={
+            "help": "With `vllm_share_weights=True` and PEFT, serve the adapter as a native vLLM LoRA instead of "
+            "merging it."
+        },
     )
     vllm_max_model_length: int | None = field(
         default=None,

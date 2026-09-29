@@ -38,8 +38,11 @@ def compare(result, manifest):
     if set(indexed) != expected or len(records) != len(expected):
         raise ValueError("Missing, duplicate, or unexpected measurements")
     rollout = config.get("kind") == "vllm-rollout"
+    grpo = config.get("kind") == "grpo-train"
     if rollout:
         metrics, diagnostics = ("rollout_seconds", "weight_transfer_bytes"), ()
+    elif grpo:
+        metrics, diagnostics = ("train_seconds", "steady_seconds"), ("generation_seconds", "update_seconds")
     else:
         metrics, diagnostics = ("train_seconds", "steady_seconds", "eval_loss"), ("train_loss",)
     environments = []
@@ -48,7 +51,13 @@ def compare(result, manifest):
             raise ValueError("Wrong commit or incomplete training")
         for metric in (*metrics, *diagnostics, "peak_memory_bytes", "workload_seconds"):
             value = record[metric]
-            if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            # Sharing weights with vLLM legitimately publishes nothing
+            if (
+                not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+                or (value == 0 and metric != "weight_transfer_bytes")
+            ):
                 raise ValueError(f"Invalid {metric} for {side}, seed {seed}")
         environments.append(record["environment"])
     if any(env != environments[0] for env in environments):
@@ -63,7 +72,8 @@ def compare(result, manifest):
     for metric in metrics:
         base = [indexed["base", seed][metric] for seed in config["seeds"]]
         head = [indexed["head", seed][metric] for seed in config["seeds"]]
-        changes = [100 * (h / b - 1) for b, h in zip(base, head, strict=True)]
+        # A base that shares weights transfers nothing
+        changes = [100 * (h / b - 1) if b else 100.0 * (h > 0) for b, h in zip(base, head, strict=True)]
         margin = manifest["thresholds"][metric]
         ci = interval(changes) if len(changes) >= 5 else None
         if ci is None:
@@ -115,6 +125,76 @@ def compare(result, manifest):
         summary["policy_parity"] = parity
         if not all(summary["quality"].values()) and summary["outcome"] in ("improved", "no_regression"):
             summary["outcome"] = "quality_failed"
+    if grpo:
+        runs = {side: [indexed[side, seed] for seed in config["seeds"]] for side in ("base", "head")}
+
+        def gap(key):
+            return max(
+                abs(b[key] - h[key])
+                for base, head in zip(runs["base"], runs["head"], strict=True)
+                for b, h in zip(base["trajectory"], head["trajectory"], strict=True)
+                if b[key] is not None and h[key] is not None
+            )
+
+        means = {
+            key: {side: statistics.mean(r[key] for r in runs[side]) for side in runs}
+            for key in (
+                "generation_seconds",
+                "update_seconds",
+                "peak_memory_bytes",
+                "init_peak_device_bytes",
+                "train_peak_device_bytes",
+                "eval_reward",
+            )
+        }
+        logp = "sampling/sampling_logp_difference/mean"
+        parameters = max(
+            abs(h["parameter_sum"] - b["parameter_sum"]) / abs(b["parameter_sum"])
+            for b, h in zip(runs["base"], runs["head"], strict=True)
+        )
+        # Trajectories diverge even main against main, so quality is compared per seed
+        gaps = {side: [[step[logp] for step in r["trajectory"]] for r in runs[side]] for side in runs}
+        if any(
+            not isinstance(gap, float) or not math.isfinite(gap)
+            for side in gaps.values()
+            for run in side
+            for gap in run
+        ):
+            raise ValueError("Missing or invalid vLLM/trainer logprob gap")
+        seed_gaps = {side: [statistics.mean(run) for run in gaps[side]] for side in runs}
+        reward_interval = interval(
+            [h["eval_reward"] - b["eval_reward"] for b, h in zip(runs["base"], runs["head"], strict=True)]
+        )
+        logp_interval = interval(
+            [100 * (h / b - 1) for b, h in zip(seed_gaps["base"], seed_gaps["head"], strict=True)]
+        )
+        summary["training"] = {
+            "means": means,
+            "max_step_gap": {key: gap(key) for key in ("loss", "reward", "grad_norm")},
+            "logprob_gap": {side: statistics.mean(seed_gaps[side]) for side in runs},
+            "eval_reward_interval": reward_interval,
+            "logprob_gap_interval_pct": logp_interval,
+            "parameter_sum_relative_gap": parameters,
+        }
+        reward_check = "Held-out reward not worse than base by over 0.02"
+        logp_check = "vLLM/trainer logprob gap not worse than base by over 10%"
+        summary["quality"] = {reward_check: reward_interval[0] >= -0.02, logp_check: logp_interval[1] <= 10}
+        # A check passes only when its whole interval clears the margin, and is inconclusive when it crosses it
+        summary["quality_inconclusive"] = [
+            check
+            for check, crossing in ((reward_check, reward_interval[1] >= -0.02), (logp_check, logp_interval[0] <= 10))
+            if crossing and not summary["quality"][check]
+        ]
+        # LoRA training isn't bitwise reproducible, even main against main
+        if not config.get("peft"):
+            summary["quality"]["Per-step rewards match base (max gap <= 1e-3)"] = (
+                summary["training"]["max_step_gap"]["reward"] <= 1e-3
+            )
+            summary["quality"]["Final parameters match base (relative sum gap <= 1e-4)"] = parameters <= 1e-4
+        failed = [check for check, passed in summary["quality"].items() if not passed]
+        if failed and summary["outcome"] in ("improved", "no_regression"):
+            inconclusive = set(failed) <= set(summary["quality_inconclusive"])
+            summary["outcome"] = "inconclusive" if inconclusive else "quality_failed"
     return summary
 
 
@@ -156,12 +236,49 @@ def markdown(summary, manifest):
             f"{item['kl_local_vllm']:.4g} | {item['js_divergence']:.4g} |"
             for label, item in head.items()
         ]
+    if "training" in summary:
+        training = summary["training"]
+        means, steps = training["means"], training["max_step_gap"]
+        lines += ["", "#### Quality checks (reported separately; any failure blocks a passing verdict)", ""]
+        uncertain = summary["quality_inconclusive"]
+        lines += [
+            f"- {'pass' if passed else 'inconclusive' if check in uncertain else '**FAIL**'}: {check}"
+            for check, passed in summary["quality"].items()
+        ]
+        lines += [
+            "",
+            "| Mean per run | Base | PR |",
+            "|---|---:|---:|",
+            f"| Steady generation + scoring seconds | {means['generation_seconds']['base']:.3f} | "
+            f"{means['generation_seconds']['head']:.3f} |",
+            f"| Steady backward + optimizer seconds | {means['update_seconds']['base']:.3f} | "
+            f"{means['update_seconds']['head']:.3f} |",
+            f"| Peak torch-allocated memory (GB) | {means['peak_memory_bytes']['base'] / 1e9:.3f} | "
+            f"{means['peak_memory_bytes']['head'] / 1e9:.3f} |",
+            f"| Peak device memory during construction (GB) | {means['init_peak_device_bytes']['base'] / 1e9:.3f} | "
+            f"{means['init_peak_device_bytes']['head'] / 1e9:.3f} |",
+            f"| Peak device memory during training (GB) | {means['train_peak_device_bytes']['base'] / 1e9:.3f} | "
+            f"{means['train_peak_device_bytes']['head'] / 1e9:.3f} |",
+            f"| Held-out greedy reward | {means['eval_reward']['base']:.4f} | {means['eval_reward']['head']:.4f} |",
+            f"| Mean vLLM/trainer logprob gap | {training['logprob_gap']['base']:.3g} | "
+            f"{training['logprob_gap']['head']:.3g} |",
+            "",
+            f"Largest per-step gap to base: loss {steps['loss']:.3g}, reward {steps['reward']:.3g}, "
+            f"grad norm {steps['grad_norm']:.3g}. Held-out reward change 95% interval: "
+            f"[{training['eval_reward_interval'][0]:+.3f}, {training['eval_reward_interval'][1]:+.3f}]. "
+            "Logprob gap change 95% interval: "
+            f"[{training['logprob_gap_interval_pct'][0]:+.2f}%, {training['logprob_gap_interval_pct'][1]:+.2f}%]. "
+            "Final parameter-sum relative gap: "
+            f"{training['parameter_sum_relative_gap']:.3g}.",
+        ]
     lines += [
         "",
         "Margins: " + ", ".join(f"{key} +{value}%" for key, value in manifest["thresholds"].items()) + ".",
         (
             "Transfer bytes count tensor payloads passed to vLLM's loaders, not hardware bus traffic."
             if rollout
+            else "Held-out reward uses the synthetic length reward; it is not a scored task benchmark."
+            if "training" in summary
             else "Held-out SFT token loss is a quality proxy; this does not certify other trainers or downstream tasks."
         ),
         "Smoke runs cannot establish no regression. Missing/non-finite measurements are errors, never passes.",

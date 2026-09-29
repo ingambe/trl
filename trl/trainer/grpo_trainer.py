@@ -1078,6 +1078,8 @@ class GRPOTrainer(_BaseTrainer):
                 * args.vllm_tensor_parallel_size
                 * args.steps_per_generation,
                 enable_sleep_mode=args.vllm_enable_sleep_mode,
+                share_weights=args.vllm_share_weights,
+                native_lora=args.vllm_native_lora,
                 model_impl=args.vllm_model_impl,
                 trust_remote_code=args.trust_remote_code,
                 cast_lm_head_to_fp32=args.cast_lm_head_to_fp32,
