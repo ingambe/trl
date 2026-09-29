@@ -353,6 +353,7 @@ def main():
             "vllm-rollout",
             "vllm-rollout-dense",
             "grpo-train-dense",
+            "grpo-train-dense-binary",
             "grpo-train-lora",
             "grpo-train-lora-3b",
         ],
