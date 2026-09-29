@@ -1232,10 +1232,12 @@ class AsyncDistillationTrainer(_BaseTrainer):
         # sharded parameters (including the `lm_head`) materialized for the projection. Mirrors
         # `DistillationTrainer.compute_loss`.
         unwrapped_model = self.accelerator.unwrap_model(model)
-        loss = self._forward_redirection(model, unwrapped_model, self._compute_loss, unwrapped_model, inputs)
+        loss = self._forward_redirection(
+            model, unwrapped_model, self._compute_loss, unwrapped_model, inputs, num_items_in_batch
+        )
         return (loss, None) if return_outputs else loss
 
-    def _compute_loss(self, unwrapped_model, inputs):
+    def _compute_loss(self, unwrapped_model, inputs, num_items_in_batch):
         # Padding-free: the collator already packed this rank's samples into a single row (real tokens concatenated,
         # `position_ids` resetting per sequence), then padded the row to the longest rank's length so
         # DataLoaderDispatcher could scatter rectangular rows. Strip that trailing inter-rank padding here.
@@ -1281,13 +1283,8 @@ class AsyncDistillationTrainer(_BaseTrainer):
         # position would degenerate through `_add_tail_bucket` into a fabricated "100% tail mass" distribution on
         # both sides, i.e. a synthetic near-zero divergence trained on, instead of being excluded like padding.
         has_teacher_signal = valid_candidate_mask.any(dim=-1)
-        # DDP/FSDP averages gradients across ranks (world_size). To get correct per-token normalization we scale by
-        # 1/tokens_per_rank = world_size / global_n_tokens, so after DDP averaging the effective scale is 1/global_n_tokens.
-        # Mirrors AsyncGRPOTrainer.compute_loss's scaling: this is infra-level (padding-free packing, DDP averaging,
-        # gradient accumulation), not policy-gradient-specific, so it needs no adaptation here. `global_n_tokens` is
-        # computed by the collator from `completion_mask` alone, so it does not shrink when `has_teacher_signal`
-        # excludes a position above; a run with such gaps is very slightly under-scaled rather than exactly
-        # renormalized, which is an acceptable trade-off for what should be a rare, teacher-side data gap.
+        # `global_n_tokens` counts `completion_mask` only, so rare positions without teacher signal are slightly
+        # under-scaled rather than renormalized
         token_mask_1d = (completion_mask.bool() & has_teacher_signal)[0]  # (seq_len - 1,), batch dim always 1
 
         # Memory-efficient path: get the student's backbone hidden states (skip `lm_head`, so this alone never
@@ -1369,11 +1366,11 @@ class AsyncDistillationTrainer(_BaseTrainer):
                 )
             )
 
+        # DDP/FSDP averages gradients across ranks, and `num_items_in_batch` counts the whole step's tokens
         global_n_tokens = inputs["global_n_tokens"][0]
         world_size = self.accelerator.num_processes
-        tokens_per_rank = (global_n_tokens / world_size).clamp(min=1.0)
+        tokens_per_rank = (num_items_in_batch / world_size).clamp(min=1.0)
         loss = loss / tokens_per_rank.to(torch.float32)
-        loss = loss / self.current_gradient_accumulation_steps
 
         with torch.no_grad():
             local_count = token_mask_1d.sum().float()
@@ -1440,6 +1437,11 @@ class AsyncDistillationTrainer(_BaseTrainer):
         self._step_microbatches += 1
         self._current_train_step_time += time.perf_counter() - time_before
         return output
+
+    def get_batch_samples(self, epoch_iterator, num_batches, device):
+        batch_samples = list(itertools.islice(epoch_iterator, num_batches))
+        num_items_in_batch = sum(batch["global_n_tokens"][0] for batch in batch_samples)
+        return batch_samples, num_items_in_batch
 
     def _log_step_metrics(self) -> None:
         """Flush one optimizer step's worth of accounting: the time budget, what the batch held, and throughput.
