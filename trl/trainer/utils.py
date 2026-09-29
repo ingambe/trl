@@ -1086,6 +1086,34 @@ def shuffle_sequence_dict(seq_dict: dict[str, Sequence | None]) -> dict[str, Seq
     return {key: permute(val) for key, val in seq_dict.items()}
 
 
+def select_sequence_dict(seq_dict: dict[str, Sequence | None], indices: list[int]) -> dict[str, Sequence | None]:
+    """
+    Keeps the rows at `indices` of all sequence-like values in a dictionary.
+
+    Example:
+    ```python
+    >>> x = torch.arange(6).reshape(3, 2)
+    >>> y = ["a", "b", "c"]
+    >>> seq_dict = {"x": x, "y": y}
+    >>> select_sequence_dict(seq_dict, [0, 2])
+    {'x': tensor([[0, 1],
+                  [4, 5]]),
+     'y': ['a', 'c']}
+    ```
+    """
+
+    def select(v: Sequence | None) -> Sequence | None:
+        if v is None:
+            return None
+        if isinstance(v, torch.Tensor) and v.ndim == 0:
+            return v
+        if isinstance(v, torch.Tensor) and v.ndim >= 1:
+            return v[indices]
+        return [v[i] for i in indices]
+
+    return {key: select(val) for key, val in seq_dict.items()}
+
+
 def nanmin(tensor: torch.Tensor) -> torch.Tensor:
     """
     Compute the minimum value of a tensor, ignoring NaNs. This function only supports 1D tensors.

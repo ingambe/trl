@@ -74,6 +74,7 @@ from .utils import (
     pad,
     print_prompt_completions_sample,
     repeat_iterable_dataset,
+    select_sequence_dict,
     shuffle_sequence_dict,
     shutdown_event_loop_in_daemon,
     split_pixel_values_by_grid,
@@ -582,6 +583,13 @@ class RLOOTrainer(_BaseTrainer):
                 f"that returns its router logits, so there is no auxiliary loss to weight."
             )
         self.aux_loss_enabled = hasattr(text_config, "output_router_logits") and self.router_aux_loss_coef != 0.0
+        self.skip_zero_advantages = args.skip_zero_advantages
+        if self.skip_zero_advantages and self.aux_loss_enabled:
+            logger.warning(
+                "`skip_zero_advantages=True` is turned off: the loss needs the completions with zero advantage (a "
+                "router auxiliary loss)."
+            )
+            self.skip_zero_advantages = False
         if is_peft_model(model) and isinstance(model.get_output_embeddings(), BaseTunerLayer):
             # The log-probabilities are computed by multiplying the hidden states by `lm_head.weight` directly, so an
             # adapter on the LM head would be ignored and never trained.
@@ -1059,6 +1067,16 @@ class RLOOTrainer(_BaseTrainer):
                 generation_batch = split_pixel_values_by_grid(generation_batch)
                 generation_batch = shuffle_sequence_dict(generation_batch)
                 generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
+                if self.skip_zero_advantages:
+                    # Skip rows with zero advantage, but keep one so every process still runs forward and backward.
+                    # The loss still averages over every row.
+                    generation_batches = [
+                        {
+                            **select_sequence_dict(batch, batch["advantages"].nonzero().flatten().tolist() or [0]),
+                            "num_sequences": len(batch["advantages"]),
+                        }
+                        for batch in generation_batches
+                    ]
                 self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
             inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
         else:
@@ -1765,7 +1783,9 @@ class RLOOTrainer(_BaseTrainer):
         per_sequence_loss1 = coef_1 * advantages
         per_sequence_loss2 = coef_2 * advantages
         per_sequence_loss = -torch.min(per_sequence_loss1, per_sequence_loss2)
-        loss = per_sequence_loss.mean()
+        # Count the rows skipped for their zero advantage too
+        num_sequences = inputs.get("num_sequences", per_sequence_loss.size(0))
+        loss = per_sequence_loss.sum() / num_sequences
 
         # Log the metrics
         mode = "train" if self.model.training else "eval"
@@ -1785,13 +1805,15 @@ class RLOOTrainer(_BaseTrainer):
         is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages < 0)
         is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages > 0)
         is_region_clipped = is_low_clipped | is_high_clipped
-        gathered_low_clip = self.accelerator.gather(is_low_clipped.float())
+        # Pad with NaN, which the reductions below ignore: ranks can hold different numbers of rows
+        pad = self.accelerator.pad_across_processes
+        gathered_low_clip = self.accelerator.gather(pad(is_low_clipped.float(), pad_index=float("nan")))
         self._metrics[mode]["clip_ratio/low_mean"].append(gathered_low_clip.nanmean().item())
         self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
-        gathered_high_clip = self.accelerator.gather(is_high_clipped.float())
+        gathered_high_clip = self.accelerator.gather(pad(is_high_clipped.float(), pad_index=float("nan")))
         self._metrics[mode]["clip_ratio/high_mean"].append(gathered_high_clip.nanmean().item())
         self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
-        gathered_clip_ratio = self.accelerator.gather(is_region_clipped.float())
+        gathered_clip_ratio = self.accelerator.gather(pad(is_region_clipped.float(), pad_index=float("nan")))
         self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
         return loss
 

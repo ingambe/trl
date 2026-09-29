@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 from unittest.mock import patch
 
 import pytest
 import torch
 import transformers
-from datasets import DatasetDict, IterableDatasetDict, load_dataset
+from datasets import Dataset, DatasetDict, IterableDatasetDict, load_dataset
 from packaging.version import Version
 from transformers import (
     AutoModelForCausalLM,
@@ -2409,3 +2410,40 @@ class TestRLOOTrainerVLM(TrlTestCase):
         )
         trainer.train()
         assert len(trainer._logs["images"]) == 0
+
+
+def test_skip_zero_advantages_keeps_the_update(tiny_llama, tmp_path):
+    model, tokenizer = tiny_llama
+
+    def reward(completions, constant, **kwargs):
+        # A constant reward gives its whole group a zero advantage
+        return [1.0 if c else float(i % 2) for i, c in enumerate(constant)]
+
+    updated, num_rows = {}, {}
+    for skip in (False, True):
+        trainer = RLOOTrainer(
+            model=copy.deepcopy(model),
+            processing_class=tokenizer,
+            reward_funcs=reward,
+            args=RLOOConfig(
+                output_dir=str(tmp_path),
+                report_to="none",
+                bf16=False,
+                beta=0.0,
+                optim="sgd",  # unlike Adam or clipping, keeps the update proportional to the gradient
+                max_grad_norm=0.0,
+                learning_rate=0.1,
+                per_device_train_batch_size=4,
+                num_generations=2,
+                max_completion_length=4,
+                max_steps=1,
+                skip_zero_advantages=skip,
+            ),
+            train_dataset=Dataset.from_dict({"prompt": ["a", "a a"], "constant": [True, False]}),
+        )
+        trainer.train()
+        updated[skip] = {n: p.detach().clone() for n, p in trainer.model.named_parameters()}
+        num_rows[skip] = len(trainer._buffered_inputs[0]["advantages"])
+
+    assert num_rows == {False: 4, True: 2}
+    torch.testing.assert_close(updated[True], updated[False])

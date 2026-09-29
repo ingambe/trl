@@ -90,6 +90,7 @@ from .utils import (
     pad,
     print_prompt_completions_sample,
     repeat_iterable_dataset,
+    select_sequence_dict,
     shuffle_sequence_dict,
     shutdown_event_loop_in_daemon,
     split_pixel_values_by_grid,
@@ -809,6 +810,22 @@ class GRPOTrainer(_BaseTrainer):
         # Whether the entropy bonus is active. Constant for the run: entropy_coef only mutates in adaptive
         # mode, where this is True regardless of its value (so the bonus can recover after being decremented).
         self._entropy_bonus_enabled = self.entropy_coef != 0.0 or self.use_adaptive_entropy
+        self.skip_zero_advantages = args.skip_zero_advantages
+        # BNPO normalizes by the tokens of each micro-batch, so it needs the completions with zero advantage too
+        needs_zero_advantages = {
+            "beta != 0.0": args.beta != 0.0,
+            "an entropy bonus": self._entropy_bonus_enabled,
+            "top_entropy_quantile < 1.0": self.top_entropy_quantile < 1.0,
+            "a router auxiliary loss": self.aux_loss_enabled,
+            "loss_type='bnpo'": self.loss_type == "bnpo",
+        }
+        if self.skip_zero_advantages and any(needs_zero_advantages.values()):
+            reasons = ", ".join(reason for reason, needed in needs_zero_advantages.items() if needed)
+            logger.warning(
+                f"`skip_zero_advantages=True` is turned off: the loss needs the completions with zero advantage "
+                f"({reasons})."
+            )
+            self.skip_zero_advantages = False
         # Cached entropy from the last optimizer step; inf so the first accumulation window
         # applies no bonus until a real measurement arrives (conservative default).
         self._last_world_entropy = float("inf")
@@ -1486,6 +1503,16 @@ class GRPOTrainer(_BaseTrainer):
                 generation_batch = split_pixel_values_by_grid(generation_batch)
                 generation_batch = shuffle_sequence_dict(generation_batch)
                 generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
+                if self.skip_zero_advantages:
+                    # Skip rows with zero advantage, but keep one so every process still runs forward and backward.
+                    # The loss still averages over every row.
+                    generation_batches = [
+                        {
+                            **select_sequence_dict(batch, batch["advantages"].nonzero().flatten().tolist() or [0]),
+                            "num_sequences": len(batch["advantages"]),
+                        }
+                        for batch in generation_batches
+                    ]
                 self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
             inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
         else:
@@ -3018,8 +3045,10 @@ class GRPOTrainer(_BaseTrainer):
             per_token_loss = per_token_loss + self.beta * per_token_kl
 
         mode = "train" if self.model.training else "eval"
+        # Count the rows skipped for their zero advantage too
+        num_sequences = inputs.get("num_sequences", per_token_loss.size(0))
         if self.loss_type in ["grpo", "sapo"]:
-            loss = ((per_token_loss * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
+            loss = ((per_token_loss * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).sum() / num_sequences
             normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0  # no accum in eval
             policy_loss = loss.detach()
             loss = loss / normalizer
@@ -3029,7 +3058,7 @@ class GRPOTrainer(_BaseTrainer):
             policy_loss = loss.detach()
             loss = loss / normalizer
         elif self.loss_type == "dr_grpo":
-            loss = (per_token_loss * mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
+            loss = (per_token_loss * mask).sum() / (num_sequences * self.max_completion_length)
             normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0  # no accum in eval
             policy_loss = loss.detach()
             loss = loss / normalizer
@@ -3044,7 +3073,7 @@ class GRPOTrainer(_BaseTrainer):
             # `per_token_loss` is (B, 1) only in the recommended sequence-level setup; importance_sampling_level=
             # "token" (the config default), the KL term, token-level vLLM IS ratios, and the entropy mask all
             # broadcast it to (B, T), so mask before aggregating.
-            loss = (per_token_loss * mask).sum(-1).mean()
+            loss = (per_token_loss * mask).sum(-1).sum() / num_sequences
             normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0
             policy_loss = loss.detach()
             loss = loss / normalizer
@@ -3181,9 +3210,10 @@ class GRPOTrainer(_BaseTrainer):
             self._metrics[mode]["clip_ratio/low_mean"].append(global_masked_mean(is_low_clipped.float()))
             self._metrics[mode]["clip_ratio/high_mean"].append(global_masked_mean(is_high_clipped.float()))
             self._metrics[mode]["clip_ratio/region_mean"].append(global_masked_mean(is_region_clipped.float()))
-            gathered_low_clip = self.accelerator.gather(masked_seq_mean(is_low_clipped.float()))
+            # Reduce locally first: ranks can hold different numbers of rows
+            gathered_low_clip = self.accelerator.gather(nanmin(masked_seq_mean(is_low_clipped.float())))
             self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip).item())
-            gathered_high_clip = self.accelerator.gather(masked_seq_mean(is_high_clipped.float()))
+            gathered_high_clip = self.accelerator.gather(nanmax(masked_seq_mean(is_high_clipped.float())))
             self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip).item())
         elif self.loss_type == "cispo":
             is_cispo_clipped = (coef_1 > self.epsilon_high) & (advantages > 0)
