@@ -731,9 +731,9 @@ class TPOTrainer(_BaseTrainer):
         chosen_logits, rejected_logits = logits_chunks[0], logits_chunks[1]
         chosen_mask, rejected_mask = mask_chunks[0], mask_chunks[1]
         chosen_labels = labels_chunks[0]
-        total_chosen_logits = chosen_logits[chosen_mask.bool()].mean(-1).sum()
+        total_chosen_logits = (chosen_logits.mean(-1) * chosen_mask).sum()
         total_chosen_tokens = chosen_mask.sum()
-        total_rejected_logits = rejected_logits[rejected_mask.bool()].mean(-1).sum()
+        total_rejected_logits = (rejected_logits.mean(-1) * rejected_mask).sum()
         total_rejected_tokens = rejected_mask.sum()
         total_chosen_logits = self.accelerator.gather_for_metrics(total_chosen_logits).sum().item()
         total_chosen_tokens = self.accelerator.gather_for_metrics(total_chosen_tokens).sum().item()
