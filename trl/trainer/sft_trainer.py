@@ -422,7 +422,8 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
             Token ID to use for padding.
         padding_free (`bool`, *optional*, defaults to `False`):
             If set to `True`, the sequences will be flattened into a single sequence, and the position IDs will be
-            generated accordingly and returned instead of the attention mask.
+            generated accordingly and returned instead of the attention mask. Packed examples (with `"seq_lengths"`)
+            are always collated this way, unless `return_position_ids=True`.
         return_position_ids (`bool`, *optional*, defaults to `False`):
             If set to `True`, position IDs are returned alongside the attention mask in the padded (non-padding-free)
             mode. Required by sequence parallelism (Ulysses/ALST), which shards batches along the sequence dimension
@@ -478,6 +479,9 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
         input_ids = [example["input_ids"] for example in examples]
         batch_seq_lengths = [example["seq_lengths"] for example in examples] if "seq_lengths" in examples[0] else None
         labels = [example.get("labels", example["input_ids"]) for example in examples]
+        # Packed examples are kept apart only by their position IDs, so collate them padding-free unless the position
+        # IDs are already returned (sequence parallelism)
+        padding_free = self.padding_free or (batch_seq_lengths is not None and not self.return_position_ids)
 
         # Convert to tensor
         input_ids = [torch.tensor(ids) for ids in input_ids]
@@ -485,17 +489,17 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
 
         # For padding-free, we should NOT create attention_mask as it causes FlashAttention to ignore position_ids and
         # compute wrong cu_seq_lens from the all-1s mask
-        if self.padding_free or self.return_position_ids:
+        if padding_free or self.return_position_ids:
             if batch_seq_lengths is not None:
                 position_ids = self.get_position_ids_from_packed_seq_lengths(batch_seq_lengths)
             else:
                 position_ids = [torch.arange(len(ids)) for ids in input_ids]
-        if not self.padding_free:
+        if not padding_free:
             attention_mask = [torch.ones_like(ids) for ids in input_ids]
 
         # If padding_free, flatten everything into a single sequence
         output = {}
-        if self.padding_free:
+        if padding_free:
             input_ids = [torch.cat(input_ids, dim=0)]
             labels = [torch.cat(labels, dim=0)]
             position_ids = [torch.cat(position_ids, dim=0)]
@@ -510,7 +514,7 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
         output["labels"] = pad(
             labels, padding_value=-100, padding_side="right", pad_to_multiple_of=self.pad_to_multiple_of
         )
-        if self.padding_free:
+        if padding_free:
             output["position_ids"] = pad(
                 position_ids, padding_value=0, padding_side="right", pad_to_multiple_of=self.pad_to_multiple_of
             )
