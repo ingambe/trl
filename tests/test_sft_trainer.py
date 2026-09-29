@@ -1277,6 +1277,20 @@ class TestSFTTrainer(TrlTestCase):
 
     @ignore_warnings(message="You are using packing, but the attention implementation is not.*", category=UserWarning)
     @ignore_warnings(message="Padding-free training is enabled, but the attention.*", category=UserWarning)
+    def test_evaluate_dict_keeps_packed_documents(self):
+        dataset = Dataset.from_dict({"input_ids": [[1, 2, 3], [4, 5]]})
+        training_args = SFTConfig(output_dir=self.tmp_dir, packing=True, max_length=8, report_to="none")
+        trainer = SFTTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", args=training_args, train_dataset=dataset
+        )
+
+        with patch.object(trainer, "get_eval_dataloader", wraps=trainer.get_eval_dataloader) as get_eval_dataloader:
+            trainer.evaluate({"held_out": dataset})
+
+        assert get_eval_dataloader.call_args.args[0]["seq_lengths"][:] == [[3, 2]]
+
+    @ignore_warnings(message="You are using packing, but the attention implementation is not.*", category=UserWarning)
+    @ignore_warnings(message="Padding-free training is enabled, but the attention.*", category=UserWarning)
     def test_only_train_packing(self):
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling")
 
