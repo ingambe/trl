@@ -31,6 +31,7 @@ def test_grpo_rollout_loads_weights_once_and_sleeps_before_scoring(colocate_grpo
         llm.sleep.assert_called_once_with(level=2)
         raise RuntimeError("stop before scoring")
 
+    trainer.num_iterations = 2  # misaligned steps, so the old-policy logps are scored here
     trainer.rollout_func = two_turn_rollout
     trainer._get_per_token_logps_and_entropies = stop_before_scoring
     with pytest.raises(RuntimeError, match="stop before scoring"):
