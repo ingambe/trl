@@ -1694,6 +1694,15 @@ def add_fused_lm_head(
         hidden_states = hidden_states.to(lm_head.weight.device)
         labels = labels.to(lm_head.weight.device)
         mask = labels != -100
+        # On Triton devices, only the valid positions are scored. Elsewhere (e.g. Neuron), the number of valid positions
+        # would change the tile shapes on every batch and trigger a recompilation, so every position is scored instead.
+        compact = _use_triton(hidden_states.device)
+        if compact:
+            hidden_states = hidden_states[mask]
+            labels = labels[mask]
+        else:
+            hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
+            labels = labels.clamp(min=0).reshape(-1)
         autocast_ctx = nullcontext()
         if cast_lm_head_to_fp32:
             hidden_states = hidden_states.float()
@@ -1706,9 +1715,6 @@ def add_fused_lm_head(
             weight = weight.full_tensor()
             if bias is not None:
                 bias = bias.full_tensor()
-        # On Triton devices, only the valid positions are scored. Elsewhere (e.g. Neuron), the number of valid positions
-        # would change the tile shapes on every batch and trigger a recompilation, so every position is scored instead.
-        compact = _use_triton(hidden_states.device)
         if support_ids is not None:
             support_ids = support_ids.to(lm_head.weight.device)
             support_ids = (
@@ -1719,10 +1725,10 @@ def add_fused_lm_head(
             score_ids = score_ids[mask] if compact else score_ids.masked_fill(~mask.unsqueeze(-1), 0).flatten(0, 1)
         with autocast_ctx, maybe_gather_lm_head_ctx(weight, bias):
             per_token = _ChunkedLogProbFunction.apply(
-                hidden_states[mask] if compact else hidden_states.reshape(-1, hidden_states.size(-1)),
+                hidden_states,
                 weight,
                 bias,
-                labels[mask] if compact else labels.clamp(min=0).reshape(-1),
+                labels,
                 temperature,
                 _CHUNKED_LOGPROB_CHUNK_SIZE,
                 final_logit_softcapping,
