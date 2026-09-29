@@ -1578,6 +1578,8 @@ def patch_fused_lm_head(model: PreTrainedModel, temperature: float = 1.0, cast_l
             hidden_states = outputs.last_hidden_state
             labels = shift_labels
         mask = labels != -100
+        hidden_states = hidden_states[mask]
+        labels = labels[mask]
         autocast_ctx = nullcontext()
         if cast_lm_head_to_fp32:
             hidden_states = hidden_states.float()
@@ -1593,10 +1595,10 @@ def patch_fused_lm_head(model: PreTrainedModel, temperature: float = 1.0, cast_l
                 bias = bias.full_tensor()
         with autocast_ctx, maybe_gather_lm_head_ctx(weight, bias):
             per_token = _ChunkedLogProbFunction.apply(
-                hidden_states[mask],
+                hidden_states,
                 weight,
                 bias,
-                labels[mask],
+                labels,
                 temperature,
                 _CHUNKED_LOGPROB_CHUNK_SIZE,
                 final_logit_softcapping,
