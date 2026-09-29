@@ -1459,6 +1459,8 @@ class SFTTrainer(_BaseTrainer):
 
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+        # Entropy and token accuracy are logged as sums over supervised tokens, divided by this count in `log`
+        self._num_supervised_tokens = {"train": 0, "eval": 0}
         self._total_train_tokens = 0
 
         # Tensor parallel ranks are given the same batch, so a token count gathered across all processes repeats
@@ -1871,8 +1873,8 @@ class SFTTrainer(_BaseTrainer):
             # count by up to one per sequence; using the patched output keeps numerator and denominator aligned.
             num_valid = self.accelerator.gather_for_metrics(outputs.num_valid_tokens).sum()
             entropy_sum = self.accelerator.gather_for_metrics(outputs.entropy_sum).sum()
-            entropy = (entropy_sum / num_valid).item() if num_valid > 0 else 0.0
-            self._metrics[mode]["entropy"].append(entropy)
+            self._metrics[mode]["entropy"].append(entropy_sum.item())
+            self._num_supervised_tokens[mode] += num_valid.item()
         elif not self.args.use_liger_kernel:  # liger doesn't return logits
             with torch.no_grad():
                 if "shift_labels" in inputs:
@@ -1899,16 +1901,13 @@ class SFTTrainer(_BaseTrainer):
                 correct_predictions = (predictions == shift_labels) & mask
                 correct_tokens = correct_predictions.sum()
 
-                # Gather counts across ranks and weight-average
+                # Gather counts across ranks; `log` divides the sums by the token count
                 entropy_sum = self.accelerator.gather_for_metrics(entropy_sum).sum()
                 total_tokens = self.accelerator.gather_for_metrics(total_tokens).sum()
-                correct_tokens = self.accelerator.gather_for_metrics(correct_tokens)
-                entropy = (entropy_sum / total_tokens).item() if total_tokens > 0 else 0.0
-
-                total_sum = total_tokens.sum()
-                accuracy = (correct_tokens.sum() / total_sum).item() if total_sum > 0 else 0.0
-            self._metrics[mode]["entropy"].append(entropy)
-            self._metrics[mode]["mean_token_accuracy"].append(accuracy)
+                correct_tokens = self.accelerator.gather_for_metrics(correct_tokens).sum()
+            self._metrics[mode]["entropy"].append(entropy_sum.item())
+            self._metrics[mode]["mean_token_accuracy"].append(correct_tokens.item())
+            self._num_supervised_tokens[mode] += total_tokens.item()
 
         if mode == "train":
             # When using padding-free, the attention_mask is not present in the inputs, instead we have cu_seq_lens_q,
@@ -1925,12 +1924,15 @@ class SFTTrainer(_BaseTrainer):
 
         if chunked:
             correct = self.accelerator.gather_for_metrics(outputs.num_correct_tokens).sum()
-            accuracy = (correct / num_valid).item() if num_valid > 0 else 0.0
-            self._metrics[mode]["mean_token_accuracy"].append(accuracy)
+            self._metrics[mode]["mean_token_accuracy"].append(correct.item())
         elif self.args.use_liger_kernel:
             if hasattr(outputs, "token_accuracy") and outputs.token_accuracy is not None:
-                token_accuracy = self.accelerator.gather_for_metrics(outputs.token_accuracy).mean().item()
-                self._metrics[mode]["mean_token_accuracy"].append(token_accuracy)
+                # Liger returns the local accuracy: weight it by the local number of supervised tokens
+                shift_labels = inputs["shift_labels"] if "shift_labels" in inputs else labels[..., 1:]
+                num_valid = (shift_labels != -100).sum()
+                correct = self.accelerator.gather_for_metrics(outputs.token_accuracy * num_valid).sum()
+                self._metrics[mode]["mean_token_accuracy"].append(correct.item())
+                self._num_supervised_tokens[mode] += self.accelerator.gather_for_metrics(num_valid).sum().item()
             else:
                 warnings.warn(
                     "liger-kernel did not return token_accuracy when requested. The mean_token_accuracy metric will "
@@ -1957,7 +1959,13 @@ class SFTTrainer(_BaseTrainer):
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         mode = "train" if self.model.training else "eval"
-        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
+        metrics = {}
+        for key, val in self._metrics[mode].items():
+            if key in ("entropy", "mean_token_accuracy"):
+                num_tokens = self._num_supervised_tokens[mode]
+                metrics[key] = sum(val) / num_tokens if num_tokens > 0 else 0.0
+            else:
+                metrics[key] = sum(val) / len(val)  # average the metrics
 
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
@@ -1967,6 +1975,7 @@ class SFTTrainer(_BaseTrainer):
         logs.update(metrics)
         super().log(logs, start_time)
         self._metrics[mode].clear()
+        self._num_supervised_tokens[mode] = 0
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):
