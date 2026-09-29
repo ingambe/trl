@@ -75,3 +75,13 @@ def test_tool_loop_marks_rolled_back_tool_call_as_truncated(server_tool_trainer)
     assert completion_ids == [[10, 11, 2], [20, 35, 135]]
     assert "tool_calls" in messages[0][-1], "The first sample must end on its unexecuted tool call."
     assert tool_truncated == [True, False], "Only the sample whose tool call was rolled back is truncated."
+
+
+def test_server_generates_each_prompt_when_group_prompts_differ(server_generation):
+    """Group members with different prompts must each be generated from their own prompt."""
+    prompt_ids, completion_ids, _, _ = server_generation.generate([[1, 30], [1, 35], [2, 40], [2, 40]], None, 2)
+
+    request = server_generation.vllm_client.generate.call_args.kwargs
+    assert (request["prompts"], request["n"]) == ([[1, 30], [1, 35], [2, 40], [2, 40]], 1)
+    assert prompt_ids == [[1, 30], [1, 35], [2, 40], [2, 40]]
+    assert completion_ids == [[130], [135], [140], [140]]
