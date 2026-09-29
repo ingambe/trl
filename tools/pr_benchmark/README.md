@@ -250,9 +250,10 @@ head, so model loading and vLLM startup happen once per side. The feedback is a 
 tool-calling loop: this is a systems workload, not a scored task, and reports no task success.
 
 Latency uses the same paired intervals as SFT on `rollout_seconds` (synchronization, all turns, and sleep) and
-`weight_transfer_bytes` (logical tensor payload handed to vLLM's `load_weights` or, for native adapters, the saved
-adapter tensors; not bus traffic). A transfer reduction alone is never reported as an improvement. Quality is reported
-separately and any failure turns a passing latency verdict into `quality_failed`; it never hides the timings:
+`weight_transfer_bytes` (logical tensor payload handed to vLLM's `load_weights`, the saved adapter tensors for native
+adapters, or the layers an adapter is merged into in place; not bus traffic). A transfer reduction alone is never
+reported as an improvement. Quality is reported separately and any failure turns a passing latency verdict into
+`quality_failed`; it never hides the timings:
 
 - greedy rollout tokens match base for every seed (native LoRA or a restoration fix can legitimately change them);
 - vLLM is asleep after every phase, and every phase synchronized the updated policy (syncs per phase are reported);
@@ -270,6 +271,24 @@ again. Compare a pushed branch before opening a PR (never publishes a status):
 `--gpus 2` runs any `vllm-rollout` profile data-parallel on two GPUs of one allocation: two RTX 3090 when the account
 offers them, otherwise two RTX 5090 (the report names the GPU). Each process rolls out its own prompts with its own
 colocated vLLM engine. A phase lasts as long as its slowest process; rank 0 records the tokens, memory and profile.
+
+`--profile vllm-rollout-dense` runs the same workload without LoRA: each phase updates the norm weights instead of
+the adapter, and the frozen-weight check covers every other parameter. On every rollout profile, a checkout whose
+`GRPOConfig` has `vllm_share_weights` enables it, so the comparison measures shared weights against weight publication.
+
+`--profile grpo-train-dense` runs real `GRPOTrainer.train()` instead: 30 AdamW steps on the dense model with colocated
+vLLM, eight completions of up to 64 tokens per step and a deterministic length reward. It compares training time, with
+generation and backward/optimizer time reported separately, and checks quality against base: per-step rewards, the
+vLLM/trainer sampling logprob gap, final parameters and a greedy reward on 128 held-out prompts. The reward is synthetic, so this is
+not a scored task benchmark.
+
+`--profile grpo-train-lora` trains an `all-linear` rank-16 LoRA instead, with completions of up to 256 tokens. LoRA
+training is not bitwise reproducible even main against main, so it runs ten seeds and only the held-out reward and the
+logprob gap are checked, per seed, and the gap as each seed's mean over its steps, which one diverged step can't
+dominate. Each passes only when its whole 95% interval clears the margin, and makes the verdict inconclusive when the
+interval crosses it.
+`--profile grpo-train-lora-3b` runs it on Qwen2.5-3B-Instruct, which needs its own prepared environment. With
+a LoRA profile, `--native-lora` has vLLM serve the adapter natively on commits that support it.
 
 `--serious` selects a longer workload on one RTX 5090: three warm-up and twelve measured phases, eight distinct
 prompts of up to 768 tokens, six turns of 64 generated tokens, 1,536-token context. It is still synthetic and unscored:

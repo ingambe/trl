@@ -83,7 +83,11 @@ def analyze(directory):
         }
         del events
         analysis = TraceAnalysis(trace_files={0: str(destination / "trace.json.gz")}, include_last_profiler_step=True)
-        tables = {"temporal": analysis.get_temporal_breakdown(visualize=False)}
+        try:
+            tables = {"temporal": analysis.get_temporal_breakdown(visualize=False)}
+        except AssertionError:
+            # HTA 0.5 asserts on kernels overlapping across streams
+            tables = {"temporal": None}
         tables["kernel-types"], tables["kernels"] = analysis.get_gpu_kernel_breakdown(
             visualize=False, duration_ratio=1.0, num_kernels=100000
         )
@@ -132,8 +136,10 @@ def analyze(directory):
         "| HTA temporal metric | Base | Head | Head minus base |",
         "|---|---:|---:|---:|",
     ]
-    before, after = summaries["base"]["temporal"][0], summaries["head"]["temporal"][0]
+    before, after = ((summaries[side]["temporal"] or [{}])[0] for side in ("base", "head"))
     for metric, value in before.items():
+        if metric not in after:
+            continue
         if metric != "rank" and isinstance(value, (float, int)):
             lines.append(f"| {metric} | {value:.4f} | {after[metric]:.4f} | {after[metric] - value:+.4f} |")
     lines += [
