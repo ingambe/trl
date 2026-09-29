@@ -1261,6 +1261,8 @@ class SFTTrainer(_BaseTrainer):
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         # Token-weighted metrics are logged as sums, divided by their token count in `log`
         self._metric_num_tokens = {"train": defaultdict(int), "eval": defaultdict(int)}
+        # Loss metrics per micro-batch, reduced across processes in `log`
+        self._pending_loss_metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._total_train_tokens = 0
 
         # Tensor parallel ranks are given the same batch, so a token count gathered across all processes repeats
@@ -1691,33 +1693,30 @@ class SFTTrainer(_BaseTrainer):
                 ) from e
             raise
 
+        def log_metric(key, reduction, value):
+            self._pending_loss_metrics[mode][key, reduction].append(value.detach())
+
         # Entropy and token accuracy. Both are zero on ignored positions, including prompt-learning virtual tokens.
-        num_valid = self.accelerator.gather_for_metrics(outputs.label_mask.sum()).sum()
-        entropy_sum = self.accelerator.gather_for_metrics(outputs.entropy.detach().sum()).sum()
-        num_correct = self.accelerator.gather_for_metrics(outputs.is_top1.sum()).sum()
-        self._metrics[mode]["entropy"].append(entropy_sum.item())
-        self._metrics[mode]["mean_token_accuracy"].append(num_correct.item())
-        self._metric_num_tokens[mode]["entropy"] += num_valid.item()
-        self._metric_num_tokens[mode]["mean_token_accuracy"] += num_valid.item()
+        num_valid = outputs.label_mask.sum()
+        log_metric("entropy", "sum", outputs.entropy.sum())
+        log_metric("entropy", "num_tokens", num_valid)
+        log_metric("mean_token_accuracy", "sum", outputs.is_top1.sum())
+        log_metric("mean_token_accuracy", "num_tokens", num_valid)
 
         if mode == "train":
             # When using padding-free, the attention_mask is not present in the inputs, instead we have cu_seq_lens_q,
             # cu_seq_lens_k, and max_length_k, max_length_q and position_ids.
             if "attention_mask" in inputs:
-                num_tokens_in_batch = self.accelerator.gather_for_metrics(inputs["attention_mask"].sum()).sum().item()
+                log_metric("num_tokens", "sum", inputs["attention_mask"].sum())
             elif "position_ids" in inputs:
                 local_num_tokens = torch.tensor(inputs["position_ids"].size(1), device=inputs["position_ids"].device)
-                num_tokens_in_batch = self.accelerator.gather_for_metrics(local_num_tokens).sum().item()
+                log_metric("num_tokens", "sum", local_num_tokens)
             else:
                 raise ValueError("Expected 'attention_mask' or 'position_ids' in inputs.")
-            self._total_train_tokens += num_tokens_in_batch // self._tp_size
-        self._metrics[mode]["num_tokens"] = [self._total_train_tokens]
 
         # Log auxiliary loss if enabled
         if self.aux_loss_enabled:
-            aux_loss = outputs.aux_loss
-            aux_loss = self.accelerator.gather_for_metrics(aux_loss).mean().item()
-            self._metrics[mode]["aux_loss"].append(aux_loss)
+            log_metric("aux_loss", "mean", outputs.aux_loss)
 
         if return_outputs:
             warnings.warn(
@@ -1751,6 +1750,19 @@ class SFTTrainer(_BaseTrainer):
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         mode = "train" if self.model.training else "eval"
+        for (key, reduction), values in self._pending_loss_metrics[mode].items():
+            gathered = self.accelerator.gather(torch.stack(values)).unflatten(0, (self.accelerator.num_processes, -1))
+            if reduction == "num_tokens":
+                self._metric_num_tokens[mode][key] += gathered.sum().item()
+            elif reduction == "sum":
+                self._metrics[mode][key].extend(gathered.sum(0).tolist())
+            else:
+                self._metrics[mode][key].extend(gathered.mean(0).tolist())
+        if self._pending_loss_metrics[mode]:
+            self._total_train_tokens += sum(self._metrics[mode].pop("num_tokens", [])) // self._tp_size
+            self._metrics[mode]["num_tokens"] = [self._total_train_tokens]
+        self._pending_loss_metrics[mode].clear()
+
         metrics = {}
         for key, val in self._metrics[mode].items():
             if key in self._metric_num_tokens[mode]:
