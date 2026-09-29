@@ -281,16 +281,20 @@ def _patch_chunked_ce_lm_head(model: torch.nn.Module, chunk_size: int, is_vlm: b
         num_items_in_batch: torch.Tensor | int | None = None,
         shift_labels: torch.Tensor | None = None,
         output_router_logits: bool | None = None,
+        skip_logits: bool = True,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         # Without labels, fall back to the original forward so generation and labels-free evaluation
         # preserve any per-model logits post-processing (e.g. Cohere `logit_scale`, Gemma
-        # `final_logit_softcapping`, `logits_to_keep` slicing).
-        if labels is None and shift_labels is None:
+        # `final_logit_softcapping`, `logits_to_keep` slicing). Also fall back when the caller needs the logits
+        # (`skip_logits=False`, e.g. `predict()`), letting the original forward compute the loss from them.
+        if (labels is None and shift_labels is None) or not skip_logits:
             # MoE models: request router logits so the model returns `outputs.aux_loss`. VLM wrappers honor this only
             # as a forward kwarg (not from the model config), so it must be passed here.
             if output_router_logits is not None:
                 kwargs["output_router_logits"] = output_router_logits
+            if not skip_logits:
+                kwargs.update(labels=labels, shift_labels=shift_labels, num_items_in_batch=num_items_in_batch)
             return original_forward(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
 
         if output_router_logits is None:
@@ -1803,8 +1807,7 @@ class SFTTrainer(_BaseTrainer):
         if self.aux_loss_enabled:
             inputs["output_router_logits"] = True
 
-        # Request token accuracy from Liger kernel and set token scaling if using DFT loss
-        if self.args.use_liger_kernel:
+        if self.args.use_liger_kernel or self.args.loss_type == "chunked_nll":
             # Avoid materializing full logits during eval unless explicitly needed.
             # By default, liger kernel only skips logits during training (self.training=True).
             # When only loss is needed for eval (no compute_metrics), we can safely skip logits.
@@ -1822,6 +1825,9 @@ class SFTTrainer(_BaseTrainer):
                     and prediction_loss_only is not False
                 )
             )
+
+        # Request token accuracy from Liger kernel and set token scaling if using DFT loss
+        if self.args.use_liger_kernel:
             inputs["return_token_accuracy"] = True
             inputs["use_token_scaling"] = self.args.loss_type == "dft"
 
