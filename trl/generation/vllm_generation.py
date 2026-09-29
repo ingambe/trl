@@ -17,11 +17,15 @@
 import logging
 import math
 import os
+from collections import Counter
 from contextlib import closing, contextmanager, nullcontext
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING
 
 import torch
 from accelerate.utils import broadcast_object_list, gather_object, is_peft_model
+from packaging.version import Version
+from safetensors.torch import save_file
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, is_bitsandbytes_available
@@ -42,6 +46,9 @@ from .vllm_client import VLLMClient
 
 if is_vllm_available():
     from vllm import LLM, RequestOutput, SamplingParams
+    from vllm.device_allocator.cumem import CuMemAllocator, unmap_and_release
+    from vllm.lora.request import LoRARequest
+    from vllm.model_executor.models.interfaces import supports_lora
     from vllm.sampling_params import StructuredOutputsParams
 
 
@@ -109,6 +116,8 @@ if is_bitsandbytes_available():
     import bitsandbytes as bnb
 
 if is_peft_available():
+    import peft
+    from peft import LoraConfig, get_peft_model_state_dict
     from peft.tuners.tuners_utils import BaseTunerLayer
 
 
@@ -175,6 +184,11 @@ class VLLMGeneration:
         enable_sleep_mode (`bool`, *optional*, defaults to `False`):
             Whether to enable sleep mode for the engine to offload weights/cache during the optimizer step. Keeps GPU
             memory usage low, but waking the engine adds host–device transfer latency.
+        share_weights (`bool`, *optional*, defaults to `False`):
+            Whether the model's parameters use vLLM's weight memory, so no weights are published and sleep only
+            releases the KV cache. With PEFT, the adapter is merged for generation and removed by `sleep()`.
+        native_lora (`bool`, *optional*, defaults to `False`):
+            With `share_weights=True` and PEFT, serve the adapter as a native vLLM LoRA instead of merging it.
         model_impl (`str`, *optional*, defaults to `"auto"`):
             Model implementation to use for vLLM.
             - "auto" will try to use the vLLM implementation, if it exists, and fall back to the Transformers
@@ -239,6 +253,8 @@ class VLLMGeneration:
         max_model_length: int | None = None,
         max_num_seqs: int | None = None,
         enable_sleep_mode: bool = False,
+        share_weights: bool = False,
+        native_lora: bool = False,
         model_impl: str = "auto",
         trust_remote_code: bool = False,
         cast_lm_head_to_fp32: bool = False,
@@ -274,6 +290,11 @@ class VLLMGeneration:
         self.max_model_length = max_model_length
         self.max_num_seqs = max_num_seqs
         self.enable_sleep_mode = enable_sleep_mode
+        self.share_weights = share_weights
+        self.native_lora = native_lora
+        self._lora_request = None
+        self._merged_bases = []
+        self._unshareable = None
         self.model_impl = model_impl
         self.trust_remote_code = trust_remote_code
         self.cast_lm_head_to_fp32 = cast_lm_head_to_fp32
@@ -353,6 +374,45 @@ class VLLMGeneration:
                     elif isinstance(module, bnb.nn.Linear8bitLt):
                         raise ValueError("vLLM does not support in-flight 8-bit quantization.")
 
+            if self.share_weights and (
+                self.tensor_parallel_size > 1 or self._dist.is_fsdp or self._dist.is_zero3 or quantization is not None
+            ):
+                raise ValueError(
+                    "`share_weights=True` requires `tensor_parallel_size=1`, no FSDP or DeepSpeed ZeRO-3, and no "
+                    "quantization."
+                )
+            lora_kwargs = {}
+            if self.share_weights and is_peft_model(model):
+                config = model.peft_config[model.active_adapters[0]]
+                tied = Counter(id(param) for _, param in model.named_parameters(remove_duplicate=False))
+                if (
+                    len(model.active_adapters) != 1
+                    or not isinstance(config, LoraConfig)
+                    or config.use_dora
+                    or config.bias != "none"
+                    or config.modules_to_save
+                    # Added in PEFT 0.14.0, 0.17.0 and 0.18.0
+                    or (Version(peft.__version__) >= Version("0.14.0") and config.lora_bias)
+                    or (Version(peft.__version__) >= Version("0.17.0") and config.target_parameters)
+                    or (Version(peft.__version__) >= Version("0.18.0") and config.alora_invocation_tokens)
+                    or config.rank_pattern
+                    or config.alpha_pattern
+                    or any(
+                        isinstance(module, BaseTunerLayer) and tied[id(module.get_base_layer().weight)] > 1
+                        for module in model.modules()
+                    )
+                ):
+                    raise ValueError(
+                        "`share_weights=True` with PEFT requires a single plain LoRA adapter: no DoRA, trained biases, "
+                        "`lora_bias`, `modules_to_save`, `target_parameters`, aLoRA, `rank_pattern`, `alpha_pattern` "
+                        "or adapted tied weights."
+                    )
+                if self.native_lora:
+                    # The ranks vLLM accepts
+                    ranks = (1, 8, 16, 32, 64, 128, 256, 320, 512)
+                    max_lora_rank = min((rank for rank in ranks if rank >= config.r), default=config.r)
+                    lora_kwargs = {"enable_lora": True, "max_lora_rank": max_lora_rank}
+
             hf_overrides = None
             if self.cast_lm_head_to_fp32:
                 if is_vllm_available(min_version="0.26.0"):
@@ -382,12 +442,14 @@ class VLLMGeneration:
                 quantization=quantization,
                 trust_remote_code=self.trust_remote_code,
                 hf_overrides=hf_overrides,
+                **lora_kwargs,
             )
-            if self.enable_sleep_mode:
-                self.llm.sleep(level=2)
-            # Sleep level 2 discards the weights; track it so that generate() knows it must re-push them
-            self._llm_weights_sleeping = self.enable_sleep_mode
-            self._kv_cache_sleeping = self.enable_sleep_mode
+            unshared = self._share_weights() if self.share_weights else []
+            if unshared and lora_kwargs:
+                raise ValueError("`native_lora=True` requires every base parameter to be shared with vLLM.")
+            self._llm_weights_sleeping = False
+            self._kv_cache_sleeping = False
+            self.sleep()
         else:
             raise ValueError(f"vllm_mode must be either 'server' or 'colocate', got '{self.mode}'.")
 
@@ -395,6 +457,84 @@ class VLLMGeneration:
         # desynchronization and seems to lead to DeepSpeed hanging during initialization. To prevent this, we
         # synchronize all processes after vLLM has been fully initialized.
         accelerator.wait_for_everyone()
+
+    @torch.no_grad()
+    def _share_weights(self) -> list[tuple[str, torch.Tensor]]:
+        """Point the model's parameters at vLLM's weights, and return the parameters that can't be shared."""
+        vllm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+        views = {name.replace(".base_layer", ""): param.data for name, param in vllm_model.named_parameters()}
+        # Fused layers (e.g. qkv_proj) stack several parameters
+        packed = vllm_model.packed_modules_mapping if supports_lora(vllm_model) else {}
+        for module_name, module in vllm_model.named_modules():
+            module_name = module_name.replace(".base_layer", "")
+            fused = module_name.rpartition(".")[2]
+            parts = packed.get(fused)
+            if parts and parts != [fused]:
+                prefix = module_name.removesuffix(fused)
+                for name, param in module.named_parameters(recurse=False):
+                    for part, view in zip(parts, param.data.split(module.output_sizes), strict=True):
+                        views[f"{prefix}{part}.{name}"] = view
+
+        self._unmerge()
+        adapter_prefix = self.model.prefix if is_peft_model(self.model) else None
+        lora_layers = {}
+        if adapter_prefix and not self.native_lora:
+            adapter = self.model.active_adapters[0]
+            lora_layers = {
+                self._fix_param_name_to_vllm(name.removeprefix("base_model.model.")) + ".weight": module
+                for name, module in self.model.named_modules()
+                if isinstance(module, BaseTunerLayer)
+            }
+        params = [
+            (self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", "")), param)
+            for name, param in self.model.named_parameters()
+            if not (adapter_prefix and adapter_prefix in name)
+        ]
+        if self._unshareable is None:
+            self._unshareable = set()
+            # vLLM's loader can't address layers wrapped by native LoRA
+            wrapped = [
+                (parent, child_name, child)
+                for parent in vllm_model.modules()
+                for child_name, child in parent.named_children()
+                if "base_layer" in child._modules
+            ]
+            for parent, child_name, child in wrapped:
+                setattr(parent, child_name, child.base_layer)
+            for name, param in params:
+                view = views.get(name)
+                if view is None or view.shape != param.shape or view.dtype != param.dtype:
+                    self._unshareable.add(name)
+                    continue
+                # Share only if vLLM's loader keeps the layout (it transposes GPT-2's Conv1D, reorders GPT-NeoX's QKV)
+                original, probe = view.clone(), torch.randn_like(view)
+                vllm_model.load_weights([(name, probe)])
+                if not torch.equal(view, probe):
+                    self._unshareable.add(name)
+                view.copy_(original)
+            for parent, child_name, child in wrapped:
+                setattr(parent, child_name, child)
+        unshared = []
+        for name, param in params:
+            if name in self._unshareable:
+                if name in lora_layers:
+                    param = (param + lora_layers[name].get_delta_weight(adapter)).to(param.dtype)
+                unshared.append((name, param.data))
+                continue
+            view = views[name]
+            if not param.data.is_set_to(view):
+                view.copy_(param.data)
+                param.data = view
+            if name in lora_layers:
+                self._merged_bases.append((view, view.clone()))
+                view.copy_(view + lora_layers[name].get_delta_weight(adapter))
+        return unshared
+
+    def _unmerge(self):
+        """Restore the frozen base of the layers the adapter was merged into."""
+        for view, base in self._merged_bases:
+            view.copy_(base)
+        self._merged_bases = []
 
     def _fix_param_name_to_vllm(self, name: str, extra_prefixes: list[str] | None = None) -> str:
         """Fix parameter name for vLLM compatibility."""
@@ -551,13 +691,18 @@ class VLLMGeneration:
                         pass
         elif self.mode == "colocate":
             load_weights = self.llm.llm_engine.model_executor.driver_worker.model_runner.model.load_weights
-            with self._export_named_params() as params:
-                if self._dist.is_fsdp or (self._dist.is_zero3 and not is_peft_model(self.model)):
-                    # Gathered tensors are released as the stream advances
-                    for name, param in params:
-                        load_weights([(name, param)])
-                else:
-                    load_weights(params)
+            if self.share_weights:
+                load_weights(self._share_weights())
+                if is_peft_model(self.model) and self.native_lora:
+                    self._publish_adapter()
+            else:
+                with self._export_named_params() as params:
+                    if self._dist.is_fsdp or (self._dist.is_zero3 and not is_peft_model(self.model)):
+                        # Gathered tensors are released as the stream advances
+                        for name, param in params:
+                            load_weights([(name, param)])
+                    else:
+                        load_weights(params)
 
         # Reset cache on vLLM
         if self.mode == "server" and accelerator.is_main_process:
@@ -566,10 +711,39 @@ class VLLMGeneration:
             self.llm.reset_prefix_cache()
         self._weights_dirty = False
 
+    def _publish_adapter(self):
+        """Replace the adapter vLLM serves with the current one, under a new ID."""
+        previous = self._lora_request
+        if previous:
+            self.llm.llm_engine.remove_lora(previous.lora_int_id)
+        state = get_peft_model_state_dict(self.model, adapter_name=self.model.active_adapters[0])
+        with TemporaryDirectory(prefix="trl-lora-") as directory:
+            save_file(
+                {name: tensor.contiguous() for name, tensor in state.items()}, f"{directory}/adapter_model.safetensors"
+            )
+            self.model.peft_config[self.model.active_adapters[0]].save_pretrained(directory)
+            lora_id = previous.lora_int_id + 1 if previous else 1
+            self._lora_request = LoRARequest(f"trl-policy-{lora_id}", lora_id, directory)
+            self.llm.llm_engine.add_lora(self._lora_request)
+
     def sleep(self):
+        if self._merged_bases:
+            self._unmerge()
+            self._weights_dirty = True
         if self.mode == "colocate" and self.enable_sleep_mode and not self._kv_cache_sleeping:
-            self.llm.sleep(level=2)
-            self._llm_weights_sleeping = True
+            if self.share_weights:
+                # The model trains on vLLM's weights, so only the KV cache is released
+                core = self.llm.llm_engine.engine_core.engine_core
+                core.pause_scheduler(clear_cache=True)
+                for data in CuMemAllocator.get_instance().pointer_to_data.values():
+                    if data.tag == "kv_cache":
+                        unmap_and_release(data.handle)
+                core.model_executor.is_sleeping = True
+                core.model_executor.sleeping_tags = {"kv_cache"}
+            else:
+                # Sleep level 2 discards the weights; track it so that generate() knows it must re-push them
+                self.llm.sleep(level=2)
+                self._llm_weights_sleeping = True
             self._kv_cache_sleeping = True
 
     def _place_features(self, features: dict | None, prompt_ids: list[int]) -> dict | None:
@@ -786,7 +960,9 @@ class VLLMGeneration:
                 torch.distributed.barrier(device_ids=[accelerator.local_process_index])
 
             with profiler:
-                all_outputs = self.llm.generate(vllm_prompts, sampling_params=sampling_params, use_tqdm=False)
+                all_outputs = self.llm.generate(
+                    vllm_prompts, sampling_params=sampling_params, use_tqdm=False, lora_request=self._lora_request
+                )
 
             all_prompt_ids = [output.prompt_token_ids for output in all_outputs]
             all_completion_ids = [output.token_ids for outputs in all_outputs for output in outputs.outputs]
