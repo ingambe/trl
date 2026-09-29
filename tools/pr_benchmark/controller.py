@@ -97,7 +97,8 @@ class GitHub:
             )
             if key in env
         }
-        self.user = self.api("user")["login"]
+        # Actions tokens cannot read /user
+        self.user = env.get("GITHUB_ACTOR") or self.api("user")["login"]
 
     def api(self, endpoint, data=None):
         command = ["gh", "api", "--hostname", "github.com", endpoint]
@@ -238,9 +239,7 @@ def wait_for_job(provider, github, manifest, record, deadline, poll=30):
             time.sleep(min(poll * failures, max(0, deadline - time.time())))
             continue
         if status in TERMINAL:
-            if status != "SUCCEEDED":
-                raise RuntimeError(f"Compute job ended with {status}")
-            return
+            return status
         time.sleep(min(poll, max(0, deadline - time.time())))
 
 
@@ -289,7 +288,21 @@ def execute(args, github, provider, manifest, state, state_file, record=None):
     try:
         if publish:
             github.status(manifest, "pending", f"Comparing against {manifest['base_sha'][:12]}", job["url"])
-        wait_for_job(provider, github, manifest, record, record["started"] + record["reserved_minutes"] * 60)
+        deadline = record["started"] + (record["reserved_minutes"] + args.queue_minutes) * 60
+        status = wait_for_job(provider, github, manifest, record, deadline)
+        for _ in range(2):
+            # The job never ran if Hyper.ai failed to start its pod
+            if status != "FAILED" or not provider.failed_to_start(job["id"]):
+                break
+            record["status"] = "submitting"
+            save(state_file, state)
+            record["job"] = job = provider.submit(directory / "bundle", record["reserved_minutes"] * 60)
+            record["status"] = "running"
+            save(state_file, state)
+            print(f"Pod failed to start, resubmitted as compute job {job['id']}: {job['url']}", flush=True)  # noqa: T201
+            status = wait_for_job(provider, github, manifest, record, deadline)
+        if status != "SUCCEEDED":
+            raise RuntimeError(f"Compute job ended with {status}")
         result = provider.result(job["id"])
         save(directory / "result.json", result)
         if manifest.get("prepare"):
@@ -380,6 +393,9 @@ def main():
     )
     parser.add_argument("--rerun", action="store_true", help="Repeat a previously completed manual comparison")
     parser.add_argument("--timeout-minutes", type=int, default=60)
+    parser.add_argument(
+        "--queue-minutes", type=int, default=0, help="Extra local deadline for time queued on Hyper.ai"
+    )
     parser.add_argument("--daily-compute-minutes", type=int, default=120)
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--state-dir", type=Path, default=Path.home() / ".local/state/trl-pr-benchmark")
