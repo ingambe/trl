@@ -61,11 +61,12 @@ jobs:
           HYPERAI_ENVIRONMENT_JOB: ${{ matrix.benchmark == 'train-lora-3b' && vars.HYPERAI_ENVIRONMENT_JOB_3B || vars.HYPERAI_ENVIRONMENT_JOB }}
           REF: ${{ inputs.ref }}
           BASE_REF: ${{ inputs.base_ref }}
-        # The deadline includes time queued behind the other jobs
+        # Jobs queue behind each other on Hyper.ai; GitHub stops a job after 360 minutes
+        shell: bash
         run: |
           python tools/pr_benchmark/controller.py compare --repo "$GITHUB_REPOSITORY" --ref "$REF" \
             --base-ref "$BASE_REF" ${{ matrix.args }} --gpus ${{ matrix.gpus }} --state-dir "$RUNNER_TEMP/trl-bench" \
-            --timeout-minutes 240 --daily-compute-minutes 240 | tee -a "$GITHUB_STEP_SUMMARY"
+            --timeout-minutes 120 --queue-minutes 210 --daily-compute-minutes 240 | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload reports and profiles
         if: always()
