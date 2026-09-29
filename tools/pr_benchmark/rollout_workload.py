@@ -68,8 +68,11 @@ def annotate(method):
     return wrapped
 
 
-def policy_parity(trainer, history, directory, seed):
-    """Compare full next-token distributions of the local policy and vLLM on one fixed history."""
+def policy_parity(trainer, updated, history, directory, seed):
+    """Compare full next-token distributions of the local policy and vLLM on one fixed history.
+
+    `updated` are the trained parameters: LoRA B matrices, or the norm weights of a dense model.
+    """
     import numpy as np
     import torch
     from peft.tuners.tuners_utils import BaseTunerLayer
@@ -81,7 +84,7 @@ def policy_parity(trainer, history, directory, seed):
     engine.max_completion_length = 1
     engine.logprobs = -1
     engine.generation_kwargs = {}
-    lora_b = [param for name, param in model.named_parameters() if "lora_B" in name]
+    peft = any(isinstance(module, BaseTunerLayer) for module in model.modules())
     ids = torch.tensor([history], device="cuda")
     records, arrays = [], {}
 
@@ -107,16 +110,17 @@ def policy_parity(trainer, history, directory, seed):
 
     previous = None
     for stage_index, stage in enumerate(("dense", "lora", "updated_lora")):
-        # Only B changes, so each stage keeps the timed model's A matrices
+        # Only B changes, or a dense model's norm weights
         generator = torch.Generator(device="cuda").manual_seed(seed + stage_index)
         with torch.no_grad():
-            for param in lora_b:
-                if stage == "dense":
+            for param in updated:
+                if stage != "dense":
+                    noise = torch.empty_like(param).normal_(std=0.03 if stage == "lora" else 0.1, generator=generator)
+                    param.copy_(noise if peft else param + noise)
+                elif peft:
                     param.zero_()
-                else:
-                    param.normal_(std=0.03 if stage == "lora" else 0.1, generator=generator)
         reference = local()
-        if stage != "dense":
+        if peft and stage != "dense":
             # Unmerging is lossy, so keep exact copies to restore
             originals = {
                 param: param.detach().cpu().clone()
@@ -130,15 +134,19 @@ def policy_parity(trainer, history, directory, seed):
             with torch.no_grad():
                 for param, original in originals.items():
                     param.copy_(original)
-        # vLLM is asleep here, so generate publishes the current policy itself
+        # generate() only publishes stale weights
+        engine.sync_weights()
         _, _, logprobs, token_ids = engine.generate([history], images=None, num_generations=1)
+        # A merged adapter must be removed before the local model runs again
+        engine.sleep()
         actual = torch.full((model.config.vocab_size,), float("nan"))
         actual[torch.tensor(token_ids[0][0])] = torch.tensor(logprobs[0][0])
         if not torch.isfinite(actual).all():
             raise ValueError("Incomplete or non-finite full-vocabulary log probabilities")
         record(stage, reference, actual)
         if stage != "dense":
-            record(stage + "_merged_reference", merged_reference, actual)
+            if peft:
+                record(stage + "_merged_reference", merged_reference, actual)
             # Negative control: the previous policy stands in for a missed sync
             record(stage + "_stale_reference", previous, actual)
         # Publishing must not change the training policy
@@ -208,9 +216,14 @@ def main():
     # Full-vocabulary logprobs are only needed by the profiled diagnostic
     llm = partial(generation_module.LLM, max_logprobs=-1) if profiling else generation_module.LLM
     with patch.object(generation_module, "LLM", llm):
+        peft = config.get("peft", True)
+        # Only a checkout that supports it shares weights
+        share = "vllm_share_weights" in GRPOConfig.__dataclass_fields__
         trainer = GRPOTrainer(
             model=str(args.model_path),
-            peft_config=LoraConfig(r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM"),
+            peft_config=LoraConfig(r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM")
+            if peft
+            else None,
             processing_class=tokenizer,
             args=GRPOConfig(
                 output_dir=str(args.output.parent / "checkpoints"),
@@ -218,6 +231,8 @@ def main():
                 use_vllm=True,
                 vllm_mode="colocate",
                 vllm_enable_sleep_mode=True,
+                **({"vllm_share_weights": True} if share else {}),
+                **({"vllm_native_lora": True} if share and config.get("native_lora") else {}),
                 vllm_gpu_memory_utilization=0.35,
                 vllm_max_model_length=config["context_tokens"],
                 max_completion_length=config["completion_tokens"],
@@ -235,14 +250,15 @@ def main():
             rollout_func=rollout,
         )
     engine = trainer.vllm_generation
-    lora_b = [param for name, param in trainer.model.named_parameters() if "lora_B" in name]
+    updated = [param for name, param in trainer.model.named_parameters() if ("lora_B" if peft else "norm") in name]
+    # Dense snapshots are the whole model, so copy asynchronously into pinned memory
     frozen = {
-        name: param.detach().cpu().clone()
+        name: torch.empty(param.shape, dtype=param.dtype, pin_memory=True).copy_(param, non_blocking=True)
         for name, param in trainer.model.named_parameters()
-        if "base_layer.weight" in name
+        if ("base_layer.weight" in name if peft else "norm" not in name)
     }
 
-    # Count publications: full tensors via load_weights, native adapters via add_lora
+    # Count published tensors, native adapters and merged layers
     counters = {"weight_transfer_bytes": 0, "sync_count": 0, "load_weights_calls": 0, "add_lora_calls": 0}
     sync_weights = engine.sync_weights
     loader = engine.llm.llm_engine.model_executor.driver_worker.model_runner.model
@@ -252,7 +268,10 @@ def main():
     def counted_sync():
         counters["sync_count"] += 1
         with span("sync_weights", profiling):
-            return sync_weights()
+            sync_weights()
+        if share and peft and not config.get("native_lora"):
+            for view, _ in engine._merged_bases:
+                counters["weight_transfer_bytes"] += view.numel() * view.element_size()
 
     def counted_load(weights):
         counters["load_weights_calls"] += 1
@@ -281,16 +300,23 @@ def main():
         engine.llm.wake_up = annotate(engine.llm.wake_up)
         engine.llm.sleep = annotate(engine.llm.sleep)
         engine.llm.reset_prefix_cache = annotate(engine.llm.reset_prefix_cache)
+        if share:
+            engine._share_weights = annotate(engine._share_weights)
+        if share and peft:
+            engine.llm.llm_engine.remove_lora = annotate(engine.llm.llm_engine.remove_lora)
+            generation_module.get_peft_model_state_dict = annotate(generation_module.get_peft_model_state_dict)
+            generation_module.save_file = annotate(generation_module.save_file)
     # One process runs every seed, so model loading and vLLM startup happen once per side
     records = []
     for seed in args.seeds:
         seed_started = time.perf_counter()
         set_seed(seed)
         prompts = prompts_for(seed)
-        generator = torch.Generator(device="cuda").manual_seed(seed + 1000)
-        with torch.no_grad():
-            for param in lora_b:
-                param.normal_(std=0.01, generator=generator)
+        if peft:
+            generator = torch.Generator(device="cuda").manual_seed(seed + 1000)
+            with torch.no_grad():
+                for param in updated:
+                    param.normal_(std=0.01, generator=generator)
         durations, outputs = [], []
         sleeping = True
         torch.cuda.reset_peak_memory_stats()
@@ -303,7 +329,7 @@ def main():
             for phase in range(config["warmup_steps"] + config["steps"]):
                 # A real update between phases must invalidate the previous policy's KV
                 with torch.no_grad():
-                    for param in lora_b:
+                    for param in updated:
                         param.add_(0.001)
                 trainer.state.global_step = phase
                 if phase == config["warmup_steps"]:
@@ -342,7 +368,7 @@ def main():
             "output_tokens": outputs,
             "peak_memory_bytes": torch.cuda.max_memory_allocated(),
             "frozen_weight_max_abs_drift": max(
-                (param.detach().cpu() - frozen[name]).abs().float().max().item()
+                (param.detach() - frozen[name].to(param.device)).abs().max().item()
                 for name, param in trainer.model.named_parameters()
                 if name in frozen
             ),
@@ -357,7 +383,7 @@ def main():
         if profiling:
             # After the capture window, so the profile covers only complete rollout phases
             record["policy_parity"] = policy_parity(
-                trainer, tokenizer(prompts[0])["input_ids"], args.profile_dir, seed
+                trainer, updated, tokenizer(prompts[0])["input_ids"], args.profile_dir, seed
             )
             metadata = {
                 "manifest_id": manifest["id"],

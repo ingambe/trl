@@ -145,6 +145,7 @@ def rollout_measurements(measurements):
         ("stale_control", "quality_failed"),
         ("slower", "regression"),
         ("same_latency", "no_regression"),
+        ("both_share_weights", "improved"),
     ],
 )
 def test_rollout_quality_is_reported_beside_latency(rollout_measurements, damage, outcome):
@@ -162,8 +163,57 @@ def test_rollout_quality_is_reported_beside_latency(rollout_measurements, damage
     elif damage == "same_latency":
         for record in result["records"]:
             record["rollout_seconds"] = 10.0
+    elif damage == "both_share_weights":
+        for record in result["records"]:
+            record["weight_transfer_bytes"] = 0
     summary = comparison.compare(result, manifest)
     assert summary["outcome"] == outcome
     report = comparison.markdown(summary, {**manifest, "profile": "vllm-rollout"})
     assert "rollout_seconds" in report
     assert ("**FAIL**" in report) == (outcome == "quality_failed")
+
+
+@pytest.mark.parametrize(
+    "damage,outcome",
+    [
+        (None, "improved"),
+        ("outlier", "inconclusive"),
+        ("worse", "quality_failed"),
+        ("reward_drop", "inconclusive"),
+        ("missing", None),
+    ],
+)
+def test_grpo_quality_is_compared_per_seed(measurements, damage, outcome):
+    manifest, result = measurements
+    manifest["workload"].update(kind="grpo-train", peft=True, steps=3)
+    manifest["thresholds"] = {"train_seconds": 5.0, "steady_seconds": 5.0}
+    for index, record in enumerate(result["records"]):
+        head = record["side"] == "head"
+        gaps = [0.03 + 0.001 * index] * 3
+        if head and damage == "outlier" and index == 1:
+            gaps[2] = 0.1  # one diverged step, as main against main produces
+        elif head and damage == "worse":
+            gaps = [gap * 1.2 for gap in gaps]
+        elif head and damage == "missing" and index == 1:
+            gaps[2] = None
+        trajectory = [
+            {"loss": 0.1, "reward": 0.5, "grad_norm": 1.0, "sampling/sampling_logp_difference/mean": gap}
+            for gap in gaps
+        ]
+        record.update(
+            steps=3,
+            train_seconds=80.0 if head else 100.0,
+            steady_seconds=80.0 if head else 100.0,
+            generation_seconds=1.0,
+            update_seconds=1.0,
+            init_peak_device_bytes=1,
+            train_peak_device_bytes=1,
+            eval_reward=0.0 if head and damage == "reward_drop" and index < 4 else 0.5,
+            parameter_sum=1.0,
+            trajectory=trajectory,
+        )
+    if outcome is None:
+        with pytest.raises(ValueError):
+            comparison.compare(result, manifest)
+    else:
+        assert comparison.compare(result, manifest)["outcome"] == outcome

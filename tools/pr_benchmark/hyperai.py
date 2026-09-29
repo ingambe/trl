@@ -30,6 +30,7 @@ BUNDLE_FILES = (
     "job.py",
     "workload.py",
     "rollout_workload.py",
+    "grpo_workload.py",
     "environment.py",
     "requirements-gpu.txt",
     "manifest.json",

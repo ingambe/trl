@@ -211,6 +211,27 @@ training_args = RLOOConfig(
 </hfoption>
 </hfoptions>
 
+##### Sharing weights with the colocated engine
+
+With `vllm_share_weights=True`, the trained model uses vLLM's weight memory instead of its own copy: optimizer steps update vLLM in place, no weights are published, and sleep mode only releases the KV cache. It requires colocate mode without tensor parallelism, FSDP, ZeRO-3 or quantization.
+
+```python
+training_args = GRPOConfig(..., use_vllm=True, vllm_enable_sleep_mode=True, vllm_share_weights=True)
+```
+
+Sharing frees the trainer's copy of the weights. To give that memory to the KV cache instead, raise `vllm_gpu_memory_utilization` by about the weights' size divided by the GPU memory (+0.25 for a 3B bf16 model on 24 GB), or by less if startup, where both copies still exist, runs out of memory.
+
+With LoRA, vLLM must serve `W + BA` while the trainer trains `W`:
+
+| | Publication (default) | Merged (`vllm_share_weights=True`) | Native (`+ vllm_native_lora=True`) |
+|---|---|---|---|
+| Sync | Loads every weight and wakes the engine | Merges `BA` into the adapted layers on the GPU | Saves and loads the adapter |
+| Generation | Unchanged | Unchanged | Slower on every token |
+| Extra memory | A full copy of the weights | A copy of the adapted layers during generation (close to a model with `all-linear`) | None |
+| Tokens | Reference | Identical | Slightly different |
+
+Use **merged** by default, **native** only when merged mode's extra memory doesn't fit, and **publication** where sharing is unsupported (server mode, tensor parallelism, FSDP, ZeRO-3, quantization, or adapters other than a single plain LoRA). As an indication, merged mode cut GRPO training time by about 45% for Qwen2.5-0.5B-Instruct on one RTX 3090 and by 56% for Qwen2.5-3B-Instruct on two, while native mode made generation about 44% slower.
+
 #### Server Mode
 
 In **server mode**, vLLM runs as a separate process on dedicated GPUs and communicates with the trainer via HTTP.

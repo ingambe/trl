@@ -30,6 +30,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import quote
 
+import requests
 from analyze_profiles import analyze
 from compare import compare, markdown
 from environment import environment_spec
@@ -161,10 +162,12 @@ class GitHub:
         self.api(f"repos/{self.repo}/issues/{manifest['pr']}/comments", {"body": report})
 
 
-def manifest_for(github, pull, profile, environment_job=None, prepare=False, gpus=1):
+def manifest_for(github, pull, profile, environment_job=None, prepare=False, gpus=1, native_lora=False):
     config = json.loads((ROOT / "profiles.json").read_text())[profile]
     if gpus > 1:
         config["gpus"] = gpus
+    if native_lora:
+        config["native_lora"] = True
     manifest = {
         "schema": 1,
         "repo": github.repo,
@@ -179,6 +182,8 @@ def manifest_for(github, pull, profile, environment_job=None, prepare=False, gpu
         "thresholds": (
             {"rollout_seconds": 5.0, "weight_transfer_bytes": 0.0}
             if config.get("kind") == "vllm-rollout"
+            else {"train_seconds": 5.0, "steady_seconds": 5.0}
+            if config.get("kind") == "grpo-train"
             else {"train_seconds": 5.0, "steady_seconds": 5.0, "eval_loss": 1.0}
         ),
         "harness": {
@@ -216,12 +221,22 @@ def reserve(state, manifest, minutes, budget):
 
 
 def wait_for_job(provider, github, manifest, record, deadline, poll=30):
+    failures = 0
     while True:
         if time.time() >= deadline:
             raise TimeoutError("Compute job exceeded its allocation/queue deadline")
-        if not github.current(manifest):
-            raise InterruptedError("PR closed, became draft, or its base/head changed")
-        status = provider.status(record["job"]["id"])
+        try:
+            if not github.current(manifest):
+                raise InterruptedError("PR closed, became draft, or its base/head changed")
+            status = provider.status(record["job"]["id"])
+            failures = 0
+        except requests.RequestException:
+            # A transient API error must not cancel a healthy job
+            failures += 1
+            if failures == 5:
+                raise
+            time.sleep(min(poll * failures, max(0, deadline - time.time())))
+            continue
         if status in TERMINAL:
             if status != "SUCCEEDED":
                 raise RuntimeError(f"Compute job ended with {status}")
@@ -330,7 +345,19 @@ def main():
     parser.add_argument("--ref", default="main", help="Commit or ref to calibrate, or the candidate to compare")
     parser.add_argument("--base-ref", default="main", help="Base commit/ref for a pre-PR compare")
     parser.add_argument("--env-file", type=Path)
-    parser.add_argument("--profile", choices=["sft-3090", "smoke", "vllm-rollout"], default="sft-3090")
+    parser.add_argument(
+        "--profile",
+        choices=[
+            "sft-3090",
+            "smoke",
+            "vllm-rollout",
+            "vllm-rollout-dense",
+            "grpo-train-dense",
+            "grpo-train-lora",
+            "grpo-train-lora-3b",
+        ],
+        default="sft-3090",
+    )
     parser.add_argument("--serious", action="store_true", help="Longer vllm-rollout workload on one RTX 5090")
     parser.add_argument(
         "--gpus",
@@ -338,6 +365,9 @@ def main():
         choices=[1, 2],
         default=1,
         help="Data-parallel vllm-rollout on 2 RTX 3090 (else 2 RTX 5090)",
+    )
+    parser.add_argument(
+        "--native-lora", action="store_true", help="Serve the LoRA natively in vLLM on commits that support it"
     )
     parser.add_argument(
         "--author", action="append", help="Allowed PR author; default is your authenticated GitHub user"
@@ -356,8 +386,15 @@ def main():
         if args.profile != "vllm-rollout":
             parser.error("--serious requires --profile vllm-rollout")
         args.profile = "vllm-rollout-serious"
-    if args.gpus > 1 and not args.profile.startswith("vllm-rollout"):
-        parser.error("--gpus 2 requires a vllm-rollout profile")
+    if args.gpus > 1 and not args.profile.startswith(("vllm-rollout", "grpo-train")):
+        parser.error("--gpus 2 requires a vllm-rollout or grpo-train profile")
+    if args.native_lora and args.profile not in (
+        "vllm-rollout",
+        "vllm-rollout-serious",
+        "grpo-train-lora",
+        "grpo-train-lora-3b",
+    ):
+        parser.error("--native-lora requires a LoRA profile")
     if args.timeout_minutes <= 0 or args.daily_compute_minutes <= 0 or args.poll_seconds < 10:
         parser.error("Timeout/budget must be positive; polling must be at least 10 seconds")
     if args.command == "run" and not args.pr:
@@ -437,6 +474,7 @@ def main():
                     env.get("HYPERAI_ENVIRONMENT_JOB"),
                     args.command == "prepare",
                     args.gpus,
+                    args.native_lora,
                 )
                 if args.dry_run:
                     print(json.dumps(manifest, indent=2))  # noqa: T201
