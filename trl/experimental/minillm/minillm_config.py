@@ -44,6 +44,8 @@ class MiniLLMConfig(GRPOConfig):
             Discount factor for future rewards in reinforcement learning.
         length_normalization (`bool`, *optional*, defaults to `True`):
             Whether to apply length normalization to the rewards.
+        skip_zero_advantages (`bool`, *optional*, defaults to `False`):
+            Overrides [`GRPOConfig`]'s default: the distillation terms need the completions with zero advantage.
     """
 
     _VALID_DICT_FIELDS = GRPOConfig._VALID_DICT_FIELDS + ["teacher_model_init_kwargs"]
@@ -81,6 +83,12 @@ class MiniLLMConfig(GRPOConfig):
     length_normalization: bool = field(
         default=True,
         metadata={"help": "Whether to apply length normalization to the rewards."},
+    )
+    skip_zero_advantages: bool = field(
+        default=False,
+        metadata={
+            "help": "Overrides `GRPOConfig`'s default: the distillation terms need the completions with zero advantage."
+        },
     )
 
     def __post_init__(self):
