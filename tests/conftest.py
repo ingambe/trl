@@ -118,6 +118,16 @@ def _make_server_generation(accelerator, *, max_completion_length):
     return generation
 
 
+@pytest.fixture
+def server_generation():
+    """Provide single-process server-mode generation with a mocked client."""
+    with (
+        patch("trl.generation.vllm_generation.gather_object", side_effect=lambda values: values),
+        patch("trl.generation.vllm_generation.broadcast_object_list", return_value=None),
+    ):
+        yield _make_server_generation(SimpleNamespace(is_main_process=True, process_index=0), max_completion_length=32)
+
+
 def _make_server_tool_trainer(accelerator, num_samples):
     """Build a GRPO trainer whose tool loop and server generation run unchanged, with a mocked vLLM client."""
     trainer = object.__new__(GRPOTrainer)
