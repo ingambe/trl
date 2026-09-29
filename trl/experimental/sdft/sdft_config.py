@@ -161,6 +161,12 @@ class SDFTConfig(_BaseConfig):
             Control the tensor parallel size for vLLM. This setting only applies when `vllm_mode` is set to
             `'colocate'`. If you are using `vllm_mode='server'`, this parameter must be passed separately when
             launching the vLLM server via the `--vllm_tensor_parallel_size` flag.
+        vllm_share_weights (`bool`, *optional*, defaults to `False`):
+            Whether the trained model uses vLLM's weight memory, so no weights are published and sleep only releases
+            the KV cache. Requires colocate mode without tensor parallelism, FSDP, ZeRO-3 or quantization. See the vLLM
+            integration guide.
+        vllm_native_lora (`bool`, *optional*, defaults to `False`):
+            With `vllm_share_weights=True` and PEFT, serve the adapter as a native vLLM LoRA instead of merging it.
         vllm_gpu_memory_utilization (`float`, *optional*, defaults to `0.3`):
             Control the GPU memory utilization for vLLM. This setting only applies when `vllm_mode` is set to
             `'colocate'`. If you are using `vllm_mode='server'`, this parameter must be passed separately when
@@ -355,6 +361,21 @@ class SDFTConfig(_BaseConfig):
         default=1,
         metadata={
             "help": "Control the tensor parallel size for vLLM. This setting only applies when `vllm_mode` is set to `'colocate'`. If you are using `vllm_mode='server'`, this parameter must be passed separately when launching the vLLM server via the `--vllm_tensor_parallel_size` flag."
+        },
+    )
+    vllm_share_weights: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether the trained model uses vLLM's weight memory, so no weights are published and sleep only "
+            "releases the KV cache. Requires colocate mode without tensor parallelism, FSDP, ZeRO-3 or quantization. "
+            "See the vLLM integration guide."
+        },
+    )
+    vllm_native_lora: bool = field(
+        default=False,
+        metadata={
+            "help": "With `vllm_share_weights=True` and PEFT, serve the adapter as a native vLLM LoRA instead of "
+            "merging it."
         },
     )
     vllm_gpu_memory_utilization: float = field(
