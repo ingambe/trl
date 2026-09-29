@@ -1813,9 +1813,12 @@ class TestGRPOTrainer(TrlTestCase):
             assert "old_per_token_logps" not in inputs
             loss = original_compute_loss(model, inputs)
             losses.append(loss)
-            # Snapshot the divergence metric here: `_metrics` is cleared on every log.
-            for key in ["sampling/sampling_logp_difference/mean", "sampling/sampling_logp_difference/max"]:
-                recorded_metrics.extend((key, value) for value in trainer._metrics["train"][key])
+            # Snapshot the divergence metric here: pending metrics are cleared on every log.
+            for key in [
+                ("sampling/sampling_logp_difference/mean", "mean"),
+                ("sampling/sampling_logp_difference/max", "max"),
+            ]:
+                recorded_metrics.extend((key, value) for value in trainer._pending_loss_metrics["train"][key])
             return loss
 
         trainer._compute_loss = record_loss
@@ -1833,7 +1836,7 @@ class TestGRPOTrainer(TrlTestCase):
         # rather than NaN.
         assert recorded_metrics, "the divergence metric was never recorded, so nothing was verified"
         for key, value in recorded_metrics:
-            assert torch.isfinite(torch.tensor(value)), f"{key} became NaN because of an unscorable token"
+            assert torch.isfinite(value), f"{key} became NaN because of an unscorable token"
 
         # And a third: the off-policy mask. The threshold above is far larger than any real sequence KL, so every
         # sequence must be kept. A NaN sequence KL compares false against it, which would silently drop exactly the
