@@ -16,8 +16,11 @@ import gc
 import logging
 import os
 import sys
+import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -82,6 +85,117 @@ def pytest_runtest_makereport(item, call):
                 exc.__traceback__ = None
             stack.append(exc.__context__)
             stack.append(exc.__cause__)
+
+
+def _make_server_generation(accelerator, *, max_completion_length):
+    """Keep the real server batching code and replace only the client that sends generation requests."""
+    generation = object.__new__(VLLMGeneration)
+    generation.accelerator = accelerator
+    generation.mode = "server"
+    generation._weights_dirty = False
+    generation.temperature = 1.0
+    generation.top_p = 1.0
+    generation.top_k = -1
+    generation.min_p = None
+    generation.repetition_penalty = 1.0
+    generation.max_completion_length = max_completion_length
+    generation.logprobs = 0
+    generation.structured_outputs_regex = None
+    generation.generation_kwargs = {}
+
+    def generate_from_submitted_histories(prompts, n, **sampling_kwargs):
+        # Match vLLM's prompt-major ordering and n outputs per submitted history. Answers encode the tool result
+        # the server actually saw: 30 -> 130, 35 -> 135. Never infer an answer from the intended recipient.
+        tool_results = [prompt[-1] for prompt in prompts for _ in range(n)]
+        return {
+            "prompt_ids": prompts,
+            "completion_ids": [[result + 100] for result in tool_results],
+            "logprobs": [[[-result / 100]] for result in tool_results],
+            "logprob_token_ids": [[[result + 100]] for result in tool_results],
+        }
+
+    generation.vllm_client = SimpleNamespace(generate=Mock(side_effect=generate_from_submitted_histories))
+    return generation
+
+
+def _make_server_tool_trainer(accelerator, num_samples):
+    """Build a GRPO trainer whose tool loop and server generation run unchanged, with a mocked vLLM client."""
+    trainer = object.__new__(GRPOTrainer)
+    trainer.accelerator = accelerator
+    trainer.args = SimpleNamespace(report_to=[])
+    trainer.model = SimpleNamespace(training=True, config=SimpleNamespace(max_position_embeddings=128))
+    trainer.state = SimpleNamespace(global_step=0)
+    trainer._last_loaded_step = 0
+    trainer.use_vllm = True
+    trainer._tokenizer = SimpleNamespace(eos_token_id=2, pad_token_id=0)
+    trainer.vllm_mode = "server"
+    trainer.num_generations = 2
+    trainer.max_tool_calling_iterations = 1
+    trainer.max_completion_length = 32
+    trainer._is_vlm = False
+    trainer.vllm_generation = _make_server_generation(
+        trainer.accelerator, max_completion_length=trainer.max_completion_length
+    )
+
+    def calculator(result):
+        return result
+
+    trainer._sync_tool_dicts = [{"calculator": calculator} for _ in range(num_samples)]
+    trainer._async_tool_dicts = [{} for _ in range(num_samples)]
+    return trainer
+
+
+def _encode_tool_result(messages):
+    # Synthetic tokenization: a result of "30" becomes token 30.
+    return [int(messages[-1]["content"])]
+
+
+def _decode_assistant_response(tokenizer, ids, prefix):
+    return {"role": "assistant", "content": str(ids[0])}
+
+
+@pytest.fixture
+def two_rank_server_tool_trainers():
+    """Run a function on two ranks in threads, with collectives that block until both ranks call them."""
+    barrier = threading.Barrier(2, timeout=5)
+    slots = [None, None]
+    local = threading.local()
+
+    def all_gather(obj):
+        slots[local.rank] = obj
+        barrier.wait()
+        gathered = list(slots)
+        barrier.wait()
+        return gathered
+
+    def gather_object(values):
+        return [value for rank_values in all_gather(values) for value in rank_values]
+
+    def broadcast_object_list(obj_list, from_process=0):
+        obj_list[0] = all_gather(obj_list[0])[from_process]
+
+    def run_on_ranks(num_samples_per_rank, fn):
+        def run(rank):
+            local.rank = rank
+            accelerator = SimpleNamespace(
+                device=torch.device("cpu"),
+                is_main_process=rank == 0,
+                process_index=rank,
+                gather=lambda tensor: torch.stack(all_gather(tensor)),
+            )
+            trainer = _make_server_tool_trainer(accelerator, num_samples=num_samples_per_rank[rank])
+            with patch.object(trainer, "_get_tool_suffix_ids", side_effect=_encode_tool_result):
+                return trainer, fn(rank, trainer)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            return [future.result() for future in [executor.submit(run, rank) for rank in range(2)]]
+
+    with (
+        patch("trl.trainer.grpo_trainer.parse_response", side_effect=_decode_assistant_response),
+        patch("trl.generation.vllm_generation.gather_object", side_effect=gather_object),
+        patch("trl.generation.vllm_generation.broadcast_object_list", side_effect=broadcast_object_list),
+    ):
+        yield run_on_ranks
 
 
 # ============================================================================
