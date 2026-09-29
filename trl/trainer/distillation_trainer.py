@@ -155,7 +155,9 @@ def _chunk(h_s, w_s, b_s, s_scale, s_softcap, h_t, w_t, b_t, t_scale, t_softcap,
 
     # A chunk's tail may hold positions packed out of the valid prefix; zero those rows before summing.
     per_token_jsd = jsd.sum(dim=-1) * valid
-    per_token_entropy = -(student_log_probs.exp() * student_log_probs).sum(dim=-1) * valid
+    # Without grad, the checkpoint recomputation in backward stops before this metric
+    with torch.no_grad():
+        per_token_entropy = -(student_log_probs.exp() * student_log_probs).sum(dim=-1) * valid
     return per_token_jsd.sum(), per_token_entropy.sum()
 
 
