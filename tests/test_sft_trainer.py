@@ -485,6 +485,29 @@ class TestSFTTrainer(TrlTestCase):
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
+    @pytest.mark.parametrize(
+        "config_kwargs, trainer_kwargs",
+        [
+            ({}, {"compute_loss_func": lambda outputs, labels, num_items_in_batch: outputs.logits.mean()}),
+            ({"label_smoothing_factor": 0.1}, {}),
+        ],
+    )
+    def test_train_chunked_nll_with_labels_consumed_before_forward(self, config_kwargs, trainer_kwargs):
+        dataset = Dataset.from_dict({"text": ["The sky is blue.", "Hello world"]})
+        training_args = SFTConfig(
+            output_dir=self.tmp_dir, loss_type="chunked_nll", max_steps=1, report_to="none", **config_kwargs
+        )
+        trainer = SFTTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            args=training_args,
+            train_dataset=dataset,
+            **trainer_kwargs,
+        )
+
+        trainer.train()
+
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+
     def test_train_nll_loss(self):
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
