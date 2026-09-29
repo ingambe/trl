@@ -352,6 +352,7 @@ def main():
             "smoke",
             "vllm-rollout",
             "vllm-rollout-dense",
+            "vllm-rollout-medium",
             "grpo-train-dense",
             "grpo-train-dense-binary",
             "grpo-train-lora",
@@ -391,6 +392,7 @@ def main():
         parser.error("--gpus 2 requires a vllm-rollout or grpo-train profile")
     if args.native_lora and args.profile not in (
         "vllm-rollout",
+        "vllm-rollout-medium",
         "vllm-rollout-serious",
         "grpo-train-lora",
         "grpo-train-lora-3b",
