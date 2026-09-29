@@ -2385,6 +2385,14 @@ class TestSFTTrainer(TrlTestCase):
         assert trainer.model.config.get_text_config().pad_token_id == pad_token_id
         assert trainer.model.generation_config.pad_token_id == pad_token_id
 
+    def test_eos_appended_to_custom_dataset_text_field(self):
+        dataset = Dataset.from_dict({"content": ["The sky is blue."]})
+        training_args = SFTConfig(output_dir=self.tmp_dir, dataset_text_field="content", report_to="none")
+        trainer = SFTTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", args=training_args, train_dataset=dataset
+        )
+        assert trainer.train_dataset[0]["input_ids"][-1] == trainer.processing_class.eos_token_id
+
     @pytest.mark.parametrize(
         "generation_eos_token_id, expected_eos_token_ids",
         [
