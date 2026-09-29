@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import inspect
 import os
 from collections.abc import Callable
@@ -5007,3 +5008,41 @@ def test_cast_lm_head_to_fp32_sets_vllm_head_dtype(tiny_llama, tmp_path):
         )
 
     assert llm.call_args.kwargs["hf_overrides"] == {"head_dtype": "float32"}
+
+
+@pytest.mark.parametrize("loss_type", ["grpo", "dapo"])
+def test_skip_zero_advantages_keeps_the_update(tiny_llama, tmp_path, loss_type):
+    model, tokenizer = tiny_llama
+
+    def reward(completions, constant, **kwargs):
+        # A constant reward gives its whole group a zero advantage
+        return [1.0 if c else float(i % 2) for i, c in enumerate(constant)]
+
+    updated, num_rows = {}, {}
+    for skip in (False, True):
+        trainer = GRPOTrainer(
+            model=copy.deepcopy(model),
+            processing_class=tokenizer,
+            reward_funcs=reward,
+            args=GRPOConfig(
+                output_dir=str(tmp_path),
+                report_to="none",
+                bf16=False,
+                loss_type=loss_type,
+                optim="sgd",  # unlike Adam or clipping, keeps the update proportional to the gradient
+                max_grad_norm=0.0,
+                learning_rate=0.1,
+                per_device_train_batch_size=4,
+                num_generations=2,
+                max_completion_length=4,
+                max_steps=1,
+                skip_zero_advantages=skip,
+            ),
+            train_dataset=Dataset.from_dict({"prompt": ["a", "a a"], "constant": [True, False]}),
+        )
+        trainer.train()
+        updated[skip] = {n: p.detach().clone() for n, p in trainer.model.named_parameters()}
+        num_rows[skip] = len(trainer._buffered_inputs[0]["advantages"])
+
+    assert num_rows == {False: 4, True: 2}
+    torch.testing.assert_close(updated[True], updated[False])

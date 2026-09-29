@@ -191,6 +191,12 @@ class RLOOConfig(_BaseConfig):
             When enabled, truncated completions are excluded from the loss calculation, preventing them from being
             incorrectly penalized and introducing noise during training. According to the
             [DAPO](https://huggingface.co/papers/2503.14476) paper, this is a good practice for training stability.
+        skip_zero_advantages (`bool`, *optional*, defaults to `True`):
+            Whether to skip the forward and backward passes of completions whose advantage is exactly zero, such as
+            groups whose completions all get the same reward. They don't contribute to the loss, so the update is
+            unchanged, but the logged `entropy` and `clip_ratio/*` metrics only cover the remaining completions, and
+            training is not bitwise identical to training on every completion. Turned off, with a warning, when a
+            router auxiliary loss needs these completions.
         sync_ref_model (`bool`, *optional*, defaults to `False`):
             Whether to synchronize the reference model with the active model every `ref_model_sync_steps` steps, using
             the `ref_model_mixup_alpha` parameter. This synchronization originates from the
@@ -561,6 +567,16 @@ class RLOOConfig(_BaseConfig):
             "help": "When enabled, truncated completions are excluded from the loss calculation, preventing them from "
             "being incorrectly penalized and introducing noise during training. According to the DAPO paper, this is "
             "a good practice for training stability."
+        },
+    )
+    skip_zero_advantages: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to skip the forward and backward passes of completions whose advantage is exactly zero, "
+            "such as groups whose completions all get the same reward. They don't contribute to the loss, so the "
+            "update is unchanged, but the logged `entropy` and `clip_ratio/*` metrics only cover the remaining "
+            "completions, and training is not bitwise identical to training on every completion. Turned off, with a "
+            "warning, when a router auxiliary loss needs these completions."
         },
     )
     sync_ref_model: bool = field(

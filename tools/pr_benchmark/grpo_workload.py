@@ -62,6 +62,10 @@ def main():
 
     # Deterministic reward with a learnable target: completions of `target_chars` characters score 1
     def reward(completions, **kwargs):
+        if config.get("binary_reward"):
+            return [
+                float(abs(len(text) - config["target_chars"]) <= config["target_chars"] / 4) for text in completions
+            ]
         return [max(0.0, 1 - abs(len(text) - config["target_chars"]) / config["target_chars"]) for text in completions]
 
     class Timer(TrainerCallback):
