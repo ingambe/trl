@@ -138,6 +138,39 @@ def _variable_length_dataset():
     )
 
 
+@pytest.mark.parametrize(
+    "iw_opd_loss_trainer, uses_global_count",
+    [
+        ((False, "jsd", 0, 0.5), True),
+        ((False, "jsd", 1, 0.5), True),
+        ((False, "iw_opd", 0, 0.5), True),
+        ((True, "iw_opd", 1, 0.5), True),
+        ((True, "jsd", 1, 0.5), False),
+        ((True, "jsd", 1, 0.0), False),
+    ],
+    indirect=["iw_opd_loss_trainer"],
+)
+def test_loss_undoes_ddp_averaging_only_for_global_token_counts(iw_opd_loss_trainer, uses_global_count):
+    trainer, inputs = iw_opd_loss_trainer
+    num_tokens = (inputs["labels"] != -100).sum()
+    loss = trainer.compute_loss(trainer.model, inputs, num_items_in_batch=num_tokens)
+    parameters = tuple(trainer.model.parameters())
+    gradients = torch.autograd.grad(loss, parameters)
+
+    trainer.accelerator.num_processes = 2
+    loss_two_ranks = trainer.compute_loss(trainer.model, inputs, num_items_in_batch=2 * num_tokens)
+    gradients_two_ranks = torch.autograd.grad(loss_two_ranks, parameters)
+    torch.testing.assert_close(loss_two_ranks, loss)
+    for actual, expected in zip(gradients_two_ranks, gradients, strict=True):
+        torch.testing.assert_close(actual, expected)
+
+    loss_no_count = trainer.compute_loss(trainer.model, inputs)
+    torch.testing.assert_close(loss_no_count, loss)
+    trainer.args.average_tokens_across_devices = False
+    loss_local_count = trainer.compute_loss(trainer.model, inputs, num_items_in_batch=2 * num_tokens)
+    torch.testing.assert_close(loss_local_count, loss / 2 if uses_global_count else loss)
+
+
 def test_distillation_config_rejects_invalid_reverse_kl_top_1_mode(tmp_path):
     with pytest.raises(ValueError, match="reverse_kl_top_1_mode must be one of"):
         IWOPDConfig(**_make_distillation_config_kwargs(tmp_path), reverse_kl_top_1_mode="invalid")
