@@ -14,6 +14,7 @@
 
 import json
 import pathlib
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -1143,6 +1144,20 @@ class TestSFTTrainer(TrlTestCase):
         # Check the number of sequences in train and eval datasets
         assert len(trainer.train_dataset["input_ids"]) == 3  # w/ this dataset, we end up with 46 seqs
         assert len(trainer.eval_dataset["input_ids"]) == 1  # w/ this dataset, we end up with 6 seqs
+
+    @ignore_warnings(message="You are using packing, but the attention implementation is not.*", category=UserWarning)
+    @ignore_warnings(message="Padding-free training is enabled, but the attention.*", category=UserWarning)
+    def test_evaluate_dict_keeps_packed_documents(self):
+        dataset = Dataset.from_dict({"input_ids": [[1, 2, 3], [4, 5]]})
+        training_args = SFTConfig(output_dir=self.tmp_dir, packing=True, max_length=8, report_to="none")
+        trainer = SFTTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", args=training_args, train_dataset=dataset
+        )
+
+        with patch.object(trainer, "get_eval_dataloader", wraps=trainer.get_eval_dataloader) as get_eval_dataloader:
+            trainer.evaluate({"held_out": dataset})
+
+        assert get_eval_dataloader.call_args.args[0]["seq_lengths"][:] == [[3, 2]]
 
     @ignore_warnings(message="You are using packing, but the attention implementation is not.*", category=UserWarning)
     @ignore_warnings(message="Padding-free training is enabled, but the attention.*", category=UserWarning)
