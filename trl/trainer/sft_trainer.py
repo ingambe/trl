@@ -1510,7 +1510,14 @@ class SFTTrainer(_BaseTrainer):
         # padding-free), so we override the default signature columns to keep it alongside the model inputs.
         if self._signature_columns is None:
             if self._is_vision_dataset:
-                self._signature_columns = ["messages", "prompt", "completion", "image", "images"]
+                self._signature_columns = [
+                    "messages",
+                    self.args.dataset_text_field,
+                    "prompt",
+                    "completion",
+                    "image",
+                    "images",
+                ]
             else:
                 self._signature_columns = ["input_ids", "labels", "seq_lengths"]
 
