@@ -14,10 +14,12 @@
 
 import os
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 import torch.nn.functional as F
+from accelerate import Accelerator
 from datasets import Dataset, DatasetDict, IterableDatasetDict, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
@@ -564,3 +566,68 @@ class TestGKDTrainer(TrlTestCase):
         # If the loss covers every valid completion token, the global-count reduction (sum / num_valid) equals the
         # local mean. The old prompt-width slice summed FEWER tokens than num_valid, so loss_global != loss_mean.
         torch.testing.assert_close(loss_global, loss_mean, rtol=1e-4, atol=1e-6)
+
+    def test_loss_undoes_ddp_averaging_of_the_global_token_count(self):
+        dataset = Dataset.from_dict(
+            {"messages": [[{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello there"}]] * 2}
+        )
+        training_args = GKDConfig(output_dir=self.tmp_dir, report_to="none", average_tokens_across_devices=True)
+        trainer = GKDTrainer(
+            model=self.model_id,
+            teacher_model=self.model_id,
+            args=training_args,
+            train_dataset=dataset,
+            processing_class=self.tokenizer,
+        )
+        with torch.no_grad():
+            for p in trainer.teacher_model.parameters():
+                p.add_(0.5 * torch.randn_like(p))
+        device = next(trainer.model.parameters()).device
+        batch = trainer.data_collator([trainer.train_dataset[i] for i in range(2)])
+        batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+        num_items = (batch["labels"][:, 1:] != -100).sum()
+
+        with torch.no_grad():
+            loss = trainer.compute_loss(trainer.model, batch, num_items_in_batch=num_items)
+            with patch.object(Accelerator, "num_processes", 2):
+                loss_two_ranks = trainer.compute_loss(trainer.model, batch, num_items_in_batch=num_items)
+
+        torch.testing.assert_close(loss_two_ranks, 2 * loss)
+
+    def test_on_policy_loss_normalizes_by_generated_tokens_of_the_window(self):
+        dataset = Dataset.from_dict(
+            {"messages": [[{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "OK"}]] * 2}
+        )
+        training_args = GKDConfig(
+            output_dir=self.tmp_dir,
+            report_to="none",
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=2,
+            max_steps=1,
+            lmbda=1.0,
+            max_new_tokens=8,
+        )
+        trainer = GKDTrainer(
+            model=self.model_id,
+            teacher_model=self.model_id,
+            args=training_args,
+            train_dataset=dataset,
+            processing_class=self.tokenizer,
+        )
+        trainer.generation_config.eos_token_id = None  # Disable early stopping.
+
+        lengths = iter([1, 8])
+        generate = GKDTrainer.generate_on_policy_outputs
+
+        def generate_with_length(model, inputs, generation_config):
+            input_ids, attention_mask, labels = generate(model, inputs, generation_config)
+            labels[(labels != -100).cumsum(dim=1) > next(lengths)] = -100
+            return input_ids, attention_mask, labels
+
+        with (
+            patch.object(GKDTrainer, "generate_on_policy_outputs", side_effect=generate_with_length),
+            patch.object(GKDTrainer, "generalized_jsd_loss", wraps=GKDTrainer.generalized_jsd_loss) as loss_fn,
+        ):
+            trainer.train()
+
+        assert [call.kwargs["num_items_in_batch"] for call in loss_fn.call_args_list] == [9, 9]
