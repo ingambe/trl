@@ -479,8 +479,7 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
         input_ids = [example["input_ids"] for example in examples]
         batch_seq_lengths = [example["seq_lengths"] for example in examples] if "seq_lengths" in examples[0] else None
         labels = [example.get("labels", example["input_ids"]) for example in examples]
-        # Packed examples are kept apart only by their position IDs, so collate them padding-free unless the position
-        # IDs are already returned (sequence parallelism)
+        # Packed examples need padding-free collation unless position IDs are already returned.
         padding_free = self.padding_free or (batch_seq_lengths is not None and not self.return_position_ids)
 
         # Convert to tensor
