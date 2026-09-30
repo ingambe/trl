@@ -419,6 +419,9 @@ def test_generate_on_policy_for_slices_uses_prompt_attention_mask_for_vllm_promp
         def sync_weights(self):
             self.sync_calls += 1
 
+        def sleep(self):
+            pass
+
         def generate(self, prompts, images, num_generations):
             self.prompts = prompts
             assert images is None
@@ -508,6 +511,9 @@ def test_generate_on_policy_for_slices_reconstructs_prompt_with_special_tokens()
 
         def sync_weights(self):
             self.sync_calls += 1
+
+        def sleep(self):
+            pass
 
         def generate(self, prompts, images, num_generations):
             self.prompts = prompts
@@ -599,6 +605,9 @@ def test_on_policy_prompt_text_reflects_truncated_prompt():
             self.prompts = None
 
         def sync_weights(self):
+            pass
+
+        def sleep(self):
             pass
 
         def generate(self, prompts, images, num_generations):
@@ -879,6 +888,8 @@ def test_gold_trainer_init_defaults_vllm_max_model_length_to_max_length(monkeypa
         vllm_gpu_memory_utilization=0.2,
         vllm_max_model_length=None,
         vllm_enable_sleep_mode=False,
+        vllm_share_weights=False,
+        vllm_native_lora=False,
         vllm_model_impl="vllm",
         vllm_sync_frequency=1,
     )
@@ -2627,6 +2638,8 @@ def test_gold_trainer_vlm_vllm_init_uses_identity_collator(monkeypatch):
         vllm_gpu_memory_utilization=0.2,
         vllm_max_model_length=None,
         vllm_enable_sleep_mode=False,
+        vllm_share_weights=False,
+        vllm_native_lora=False,
         vllm_model_impl="vllm",
         vllm_sync_frequency=1,
     )
@@ -2719,6 +2732,8 @@ def _make_vlm_trainer_args(use_vllm=False):
         vllm_gpu_memory_utilization=0.2,
         vllm_max_model_length=None,
         vllm_enable_sleep_mode=False,
+        vllm_share_weights=False,
+        vllm_native_lora=False,
         vllm_model_impl="vllm",
         vllm_sync_frequency=1,
         # ULD-specific defaults (needed when use_uld_loss=True)
@@ -3158,6 +3173,9 @@ def test_on_policy_vlm_vllm_does_not_duplicate_repeated_sampler_batch(monkeypatc
 
     class StubVLLMGeneration:
         def sync_weights(self):
+            pass
+
+        def sleep(self):
             pass
 
         def generate(self, prompts, images, num_generations):
