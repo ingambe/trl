@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""One GRPO training run with colocated vLLM. Invoked in a fresh process for each commit/seed on the GPU worker."""
+"""One GRPO training run on a seeded tool-calling game with colocated vLLM. Invoked in a fresh process per commit."""
 
 import argparse
 import importlib.metadata
@@ -27,19 +27,19 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from games import GAMES
+
 
 # Metrics compared step by step between base and PR
-TRAJECTORY = ("loss", "reward", "grad_norm", "sampling/sampling_logp_difference/mean")
+TRAJECTORY = ("loss", "reward", "grad_norm", "completions/mean_length", "sampling/sampling_logp_difference/mean")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--checkout", type=Path, required=True)
-    parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--side", choices=["base", "head"], required=True)
-    parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     sys.path.insert(0, str(args.checkout))
@@ -54,20 +54,17 @@ def main():
 
     config = json.loads(args.manifest.read_text())["workload"]
     rank = int(os.environ.get("RANK", "0"))
-    set_seed(args.seed)
+    set_seed(config["seed"])
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, local_files_only=True)
-    tokenizer.padding_side = "left"
-    data = json.loads(args.data.read_text())
-    train_prompts = [tokenizer.decode(ids[: config["prompt_tokens"]]) for ids in data["train"]]
-    eval_prompts = [tokenizer.decode(ids[: config["prompt_tokens"]]) for ids in data["eval"]]
+    game, prompt = GAMES[config["game"]]
+    # Held-out games never appear in training
+    eval_seeds = list(range(10**6, 10**6 + config["eval_games"]))
 
-    # Deterministic reward with a learnable target: completions of `target_chars` characters score 1
-    def reward(completions, **kwargs):
-        if config.get("binary_reward"):
-            return [
-                float(abs(len(text) - config["target_chars"]) <= config["target_chars"] / 4) for text in completions
-            ]
-        return [max(0.0, 1 - abs(len(text) - config["target_chars"]) / config["target_chars"]) for text in completions]
+    def games(seeds):
+        return Dataset.from_dict({"prompt": [[{"role": "user", "content": prompt}]] * len(seeds), "seed": seeds})
+
+    def reward(environments, **kwargs):
+        return [env.reward for env in environments]
 
     class Timer(TrainerCallback):
         def on_step_begin(self, args, state, control, **kwargs):
@@ -76,8 +73,17 @@ def main():
 
         def on_step_end(self, args, state, control, **kwargs):
             torch.cuda.synchronize()
-            if state.global_step > config["warmup_steps"]:
-                timings["steady_seconds"] += time.perf_counter() - self.step_started
+            step_seconds[state.global_step] = time.perf_counter() - self.step_started
+            # Every rank stops at the same step once the time budget is spent
+            over = torch.tensor(time.perf_counter() - started > 60 * config["train_minutes"], device="cuda")
+            control.should_training_stop = bool(trainer.accelerator.gather(over).any())
+
+    class FrozenStart(TrainerCallback):
+        # The first steps run every code path with a zero learning rate, so both commits time the same policy
+        def on_pre_optimizer_step(self, args, state, control, optimizer, **kwargs):
+            if state.global_step < config["warmup_steps"] + config["speed_steps"]:
+                for group in optimizer.param_groups:
+                    group["lr"] = 0.0
 
     class MemoryBreakdown(TrainerCallback):
         # Training peaks after backward
@@ -119,7 +125,7 @@ def main():
             done.set()
             thread.join()
 
-    timings = {"steady_seconds": 0.0, "generation_seconds": 0.0}
+    step_seconds, generation_seconds = {}, {}
     device = {}
     breakdown = {}
     share = "vllm_share_weights" in GRPOConfig.__dataclass_fields__
@@ -139,28 +145,33 @@ def main():
                 vllm_gpu_memory_utilization=0.35,
                 vllm_max_model_length=config["context_tokens"],
                 max_completion_length=config["completion_tokens"],
+                max_tool_calling_iterations=7,
                 num_generations=config["num_generations"],
+                num_generations_eval=1,
                 per_device_train_batch_size=config["batch_size"],
+                per_device_eval_batch_size=config["eval_games"] // config.get("gpus", 1),
                 gradient_accumulation_steps=1,
-                max_steps=config["steps"],
+                max_steps=config["max_steps"],
                 learning_rate=config["learning_rate"],
                 lr_scheduler_type="constant",
                 warmup_steps=0,
                 weight_decay=0.0,
                 optim="adamw_torch",
                 bf16=True,
-                seed=args.seed,
-                data_seed=args.seed,
+                seed=config["seed"],
+                data_seed=config["seed"],
                 logging_steps=1,
                 report_to="none",
                 save_strategy="no",
                 disable_tqdm=True,
             ),
-            train_dataset=Dataset.from_dict({"prompt": train_prompts}),
+            train_dataset=games(list(range(config["max_steps"] * config["batch_size"]))),
+            eval_dataset=games(eval_seeds),
+            environment_factory=game,
             peft_config=LoraConfig(r=16, lora_alpha=32, target_modules="all-linear", task_type="CAUSAL_LM")
             if config.get("peft")
             else None,
-            callbacks=[Timer(), MemoryBreakdown()],
+            callbacks=[Timer(), FrozenStart(), MemoryBreakdown()],
         )
     # Per-request sampling seeds, so a token flipped by rounding changes one completion instead of the whole batch
     llm = trainer.vllm_generation.llm
@@ -171,7 +182,7 @@ def main():
         call = next(calls)
         requests = [sampling_params.clone() for _ in prompts]
         for index, request in enumerate(requests):
-            request.seed = hash((args.seed, rank, call, index)) % 2**31
+            request.seed = hash((config["seed"], rank, call, index)) % 2**31
         return generate(prompts, sampling_params=requests, **kwargs)
 
     llm.generate = seeded_generate
@@ -182,11 +193,12 @@ def main():
         started = time.perf_counter()
         output = generate_and_score(inputs)
         torch.cuda.synchronize()
-        if trainer.state.global_step >= config["warmup_steps"]:
-            timings["generation_seconds"] += time.perf_counter() - started
+        if trainer.model.training:
+            generation_seconds[trainer.state.global_step + 1] = time.perf_counter() - started
         return output
 
     trainer._generate_and_score_completions = timed_generate_and_score
+    initial_eval_reward = trainer.evaluate()["eval_reward"]
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
@@ -195,38 +207,26 @@ def main():
         torch.cuda.synchronize()
     train_seconds = time.perf_counter() - started
     peak = torch.cuda.max_memory_allocated()
-    if trainer.state.global_step != config["steps"]:
-        raise RuntimeError("Training stopped before the requested step count")
     trajectory = [{key: r.get(key) for key in TRAJECTORY} for r in trainer.state.log_history if "loss" in r]
     if any(not math.isfinite(value) for step in trajectory for value in step.values() if value is not None):
         raise RuntimeError("Non-finite training metric")
+    eval_reward = trainer.evaluate()["eval_reward"]
     if rank > 0:
         return
 
-    # Held-out quality: greedy completions outside vLLM
-    model = trainer.accelerator.unwrap_model(trainer.model)
-    model.eval()
-    batch = tokenizer(eval_prompts, return_tensors="pt", padding=True).to(model.device)
-    with torch.inference_mode():
-        generated = model.generate(
-            **batch, max_new_tokens=config["completion_tokens"], do_sample=False, pad_token_id=tokenizer.pad_token_id
-        )
-    completions = tokenizer.batch_decode(generated[:, batch["input_ids"].shape[1] :], skip_special_tokens=True)
-    with torch.no_grad():
-        fingerprint = sum(param.double().sum().item() for param in model.parameters())
+    steps = range(1, trainer.state.global_step + 1)
     record = {
         "side": args.side,
-        "seed": args.seed,
         "sha": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=args.checkout, text=True).strip(),
         "steps": trainer.state.global_step,
         "train_seconds": train_seconds,
-        **timings,
-        "update_seconds": timings["steady_seconds"] - timings["generation_seconds"],
+        "step_seconds": [step_seconds[step] for step in steps],
+        "generation_seconds": [generation_seconds[step] for step in steps],
         "peak_memory_bytes": peak,
         **device,
         "train_peak_breakdown": breakdown,
-        "eval_reward": sum(reward(completions)) / len(completions),
-        "parameter_sum": fingerprint,
+        "initial_eval_reward": initial_eval_reward,
+        "eval_reward": eval_reward,
         "trajectory": trajectory,
         "environment": {
             "gpu": torch.cuda.get_device_name(),
