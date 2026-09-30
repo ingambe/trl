@@ -1838,7 +1838,7 @@ class SFTTrainer(_BaseTrainer):
                 ) from e
             raise
 
-        # Without labels (popped by a `compute_loss_func` or label smoothing), the chunked forward runs the original one
+        # Check whether chunked NLL was used.
         chunked = isinstance(outputs, _ChunkedCELMHeadOutput)
 
         # Compute entropy
