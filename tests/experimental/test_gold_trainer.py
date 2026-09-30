@@ -371,6 +371,9 @@ class RecordingVLLMGeneration:
     def sync_weights(self):
         self.sync_calls += 1
 
+    def sleep(self):
+        pass
+
     def generate(self, prompts, images, num_generations):
         self.prompts = prompts
         return None, [self.completion_ids] * len(prompts), None, None
@@ -2043,6 +2046,9 @@ def test_on_policy_vlm_vllm_does_not_duplicate_repeated_sampler_batch(monkeypatc
             self.eos_token_id = processing_class.tokenizer.eos_token_id
 
         def sync_weights(self):
+            pass
+
+        def sleep(self):
             pass
 
         def generate(self, prompts, images, num_generations):
