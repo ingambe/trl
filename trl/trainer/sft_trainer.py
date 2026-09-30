@@ -1686,7 +1686,7 @@ class SFTTrainer(_BaseTrainer):
                     lambda example: any(label != -100 for label in example["labels"]), **map_kwargs
                 )
 
-            # Pack, unless the dataset is already packed (e.g. an eval dataset prepared once more by `evaluate`)
+            # Skip packing if the dataset is already packed.
             if packing and "seq_lengths" not in column_names:
                 if args.max_length is None:
                     raise ValueError("When packing is enabled, `max_length` can't be `None`.")
