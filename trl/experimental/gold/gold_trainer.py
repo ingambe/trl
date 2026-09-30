@@ -2537,6 +2537,9 @@ class GOLDTrainer(SFTTrainer):
                 temperature=self.temperature,
                 num_items_in_batch=num_items_in_batch,
             )
+            # As in `Trainer.compute_loss`: DDP averages gradients across ranks, which divides the global-count loss again
+            if self.args.average_tokens_across_devices and num_items_in_batch is not None:
+                loss *= self.accelerator.num_processes
 
         if self.use_uld_loss and self.teacher_tokenizer is not None:
             student_labels = inputs["labels"]
