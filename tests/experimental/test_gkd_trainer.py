@@ -614,9 +614,8 @@ class TestGKDTrainer(TrlTestCase):
             train_dataset=dataset,
             processing_class=self.tokenizer,
         )
-        trainer.generation_config.eos_token_id = None  # always generate `max_new_tokens`
+        trainer.generation_config.eos_token_id = None  # Disable early stopping.
 
-        # Keep 1 then 8 generated tokens, so the micro-batches of the window differ in length
         lengths = iter([1, 8])
         generate = GKDTrainer.generate_on_policy_outputs
 
