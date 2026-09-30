@@ -1309,11 +1309,9 @@ class SFTTrainer(_BaseTrainer):
                         map_kwargs["desc"] = f"Adding EOS to {dataset_name} dataset"
 
                     def add_eos(example, eos_token, dataset_text_field):
-                        # language modeling case
-                        if dataset_text_field in example and not example[dataset_text_field].endswith(eos_token):
-                            example[dataset_text_field] = example[dataset_text_field] + eos_token
-                        elif "completion" in example and not example["completion"].endswith(eos_token):
-                            example["completion"] = example["completion"] + eos_token
+                        text_field = "completion" if "prompt" in example else dataset_text_field
+                        if not example[text_field].endswith(eos_token):
+                            example[text_field] = example[text_field] + eos_token
                         return example
 
                     dataset = dataset.map(
