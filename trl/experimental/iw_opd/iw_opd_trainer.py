@@ -1610,6 +1610,9 @@ class IWOPDTrainer(_BaseTrainer):
                     rollout_logprobs=rollout_logprobs,
                     num_items_in_batch=num_items_in_batch,
                 )
+                # Undo DDP gradient averaging for the global token count.
+                if self.args.average_tokens_across_devices and num_items_in_batch is not None:
+                    loss *= self.accelerator.num_processes
             elif self.beta > 0:
                 loss = self._compute_server_sparse_top_1_divergence_loss(
                     teacher_result=teacher_result,
@@ -1660,6 +1663,9 @@ class IWOPDTrainer(_BaseTrainer):
                     add_tail=self.loss_add_tail,
                     num_items_in_batch=num_items_in_batch,
                 )
+            # Undo DDP gradient averaging for the global token count.
+            if self.args.average_tokens_across_devices and num_items_in_batch is not None:
+                loss *= self.accelerator.num_processes
 
         return (loss, student_outputs) if return_outputs else loss
 
