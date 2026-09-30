@@ -540,9 +540,9 @@ class _AsyncRolloutLoop:
                     # prompt and capture its initial observation (e.g. a task instruction). The reset() return was
                     # previously discarded, so an environment_factory whose task lives in the observation (not the
                     # dataset prompt) was generated against the bare prompt. Mirror GRPOTrainer: fold the observation
-                    # into the last prompt message. reset() may be stochastic, so this is done per generation (each
-                    # generation gets its own observation -> its own prompt and prompt_ids). `environment` is a control
-                    # field in multi-environment mode, so it is not forwarded to `reset`.
+                    # into the last prompt message. reset() is deterministic given the row, so every generation of a
+                    # group starts from the same state in its own instance. `environment` is a control field in
+                    # multi-environment mode, so it is not forwarded to `reset`.
                     environment = None
                     observation = None
                     if self.environment_factories is not None:

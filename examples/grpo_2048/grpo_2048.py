@@ -35,7 +35,8 @@ PROMPT = "Play 2048 on a 4x4 board. Use the tool `move` with one of: up, down, l
 
 
 class Game2048Env:
-    def reset(self, **kwargs) -> str:
+    def reset(self, seed, **kwargs) -> str:
+        self.rng = random.Random(seed)  # the rollouts of a group share the seed, hence the starting board
         self.board = [[0] * 4 for _ in range(4)]
         self.score = 0.0
         self.done = False
@@ -66,8 +67,8 @@ class Game2048Env:
         empty = [(r, c) for r in range(4) for c in range(4) if self.board[r][c] == 0]
         if not empty:
             return
-        r, c = random.choice(empty)
-        self.board[r][c] = 4 if random.random() < 0.1 else 2
+        r, c = self.rng.choice(empty)
+        self.board[r][c] = 4 if self.rng.random() < 0.1 else 2
 
     @staticmethod
     def _merge_line(line: list[int]) -> tuple[list[int], int]:
@@ -139,7 +140,9 @@ def reward_score(environments, **kwargs):
 
 
 def main() -> None:
-    dataset = Dataset.from_dict({"prompt": [[{"role": "user", "content": PROMPT}] for _ in range(1000)]})
+    dataset = Dataset.from_dict(
+        {"prompt": [[{"role": "user", "content": PROMPT}] for _ in range(1000)], "seed": range(1000)}
+    )
 
     trainer = GRPOTrainer(
         model="Qwen/Qwen3-4B",

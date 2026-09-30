@@ -777,7 +777,7 @@ You can also provide tools through `environment_factory`. In this mode, [`GRPOTr
 > [!IMPORTANT]
 > `environment_factory` requires `transformers>=5.2.0`.
 
-When you use an `environment_factory`, the environment owns the data: there is no external `train_dataset`. On each rollout, `reset()` produces the task — self-sampling from a corpus the environment holds, or generating a state procedurally — and returns the prompt. `max_steps` sets the training length. The following is a minimal example of an environment that self-samples a target and exposes an `increment` method (exposed as a tool).
+When you use an `environment_factory`, the environment owns the data: there is no external `train_dataset`. On each rollout, `reset()` produces the task — self-sampling from a corpus the environment holds, or generating a state procedurally — and returns the prompt. `max_steps` sets the training length. The trainer passes each rollout a `seed`, shared by the rollouts of a group. The following is a minimal example of an environment that samples a target from that seed and exposes an `increment` method (exposed as a tool).
 
 ```python
 import random
@@ -786,9 +786,9 @@ from trl import GRPOConfig, GRPOTrainer
 
 class IncrementEnv:
     # Reserved methods
-    def reset(self, **kwargs) -> str | None:  # required; called at the start of each rollout
+    def reset(self, seed, **kwargs) -> str | None:  # required; called at the start of each rollout
         self.counter = 0
-        self.target = random.randint(1, 6)  # self-sample the task
+        self.target = random.Random(seed).randint(1, 6)  # sample the task from the group's seed
         return f"Increment the counter by {self.target}."  # returned string becomes the prompt
 
     def get_reward(self) -> float:  # optional: the environment scores itself from its own state
@@ -822,7 +822,7 @@ An environment class has two reserved methods: `reset` and `get_reward`. Unlike 
 - `get_reward` (optional, sync or async) takes no argument and returns a `float`: the environment scores the episode it just ran from its own internal state (did the game end in a win? was the word guessed?). It is called once per completed rollout and acts as a reward source.
 
 > [!NOTE]
-> Because the environment self-samples on each `reset()`, the `G` members of a GRPO group may not share the same initial state, making the group baseline slightly noisier. For identical states within a group, have `reset()` derive the state deterministically from a shared key.
+> `reset()` must return the same state for the same keyword arguments: the `G` rollouts of a GRPO group share their row, and the group baseline assumes they start from the same state. Sample from the `seed` argument, not from a global generator; rollouts then diverge only through their actions.
 
 #### Providing an external dataset (optional)
 
@@ -892,8 +892,8 @@ from trl import GRPOConfig, GRPOTrainer
 
 
 class CodingEnv:
-    def reset(self, **kwargs) -> str:
-        n = random.randint(1, 20)
+    def reset(self, seed, **kwargs) -> str:
+        n = random.Random(seed).randint(1, 20)
         return f"Compute the {n}th Fibonacci number."
 
     def run_code(self, code: str) -> str:  # exposed as a tool only for "coding" examples
@@ -922,8 +922,8 @@ class GameEnv:
         """
         ...
 
-# The dataset only routes: each row picks the environment for that rollout
-dataset = Dataset.from_dict({"environment": ["coding", "game"] * 500})
+# The dataset only routes: each row picks the environment for that rollout and seeds its task
+dataset = Dataset.from_dict({"environment": ["coding", "game"] * 500, "seed": range(1000)})
 
 trainer = GRPOTrainer(
     model="Qwen/Qwen3-0.6B",

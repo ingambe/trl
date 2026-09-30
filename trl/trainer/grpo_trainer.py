@@ -267,13 +267,15 @@ class GRPOTrainer(_BaseTrainer):
             A callable that creates and returns an environment instance, or a dictionary mapping environment names to
             such callables. The environment class should define methods that can be invoked as tools during generation.
             Each method should comply with the same requirements as the `tools` described above. The environment must
-            also implement a callable `reset` method that can be used to reset state between generations. The `reset`
-            method should return either `None` or a string: when it returns a string, that string is appended to the
-            last user message before generation. The environment may also define a `get_reward` method taking no
-            argument and returning a `float`: when present, the environment owns the reward, and `get_reward` is called
-            once per completed rollout to score it from the environment's internal state. It acts as an additional
-            reward source (with weight 1, logged under the environment's class name) alongside `reward_funcs`, which
-            then becomes optional.
+            also implement a callable `reset` method that can be used to reset state between generations. `reset`
+            receives the dataset row as keyword arguments and must return the same state for the same row, since the
+            rollouts of a group share their row: draw random states from a `seed` column (added automatically when no
+            `train_dataset` is given) rather than a global generator. The `reset` method should return either `None` or
+            a string: when it returns a string, that string is appended to the last user message before generation. The
+            environment may also define a `get_reward` method taking no argument and returning a `float`: when present,
+            the environment owns the reward, and `get_reward` is called once per completed rollout to score it from the
+            environment's internal state. It acts as an additional reward source (with weight 1, logged under the
+            environment's class name) alongside `reward_funcs`, which then becomes optional.
 
             With a single callable, every example uses the same environment, with one instance per rollout so their
             interactions stay isolated. With a dictionary, each example must carry an `environment` field selecting its
@@ -839,8 +841,8 @@ class GRPOTrainer(_BaseTrainer):
 
         if train_dataset is None:
             # A dataset is optional when an environment owns the data and returns the prompt from `reset()`; then
-            # `max_steps` sets the length. Build a placeholder dataset of empty prompts to drive the loop — one
-            # generation round's worth of rows, cycled across steps.
+            # `max_steps` sets the length. Build a placeholder dataset of empty prompts to drive the loop, with a unique
+            # `seed` per row so that the rollouts of a group reset to the same state.
             if self.environment_factories is None:
                 raise ValueError("`train_dataset` is required unless an `environment_factory` is provided.")
             if self._multi_environment:
@@ -855,8 +857,13 @@ class GRPOTrainer(_BaseTrainer):
                     "from `reset()`), `max_steps` must be set to a positive value to define the training length. Set "
                     "it via `GRPOConfig(max_steps=...)`."
                 )
-            num_placeholder_rows = args.generation_batch_size // args.num_generations
-            train_dataset = Dataset.from_dict({"prompt": [[{"role": "user", "content": ""}]] * num_placeholder_rows})
+            num_placeholder_rows = args.max_steps * args.generation_batch_size // args.num_generations
+            train_dataset = Dataset.from_dict(
+                {
+                    "prompt": [[{"role": "user", "content": ""}]] * num_placeholder_rows,
+                    "seed": range(num_placeholder_rows),
+                }
+            )
         elif not isinstance(train_dataset, (Dataset, IterableDataset)):
             raise TypeError(
                 f"`train_dataset` must be a `Dataset` or `IterableDataset`, got `{type(train_dataset).__name__}`."

@@ -4920,3 +4920,42 @@ def test_micro_batches_crop_completion_padding(tiny_llama, tmp_path):
     widths = [batch["completion_ids"].size(1) for batch in trainer._buffered_inputs]
     assert widths == [batch["completion_lengths"].max().item() for batch in trainer._buffered_inputs]
     assert min(widths) < 32
+
+
+@pytest.mark.xfail(
+    condition=Version(transformers.__version__) < Version("5.2.0"),
+    reason="Environment factory support is not available in transformers versions below 5.2.0",
+    strict=True,
+)
+def test_environment_rollouts_of_a_group_reset_with_the_same_seed(tiny_llama, tmp_path):
+    model, tokenizer = tiny_llama
+    tokenizer.chat_template = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+    seeds = []
+
+    class Environment:
+        def reset(self, seed, **kwargs):
+            seeds.append(seed)
+            return "a"
+
+        def get_reward(self):
+            return 0.0
+
+    with patch("trl.trainer.grpo_trainer.supports_tool_calling", return_value=True):
+        trainer = GRPOTrainer(
+            model=model,
+            processing_class=tokenizer,
+            environment_factory=Environment,
+            args=GRPOConfig(
+                output_dir=str(tmp_path),
+                report_to="none",
+                bf16=False,
+                per_device_train_batch_size=4,
+                num_generations=2,
+                max_completion_length=4,
+                max_steps=3,
+            ),
+        )
+    trainer.train()
+
+    assert seeds[::2] == seeds[1::2]
+    assert len(set(seeds)) == len(seeds) // 2
