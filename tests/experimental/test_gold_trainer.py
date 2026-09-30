@@ -408,6 +408,9 @@ def test_generate_on_policy_for_slices_uses_prompt_attention_mask_for_vllm_promp
         def sync_weights(self):
             self.sync_calls += 1
 
+        def sleep(self):
+            pass
+
         def generate(self, prompts, images, num_generations):
             self.prompts = prompts
             assert images is None
@@ -497,6 +500,9 @@ def test_generate_on_policy_for_slices_reconstructs_prompt_with_special_tokens()
 
         def sync_weights(self):
             self.sync_calls += 1
+
+        def sleep(self):
+            pass
 
         def generate(self, prompts, images, num_generations):
             self.prompts = prompts
@@ -588,6 +594,9 @@ def test_on_policy_prompt_text_reflects_truncated_prompt():
             self.prompts = None
 
         def sync_weights(self):
+            pass
+
+        def sleep(self):
             pass
 
         def generate(self, prompts, images, num_generations):
@@ -2342,6 +2351,9 @@ def test_on_policy_vlm_vllm_does_not_duplicate_repeated_sampler_batch(monkeypatc
 
     class StubVLLMGeneration:
         def sync_weights(self):
+            pass
+
+        def sleep(self):
             pass
 
         def generate(self, prompts, images, num_generations):

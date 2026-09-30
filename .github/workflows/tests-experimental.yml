@@ -10,6 +10,8 @@ on:
 
 env:
   TQDM_DISABLE: 1
+  TRITON_INTERPRET: 1  # run the Triton kernels on CPU
+  OMP_NUM_THREADS: 1  # one thread per pytest-xdist worker
   HF_TOKEN: ${{ secrets.HF_TOKEN }}
   PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
   PYTORCH_ALLOC_CONF: "expandable_segments:True"
@@ -26,11 +28,7 @@ jobs:
     permissions:
       contents: read
     name: Tests (experimental)
-    runs-on:
-      group: aws-g6e-4xlarge
-    container:
-      image: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
-      options: --gpus all
+    runs-on: ubuntu-latest
     defaults:
       run:
         shell: bash
@@ -42,10 +40,6 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.12'
-
-      - name: Install Make and Git
-        run: |
-          apt-get update && apt-get install -y make git curl
 
       - name: Install uv
         uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
