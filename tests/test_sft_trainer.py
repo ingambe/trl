@@ -23,6 +23,7 @@ from datasets import Dataset, DatasetDict, IterableDatasetDict, load_dataset
 from packaging.version import Version
 from transformers import (
     AutoModelForCausalLM,
+    AutoProcessor,
     AutoTokenizer,
     BitsAndBytesConfig,
     TrainingArguments,
@@ -32,6 +33,7 @@ from transformers.trainer_pt_utils import LabelSmoother
 from transformers.utils import is_peft_available
 
 from trl import SFTConfig, SFTTrainer
+from trl.data_utils import prepare_multimodal_messages
 from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
 
 from .testing_utils import (
@@ -2165,6 +2167,30 @@ class TestSFTTrainer(TrlTestCase):
                 assert torch.equal(param, new_param), f"Param {n} expected frozen by LLaVA design, but changed"
             else:
                 assert not torch.equal(param, new_param), f"Param {n} is not updated"
+
+    @require_vision
+    def test_train_vlm_standard_language_modeling(self):
+        model_id = "trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration"
+        processor = AutoProcessor.from_pretrained(model_id)
+        dataset = load_dataset("trl-internal-testing/zen-image", "conversational_language_modeling", split="train")
+
+        def to_text(example):
+            messages = prepare_multimodal_messages(example["messages"], images=example["images"])
+            return {"content": processor.apply_chat_template(messages)}
+
+        dataset = dataset.map(to_text, remove_columns="messages")
+        training_args = SFTConfig(
+            output_dir=self.tmp_dir,
+            dataset_text_field="content",
+            per_device_train_batch_size=1,
+            max_length=None,
+            report_to="none",
+        )
+        trainer = SFTTrainer(model=model_id, args=training_args, train_dataset=dataset)
+
+        trainer.train()
+
+        assert trainer.state.log_history[-1]["train_loss"] is not None
 
     @pytest.mark.parametrize(
         "model_id",
