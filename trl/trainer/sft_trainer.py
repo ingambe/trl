@@ -1889,8 +1889,11 @@ class SFTTrainer(_BaseTrainer):
                 ) from e
             raise
 
+        # Check whether chunked NLL was used.
+        chunked = isinstance(outputs, _ChunkedCELMHeadOutput)
+
         # Compute entropy
-        if self.args.loss_type == "chunked_nll":
+        if chunked:
             # Use `num_valid_tokens` from the patched forward rather than recomputing from `labels`. Prompt-learning
             # PEFT (PromptTuning, P-Tuning) prepends `-100`-padded virtual tokens before delegating into the patched
             # forward, so the valid-token count over the padded labels can differ from the un-padded `labels[..., 1:]`
@@ -1949,7 +1952,7 @@ class SFTTrainer(_BaseTrainer):
             self._total_train_tokens += num_tokens_in_batch // self._tp_size
         self._metrics[mode]["num_tokens"] = [self._total_train_tokens]
 
-        if self.args.loss_type == "chunked_nll":
+        if chunked:
             correct = self.accelerator.gather_for_metrics(outputs.num_correct_tokens).sum()
             accuracy = (correct / num_valid).item() if num_valid > 0 else 0.0
             self._metrics[mode]["mean_token_accuracy"].append(accuracy)
