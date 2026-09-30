@@ -226,8 +226,8 @@ class TestDataCollatorForLanguageModeling(TrlTestCase):
         torch.testing.assert_close(result["position_ids"], torch.tensor([[0, 1, 2, 0, 1, 0, 0, 0]]))
         torch.testing.assert_close(result["labels"], torch.tensor([[-100, 2, 3, -100, 5, -100, -100, -100]]))
 
-    def test_custom_position_ids_but_no_padding_free(self):
-        """Test that custom position_ids are ignored if padding_free is False."""
+    def test_packing_without_padding_free(self):
+        """Packed examples are collated padding-free even if padding_free is False (e.g. eval-only packing)."""
         collator = DataCollatorForLanguageModeling(pad_token_id=0)
         examples = [
             {"input_ids": [1, 2, 3], "seq_lengths": [1, 2], "labels": [1, 2, 3]},
@@ -236,10 +236,10 @@ class TestDataCollatorForLanguageModeling(TrlTestCase):
 
         result = collator(examples)
 
-        assert set(result.keys()) == {"input_ids", "attention_mask", "labels"}
-        torch.testing.assert_close(result["input_ids"], torch.tensor([[1, 2, 3], [4, 5, 0]]))
-        torch.testing.assert_close(result["attention_mask"], torch.tensor([[1, 1, 1], [1, 1, 0]]))
-        torch.testing.assert_close(result["labels"], torch.tensor([[1, 2, 3], [4, 5, -100]]))
+        assert set(result.keys()) == {"input_ids", "position_ids", "labels"}
+        torch.testing.assert_close(result["input_ids"], torch.tensor([[1, 2, 3, 4, 5]]))
+        torch.testing.assert_close(result["position_ids"], torch.tensor([[0, 0, 1, 0, 1]]))
+        torch.testing.assert_close(result["labels"], torch.tensor([[-100, -100, 3, -100, 5]]))
 
     def test_single_example(self):
         """Test collator with a single example."""
