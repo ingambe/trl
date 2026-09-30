@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 import random
 import textwrap
 from collections.abc import Callable
@@ -197,6 +198,7 @@ class GKDTrainer(SFTTrainer):
         self.beta = args.beta
         self.temperature = args.temperature
         self.seq_kd = args.seq_kd
+        self._window_to_generate = None
 
         # With `lmbda=1.0` training is fully on-policy and `seq_kd` is never reached, and with `temperature=1.0` the
         # sampling temperature matches the one `DistillationTrainer` also applies to the divergence. In that setting,
@@ -353,6 +355,9 @@ class GKDTrainer(SFTTrainer):
             beta=self.beta,
             num_items_in_batch=num_items_in_batch,
         )
+        # Undo DDP gradient averaging for the global token count.
+        if self.args.average_tokens_across_devices and num_items_in_batch is not None:
+            loss *= self.accelerator.num_processes
 
         # empty cache
         empty_cache()
@@ -403,6 +408,12 @@ class GKDTrainer(SFTTrainer):
 
         return generated_tokens, new_attention_mask, new_labels
 
+    def get_batch_samples(self, epoch_iterator, num_batches, device):
+        batch_samples = list(itertools.islice(epoch_iterator, num_batches))
+        # Defer generation until Trainer restores the checkpoint RNG state.
+        self._window_to_generate = batch_samples
+        return batch_samples, None
+
     def training_step(
         self, model: nn.Module, inputs: dict[str, torch.Tensor | Any], num_items_in_batch: int | None = None
     ) -> torch.Tensor:
@@ -412,35 +423,34 @@ class GKDTrainer(SFTTrainer):
         This method implements the on-policy learning approach described in the GKD paper. With probability
         `self.lmbda`, it generates new responses using the student model, which are then used for training instead of
         the original inputs.
-        """
-        if random.random() <= self.lmbda:
-            with (
-                unwrap_model_for_generation(
-                    model,
-                    self.accelerator,
-                    generation_kwargs=self.generation_kwargs,  # Override model.generation_config with generation_kwargs to fix transformers#42762
-                ) as unwrapped_model
-            ):
-                new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
-                    unwrapped_model, inputs, self.generation_config
-                )
-            inputs["input_ids"] = new_input_ids
-            inputs["attention_mask"] = new_attention_mask
-            inputs["labels"] = new_labels
-        elif self.seq_kd:
-            with (
-                unwrap_model_for_generation(
-                    self.teacher_model,
-                    self.accelerator,
-                    generation_kwargs=self.generation_kwargs,  # Override model.generation_config with generation_kwargs to fix transformers#42762
-                ) as unwrapped_model
-            ):
-                new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
-                    unwrapped_model, inputs, self.generation_config
-                )
-            inputs["input_ids"] = new_input_ids
-            inputs["attention_mask"] = new_attention_mask
-            inputs["labels"] = new_labels
 
-        loss = super().training_step(model, inputs, num_items_in_batch)
+        The loss is normalized by the accumulation window's target token count.
+        """
+        if self._window_to_generate is not None:
+            for window_inputs in self._window_to_generate:
+                if random.random() <= self.lmbda:
+                    generation_model = model
+                elif self.seq_kd:
+                    generation_model = self.teacher_model
+                else:
+                    continue
+                with (
+                    unwrap_model_for_generation(
+                        generation_model,
+                        self.accelerator,
+                        generation_kwargs=self.generation_kwargs,  # Override model.generation_config with generation_kwargs to fix transformers#42762
+                    ) as unwrapped_model
+                ):
+                    new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
+                        unwrapped_model, window_inputs, self.generation_config
+                    )
+                window_inputs["input_ids"] = new_input_ids
+                window_inputs["attention_mask"] = new_attention_mask
+                window_inputs["labels"] = new_labels
+            _, self._num_items_in_batch = super().get_batch_samples(
+                iter(self._window_to_generate), len(self._window_to_generate), self.args.device
+            )
+            self._window_to_generate = None
+
+        loss = super().training_step(model, inputs, self._num_items_in_batch)
         return loss
