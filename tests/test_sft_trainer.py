@@ -2448,6 +2448,35 @@ class TestSFTTrainer(TrlTestCase):
         assert trainer.model.config.get_text_config().pad_token_id == pad_token_id
         assert trainer.model.generation_config.pad_token_id == pad_token_id
 
+    def test_eos_appended_to_custom_dataset_text_field(self):
+        dataset = Dataset.from_dict({"content": ["The sky is blue."]})
+        training_args = SFTConfig(output_dir=self.tmp_dir, dataset_text_field="content", report_to="none")
+        trainer = SFTTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", args=training_args, train_dataset=dataset
+        )
+        assert trainer.train_dataset[0]["input_ids"][-1] == trainer.processing_class.eos_token_id
+
+    @pytest.mark.parametrize("dataset_text_field", ["prompt", "content"])
+    def test_eos_appended_to_completion_with_custom_dataset_text_field(self, dataset_text_field):
+        model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        dataset = Dataset.from_dict(
+            {
+                "prompt": ["The sky is", "The sky is"],
+                "completion": [" blue.", " blue." + tokenizer.eos_token],
+                "content": ["metadata", "metadata"],
+            }
+        )
+        training_args = SFTConfig(output_dir=self.tmp_dir, dataset_text_field=dataset_text_field, report_to="none")
+        trainer = SFTTrainer(model=model_id, args=training_args, train_dataset=dataset, processing_class=tokenizer)
+
+        expected_ids = tokenizer("The sky is blue." + tokenizer.eos_token)["input_ids"]
+        for example in trainer.train_dataset:
+            assert example["prompt"] == "The sky is"
+            assert example["content"] == "metadata"
+            assert example["input_ids"] == expected_ids
+            assert example["labels"][-1] == tokenizer.eos_token_id
+
     @pytest.mark.parametrize(
         "generation_eos_token_id, expected_eos_token_ids",
         [
