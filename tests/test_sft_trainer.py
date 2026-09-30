@@ -1923,6 +1923,29 @@ class TestSFTTrainer(TrlTestCase):
         else:
             assert "input_ids" in next(iter(trainer.eval_dataset))
 
+    def test_logged_metrics_are_token_weighted(self):
+        dataset = Dataset.from_dict({"input_ids": [[1, 2], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]]})
+        training_args = SFTConfig(output_dir=self.tmp_dir, per_device_eval_batch_size=1, bf16=False, report_to="none")
+        trainer = SFTTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            args=training_args,
+            train_dataset=dataset,
+            eval_dataset=dataset,
+        )
+
+        metrics = trainer.evaluate()
+
+        # Pool the 10 target tokens of the two examples, one with 1 target and one with 9
+        input_ids = [torch.tensor([ids], device=trainer.model.device) for ids in dataset["input_ids"]]
+        with torch.no_grad():
+            logits = torch.cat([trainer.model(input_ids=ids).logits[0, :-1] for ids in input_ids])
+        targets = torch.cat([ids[0, 1:] for ids in input_ids])
+        log_probs = logits.log_softmax(-1)
+        entropy = -(log_probs.exp() * log_probs).sum(-1).mean()
+        accuracy = (logits.argmax(-1) == targets).float().mean()
+        torch.testing.assert_close(metrics["eval_entropy"], entropy.item(), rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(metrics["eval_mean_token_accuracy"], accuracy.item(), rtol=1e-5, atol=1e-5)
+
     def test_train_with_compute_metrics(self):
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling")
 
