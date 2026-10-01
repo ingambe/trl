@@ -156,6 +156,10 @@ class RLOOConfig(_BaseConfig):
         vllm_max_model_length (`int`, *optional*):
             Context window for vLLM. Set it to at least the maximum prompt length in the dataset plus
             `max_completion_length`; if omitted, it is inferred from the model config.
+        vllm_max_num_batched_tokens (`int`, *optional*, defaults to `4096`):
+            Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in fewer steps
+            but use more activation memory. If you are using `vllm_mode="server"`, pass `--max-num-batched-tokens` when
+            launching the vLLM server instead.
         vllm_tensor_parallel_size (`int`, *optional*, defaults to `1`):
             Control the tensor parallel size for vLLM. This setting only applies when `vllm_mode` is set to
             `"colocate"`. If you are using `vllm_mode="server"`, this parameter must be passed separately when
@@ -494,6 +498,14 @@ class RLOOConfig(_BaseConfig):
         metadata={
             "help": "Context window for vLLM. Set it to at least the maximum prompt length in the dataset plus "
             "`max_completion_length`; if omitted, it is inferred from the model config."
+        },
+    )
+    vllm_max_num_batched_tokens: int = field(
+        default=4096,
+        metadata={
+            "help": "Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in "
+            "fewer steps but use more activation memory. If you are using `vllm_mode='server'`, pass "
+            "`--max-num-batched-tokens` when launching the vLLM server instead."
         },
     )
     vllm_tensor_parallel_size: int = field(

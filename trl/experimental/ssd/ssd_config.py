@@ -97,6 +97,10 @@ class SSDConfig(_BaseConfig):
             GPU memory utilization ratio for colocated vLLM.
         vllm_max_model_length (`int` or `None`, *optional*):
             Model context length for vLLM. Inferred from model config if not set.
+        vllm_max_num_batched_tokens (`int`, *optional*, defaults to `4096`):
+            Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in fewer steps
+            but use more activation memory. If you are using `vllm_mode="server"`, pass `--max-num-batched-tokens` when
+            launching the vLLM server instead.
         vllm_enable_sleep_mode (`bool`, *optional*, defaults to `False`):
             Whether to enable sleep mode for colocated vLLM engine.
 
@@ -242,6 +246,14 @@ class SSDConfig(_BaseConfig):
     vllm_max_model_length: int | None = field(
         default=None,
         metadata={"help": "Model context length for vLLM. Inferred from model config if not set."},
+    )
+    vllm_max_num_batched_tokens: int = field(
+        default=4096,
+        metadata={
+            "help": "Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in "
+            "fewer steps but use more activation memory. If you are using `vllm_mode='server'`, pass "
+            "`--max-num-batched-tokens` when launching the vLLM server instead."
+        },
     )
     vllm_enable_sleep_mode: bool = field(
         default=False,
