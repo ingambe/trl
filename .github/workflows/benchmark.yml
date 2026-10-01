@@ -23,11 +23,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        benchmark: [rollout-small, rollout-medium, rollout-large, train-dense, train-lora, train-lora-3b]
+        benchmark: [rollout-small, rollout-medium, rollout-large, train-dense, train-lora, train-lora-3b, sft-long]
         gpus: [1, 2]
         exclude:
           - benchmark: train-lora-3b
             gpus: 1
+          - benchmark: sft-long
+            gpus: 2
         # Large rollouts run on RTX 5090, the others on RTX 3090
         include:
           - benchmark: rollout-small
@@ -42,6 +44,8 @@ jobs:
             args: --profile grpo-train-lora
           - benchmark: train-lora-3b
             args: --profile grpo-train-lora-3b
+          - benchmark: sft-long
+            args: --profile sft-long
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
