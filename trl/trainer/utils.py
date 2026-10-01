@@ -1848,7 +1848,8 @@ def get_peak_flops_per_device(accelerator: Accelerator, dtype: str) -> float | N
     Returns:
         `float` or `None`: Local device peak FLOPs, or `None` if the device or precision is unsupported.
     """
-    device_name = torch.cuda.get_device_name(accelerator.device)
+    device = accelerator.device
+    device_name = torch.cuda.get_device_name(device) if device.type == "cuda" else device.type
     peak_flops = get_peak_flops(device_name, dtype)
     if peak_flops is None:
         logger.info(
