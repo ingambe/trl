@@ -144,6 +144,10 @@ class IWOPDConfig(_BaseConfig):
             With `vllm_share_weights=True` and PEFT, serve the adapter as a native vLLM LoRA instead of merging it.
         vllm_max_model_length (`int` or `None`, *optional*):
             Maximum model sequence length for the colocated vLLM engine.
+        vllm_max_num_batched_tokens (`int`, *optional*, defaults to `4096`):
+            Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in fewer steps
+            but use more activation memory. If you are using `vllm_mode="server"`, pass `--max-num-batched-tokens` when
+            launching the vLLM server instead.
         vllm_model_impl (`str`, *optional*, defaults to `"vllm"`):
             Model implementation backend for vLLM. Use `"vllm"` or `"transformers"`.
         vllm_structured_outputs_regex (`str` or `None`, *optional*):
@@ -382,6 +386,14 @@ class IWOPDConfig(_BaseConfig):
     vllm_max_model_length: int | None = field(
         default=None,
         metadata={"help": "Maximum model sequence length for the colocated vLLM engine."},
+    )
+    vllm_max_num_batched_tokens: int = field(
+        default=4096,
+        metadata={
+            "help": "Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in "
+            "fewer steps but use more activation memory. If you are using `vllm_mode='server'`, pass "
+            "`--max-num-batched-tokens` when launching the vLLM server instead."
+        },
     )
     vllm_model_impl: str = field(
         default="vllm",
