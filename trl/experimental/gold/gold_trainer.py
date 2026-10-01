@@ -1092,6 +1092,7 @@ class GOLDTrainer(SFTTrainer):
                 gpu_memory_utilization=args.vllm_gpu_memory_utilization,
                 max_model_length=args.vllm_max_model_length or args.max_length,
                 max_num_seqs=args.per_device_train_batch_size * args.gradient_accumulation_steps,
+                max_num_batched_tokens=args.vllm_max_num_batched_tokens,
                 enable_sleep_mode=args.vllm_enable_sleep_mode,
                 share_weights=args.vllm_share_weights,
                 native_lora=args.vllm_native_lora,
