@@ -146,6 +146,10 @@ class GOLDConfig(SFTConfig):
         vllm_max_model_length (`int`, *optional*):
             Maximum model sequence length for the colocated vLLM engine when `vllm_mode="colocate"`. Defaults to the
             model's maximum context length.
+        vllm_max_num_batched_tokens (`int`, *optional*, defaults to `4096`):
+            Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in fewer steps
+            but use more activation memory. If you are using `vllm_mode="server"`, pass `--max-num-batched-tokens` when
+            launching the vLLM server instead.
         vllm_model_impl (`str`, *optional*, defaults to `"vllm"`):
             Model implementation backend to use in vLLM. Use `"vllm"` (default) or `"transformers"`.
         vllm_sync_frequency (`int`, *optional*, defaults to `1`):
@@ -427,6 +431,14 @@ class GOLDConfig(SFTConfig):
         default=None,
         metadata={
             "help": 'Maximum model sequence length for the colocated vLLM engine when `vllm_mode="colocate"`. Defaults to the model\'s maximum context length.'
+        },
+    )
+    vllm_max_num_batched_tokens: int = field(
+        default=4096,
+        metadata={
+            "help": "Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in "
+            "fewer steps but use more activation memory. If you are using `vllm_mode='server'`, pass "
+            "`--max-num-batched-tokens` when launching the vLLM server instead."
         },
     )
     vllm_model_impl: str = field(

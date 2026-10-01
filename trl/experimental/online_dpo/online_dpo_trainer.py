@@ -498,8 +498,7 @@ class OnlineDPOTrainer(_BaseTrainer):
                     "distributed_executor_backend": "external_launcher",
                     # Feed identical seed for tp groups to ensure sampling results are the same across workers
                     "seed": self.accelerator.process_index // self.vllm_tensor_parallel_size,
-                    # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768)
-                    "max_num_batched_tokens": 4096,
+                    "max_num_batched_tokens": self.args.vllm_max_num_batched_tokens,
                     "enable_sleep_mode": self.args.vllm_enable_sleep_mode,
                     "quantization": vllm_quantization,
                 }

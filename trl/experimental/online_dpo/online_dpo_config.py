@@ -125,6 +125,10 @@ class OnlineDPOConfig(_BaseConfig):
             Control the GPU memory utilization for vLLM. This setting only applies when `vllm_mode` is set to
             `"colocate"`. If you are using `vllm_mode="server"`, this parameter must be passed separately when
             launching the vLLM server via the `--vllm_gpu_memory_utilization` flag.
+        vllm_max_num_batched_tokens (`int`, *optional*, defaults to `4096`):
+            Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in fewer steps
+            but use more activation memory. If you are using `vllm_mode="server"`, pass `--max-num-batched-tokens` when
+            launching the vLLM server instead.
         vllm_tensor_parallel_size (`int`, *optional*, defaults to `1`):
             Control the tensor parallel size for vLLM. This setting only applies when `vllm_mode` is set to
             `"colocate"`. If you are using `vllm_mode="server"`, this parameter must be passed separately when
@@ -287,6 +291,14 @@ class OnlineDPOConfig(_BaseConfig):
             "help": "Control the GPU memory utilization for vLLM. This setting only applies when `vllm_mode` is set "
             "to `'colocate'`. If you are using `vllm_mode='server'`, this parameter must be passed separately when "
             "launching the vLLM server via the `--vllm_gpu_memory_utilization` flag.",
+        },
+    )
+    vllm_max_num_batched_tokens: int = field(
+        default=4096,
+        metadata={
+            "help": "Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in "
+            "fewer steps but use more activation memory. If you are using `vllm_mode='server'`, pass "
+            "`--max-num-batched-tokens` when launching the vLLM server instead."
         },
     )
     vllm_mode: str = field(
