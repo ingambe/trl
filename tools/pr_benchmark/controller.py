@@ -31,7 +31,6 @@ from pathlib import Path
 from urllib.parse import quote
 
 import requests
-from analyze_profiles import analyze
 from compare import compare, markdown
 from environment import environment_spec
 from hyperai import BUNDLE_FILES, TERMINAL, HyperAI
@@ -180,13 +179,7 @@ def manifest_for(github, pull, profile, environment_job=None, prepare=False, gpu
         "prepare": prepare,
         "environment_job": None if prepare else environment_job,
         "workload": config,
-        "thresholds": (
-            {"rollout_seconds": 5.0, "weight_transfer_bytes": 0.0}
-            if config.get("kind") == "vllm-rollout"
-            else {"train_seconds": 5.0, "steady_seconds": 5.0}
-            if config.get("kind") == "grpo-train"
-            else {"train_seconds": 5.0, "steady_seconds": 5.0, "eval_loss": 1.0}
-        ),
+        "thresholds": {"step_seconds": 5.0, "generation_seconds": 5.0},
         "harness": {
             name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in (*BUNDLE_FILES[:-1], "compare.py")
         },
@@ -318,14 +311,6 @@ def execute(args, github, provider, manifest, state, state_file, record=None):
             return "prepared"
         summary = compare(result, manifest)
         report = markdown(summary, manifest)
-        if manifest["workload"].get("kind") == "vllm-rollout":
-            for side in ("base", "head"):
-                provider.download_profile(job["id"], side, directory / f"{side}-profile.zip")
-            analyze(directory)
-            report += (
-                "\nProfiler diagnostics (separate instrumented runs, excluded from timing): before/after traces and HTA "
-                "tables are in the controller's local run directory, `profiles/report.md`.\n"
-            )
         save(directory / "summary.json", summary)
         (directory / "report.md").write_text(report)
         # Recheck after download/analysis so an obsolete comparison cannot publish a green status.
@@ -360,26 +345,15 @@ def main():
     parser.add_argument("--env-file", type=Path)
     parser.add_argument(
         "--profile",
-        choices=[
-            "sft-3090",
-            "smoke",
-            "vllm-rollout",
-            "vllm-rollout-dense",
-            "vllm-rollout-medium",
-            "grpo-train-dense",
-            "grpo-train-dense-binary",
-            "grpo-train-lora",
-            "grpo-train-lora-3b",
-        ],
-        default="sft-3090",
+        choices=json.loads((ROOT / "profiles.json").read_text()),
+        default="wordle",
     )
-    parser.add_argument("--serious", action="store_true", help="Longer vllm-rollout workload on one RTX 5090")
     parser.add_argument(
         "--gpus",
         type=int,
         choices=[1, 2],
         default=1,
-        help="Data-parallel vllm-rollout on 2 RTX 3090 (else 2 RTX 5090)",
+        help="Data-parallel training on 2 RTX 3090 (else 2 RTX 5090)",
     )
     parser.add_argument(
         "--native-lora", action="store_true", help="Serve the LoRA natively in vLLM on commits that support it"
@@ -400,19 +374,7 @@ def main():
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--state-dir", type=Path, default=Path.home() / ".local/state/trl-pr-benchmark")
     args = parser.parse_args()
-    if args.serious:
-        if args.profile != "vllm-rollout":
-            parser.error("--serious requires --profile vllm-rollout")
-        args.profile = "vllm-rollout-serious"
-    if args.gpus > 1 and not args.profile.startswith(("vllm-rollout", "grpo-train")):
-        parser.error("--gpus 2 requires a vllm-rollout or grpo-train profile")
-    if args.native_lora and args.profile not in (
-        "vllm-rollout",
-        "vllm-rollout-medium",
-        "vllm-rollout-serious",
-        "grpo-train-lora",
-        "grpo-train-lora-3b",
-    ):
+    if args.native_lora and "lora" not in args.profile:
         parser.error("--native-lora requires a LoRA profile")
     if args.timeout_minutes <= 0 or args.daily_compute_minutes <= 0 or args.poll_seconds < 10:
         parser.error("Timeout/budget must be positive; polling must be at least 10 seconds")
@@ -422,12 +384,7 @@ def main():
         parser.error("--rerun is only supported for manual runs")
     if args.command in {"prepare", "calibrate", "compare"} and args.publish:
         parser.error("Preparation, calibration, and pre-PR comparisons do not publish PR statuses")
-    if args.profile.startswith("vllm-rollout") and args.command not in {"doctor", "prepare"} and not args.dry_run:
-        # Fail before spending compute if the local HTA analysis cannot run.
-        import hta.trace_analysis  # noqa: F401
     env = load_env(args.env_file)
-    if args.serious:
-        env["HYPERAI_RESOURCE"] = "rtx-5090"
     if args.command == "doctor":
         print(json.dumps(HyperAI(env).inventory(), indent=2))  # noqa: T201
         return 0

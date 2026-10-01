@@ -23,25 +23,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        benchmark: [rollout-small, rollout-medium, rollout-large, train-dense, train-lora, train-lora-3b]
-        gpus: [1, 2]
-        exclude:
-          - benchmark: train-lora-3b
-            gpus: 1
-        # Large rollouts run on RTX 5090, the others on RTX 3090
+        benchmark: [wordle, wordle-lora, number, number-lora]
+        gpus: [1]
         include:
-          - benchmark: rollout-small
-            args: --profile vllm-rollout
-          - benchmark: rollout-medium
-            args: --profile vllm-rollout-medium
-          - benchmark: rollout-large
-            args: --profile vllm-rollout --serious
-          - benchmark: train-dense
-            args: --profile grpo-train-dense
-          - benchmark: train-lora
-            args: --profile grpo-train-lora
-          - benchmark: train-lora-3b
-            args: --profile grpo-train-lora-3b
+          - benchmark: wordle
+            gpus: 2
+          - benchmark: number
+            gpus: 2
+          - benchmark: wordle-lora-3b
+            gpus: 2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -58,17 +48,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           OPENBAYES_TOKEN: ${{ secrets.OPENBAYES_TOKEN }}
           HYPERAI_RUNTIME: ${{ vars.HYPERAI_RUNTIME }}
-          HYPERAI_ENVIRONMENT_JOB: ${{ matrix.benchmark == 'train-lora-3b' && vars.HYPERAI_ENVIRONMENT_JOB_3B || vars.HYPERAI_ENVIRONMENT_JOB }}
+          HYPERAI_ENVIRONMENT_JOB: ${{ matrix.benchmark == 'wordle-lora-3b' && vars.HYPERAI_ENVIRONMENT_JOB_3B || vars.HYPERAI_ENVIRONMENT_JOB }}
           REF: ${{ inputs.ref }}
           BASE_REF: ${{ inputs.base_ref }}
         # Jobs queue behind each other on Hyper.ai; GitHub stops a job after 360 minutes
         shell: bash
         run: |
           python tools/pr_benchmark/controller.py compare --repo "$GITHUB_REPOSITORY" --ref "$REF" \
-            --base-ref "$BASE_REF" ${{ matrix.args }} --gpus ${{ matrix.gpus }} --state-dir "$RUNNER_TEMP/trl-bench" \
-            --timeout-minutes 120 --queue-minutes 210 --daily-compute-minutes 240 | tee -a "$GITHUB_STEP_SUMMARY"
+            --base-ref "$BASE_REF" --profile ${{ matrix.benchmark }} --gpus ${{ matrix.gpus }} --state-dir "$RUNNER_TEMP/trl-bench" \
+            --timeout-minutes 60 --queue-minutes 210 --daily-compute-minutes 240 | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload reports and profiles
+      - name: Upload reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
