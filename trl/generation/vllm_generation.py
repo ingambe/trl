@@ -738,9 +738,12 @@ class VLLMGeneration:
                 # The model trains on vLLM's weights, so only the KV cache is released
                 core = self.llm.llm_engine.engine_core.engine_core
                 core.pause_scheduler(clear_cache=True)
-                for data in CuMemAllocator.get_instance().pointer_to_data.values():
-                    if data.tag == "kv_cache":
-                        unmap_and_release(data.handle)
+                if is_vllm_available(min_version="0.28.0"):
+                    CuMemAllocator.get_instance().discard("kv_cache")
+                else:
+                    for data in CuMemAllocator.get_instance().pointer_to_data.values():
+                        if data.tag == "kv_cache":
+                            unmap_and_release(data.handle)
                 core.model_executor.is_sleeping = True
                 core.model_executor.sleeping_tags = {"kv_cache"}
             else:
