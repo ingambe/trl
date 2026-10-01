@@ -248,7 +248,7 @@ class TestChunkedDivergenceLoss(TrlTestCase):
         assert torch.equal(grad[~valid], torch.zeros_like(grad[~valid]))  # masked positions get none
 
     def test_backward_matches_reference(self):
-        # The chunked (checkpointed) backward must match a naive full-vocab autograd backward, not merely be non-null.
+        # The chunked backward must match a naive full-vocab autograd backward, not merely be non-null.
         # Only the student carries gradient (the teacher is a fixed target), so compare the student hidden + lm_head.
         sh, th, sw, tw, mask = self._inputs()
         sh_c, sw_c = sh.clone().requires_grad_(True), sw.clone().requires_grad_(True)

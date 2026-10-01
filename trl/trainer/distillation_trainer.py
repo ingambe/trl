@@ -104,16 +104,13 @@ _CHUNKED_LM_HEAD_CHUNK_SIZE = 256
 
 
 def _chunk(h_s, w_s, b_s, s_scale, s_softcap, h_t, w_t, b_t, t_scale, t_softcap, beta, temperature, valid):
-    # Project both hidden states to vocab logits inside the checkpointed body so only `(chunk, H)` is retained across
-    # the backward, never `(chunk, V)`. ZeRO-3 shards the `lm_head`, so gather it tightly around each projection.
     # `logit_scale` (Cohere) / `final_logit_softcapping` (Gemma) are applied per model to match its full forward.
-    with maybe_gather_lm_head_ctx(w_s, b_s):
-        # Project in the compute dtype and upcast only for the softmax, like `"nll"` and
-        # `transformers`' own `ForCausalLMLoss` do. Matching the weight to the hidden-states dtype keeps the
-        # matmul in that dtype, which is what `lm_head`'s own forward computes in.
-        student_logits = (h_s @ w_s.to(h_s.dtype).t()).float()
-        if b_s is not None:
-            student_logits = student_logits + b_s.float()
+    # Project in the compute dtype and upcast only for the softmax, like `"nll"` and
+    # `transformers`' own `ForCausalLMLoss` do. Matching the weight to the hidden-states dtype keeps the
+    # matmul in that dtype, which is what `lm_head`'s own forward computes in.
+    student_logits = (h_s @ w_s.to(h_s.dtype).t()).float()
+    if b_s is not None:
+        student_logits = student_logits + b_s.float()
     if s_scale != 1.0:
         student_logits = student_logits * s_scale
     if s_softcap is not None:
@@ -121,7 +118,7 @@ def _chunk(h_s, w_s, b_s, s_scale, s_softcap, h_t, w_t, b_t, t_scale, t_softcap,
     # The teacher is a fixed target: compute its logits under `no_grad` so the projection builds no autograd graph
     # and the teacher accumulates no gradients (the teacher params are not frozen by `prepare_model`). Everything
     # downstream inherits this since `teacher_logits` is already detached.
-    with maybe_gather_lm_head_ctx(w_t, b_t), torch.no_grad():
+    with torch.no_grad():
         teacher_logits = (h_t @ w_t.to(h_t.dtype).t()).float()
         if b_t is not None:
             teacher_logits = teacher_logits + b_t.float()
@@ -159,6 +156,64 @@ def _chunk(h_s, w_s, b_s, s_scale, s_softcap, h_t, w_t, b_t, t_scale, t_softcap,
     return per_token_jsd.sum(), per_token_entropy.sum()
 
 
+class _ChunkedDivergence(torch.autograd.Function):
+    """
+    Summed divergence over chunks of the student and teacher hidden states. Each chunk's student gradients are computed
+    right after its logits in the forward pass, so backward only scales them instead of projecting through both
+    `lm_head`s again.
+    """
+
+    @staticmethod
+    def forward(
+        ctx, h_s, w_s, b_s, h_t, w_t, b_t, valid, chunk_size, s_scale, s_softcap, t_scale, t_softcap, beta, temperature
+    ):
+        needs_hidden, needs_weight, needs_bias = ctx.needs_input_grad[:3]
+        grad_hidden = torch.zeros_like(h_s) if needs_hidden else None
+        grad_weight = torch.zeros_like(w_s) if needs_weight else None
+        grad_bias = torch.zeros_like(b_s) if needs_bias else None
+        loss = h_s.new_zeros((), dtype=torch.float32)
+        entropy_sum = h_s.new_zeros((), dtype=torch.float32)
+        for start in range(0, h_s.size(0), chunk_size):
+            chunk = slice(start, start + chunk_size)
+            h = h_s[chunk].detach().requires_grad_(needs_hidden)
+            w = w_s.detach().requires_grad_(needs_weight)
+            b = b_s.detach().requires_grad_(needs_bias) if b_s is not None else None
+            with torch.enable_grad():
+                chunk_loss, chunk_entropy = _chunk(
+                    h,
+                    w,
+                    b,
+                    s_scale,
+                    s_softcap,
+                    h_t[chunk],
+                    w_t,
+                    b_t,
+                    t_scale,
+                    t_softcap,
+                    beta,
+                    temperature,
+                    valid[chunk].float(),
+                )
+            leaves = [t for t in (h, w, b) if t is not None and t.requires_grad]
+            chunk_grads = iter(torch.autograd.grad(chunk_loss, leaves) if leaves else ())
+            if needs_hidden:
+                grad_hidden[chunk] = next(chunk_grads)
+            if needs_weight:
+                grad_weight += next(chunk_grads)
+            if needs_bias:
+                grad_bias += next(chunk_grads)
+            loss += chunk_loss.detach()
+            entropy_sum += chunk_entropy.detach()
+        ctx.save_for_backward(grad_hidden, grad_weight, grad_bias)
+        ctx.mark_non_differentiable(entropy_sum)
+        return loss, entropy_sum
+
+    @staticmethod
+    def backward(ctx, grad_loss, grad_entropy):
+        grads = [None if g is None else g * grad_loss.to(g.dtype) for g in ctx.saved_tensors]
+        return *grads, *[None] * 11
+
+
 def _chunked_divergence_loss(
     student_hidden_states: torch.Tensor,
     teacher_hidden_states: torch.Tensor,
@@ -181,9 +236,9 @@ def _chunked_divergence_loss(
 
     The full `lm_head` projections are never materialized. Valid (unmasked) completion positions are packed to the
     front (via `argsort` on the completion mask, a static-shape op) and processed in chunks of `chunk_size`, rounding
-    the count up to a whole chunk so masked positions land in a skippable tail. Each chunk's `[chunk_size, vocab_size]`
-    logits (for both models) are kept alive only during its own forward/backward via gradient checkpointing, so peak
-    logits memory is `2 * chunk_size * vocab_size` instead of `2 * batch_size * seq_len * vocab_size`.
+    the count up to a whole chunk so masked positions land in a skippable tail. Each chunk's student gradients are
+    computed right after its `[chunk_size, vocab_size]` logits in the forward pass (see [`_ChunkedDivergence`]), so
+    peak logits memory is `2 * chunk_size * vocab_size` instead of `2 * batch_size * seq_len * vocab_size`.
 
     Args:
         student_hidden_states (`torch.Tensor`):
@@ -224,10 +279,9 @@ def _chunked_divergence_loss(
         number of valid completion positions — all over the local batch. Raw sums are returned so callers can reduce
         correctly across ranks.
     """
-    # Under FSDP2, lm_head.weight is a DTensor (Shard(0) or Replicate). Passing it directly into the
-    # gradient-checkpointed chunk loop causes FSDP2 to re-gather it once per chunk during backward recomputation.
-    # full_tensor() converts it to a plain tensor once; all chunks reference that tensor, so only one all-gather occurs
-    # (in full_tensor()'s backward). Done per model since the student and teacher have their own heads.
+    # Under FSDP2, lm_head.weight is a DTensor (Shard(0) or Replicate). full_tensor() converts it to a plain tensor
+    # once; all chunks reference that tensor, so only one all-gather occurs (in full_tensor()'s backward). Done per
+    # model since the student and teacher have their own heads.
     # Under mixed precision the teacher's gathered weight is still the fp32 master copy, so cast to the
     # hidden-states dtype here: once, rather than rebuilding a vocab-sized copy per chunk.
     if isinstance(student_lm_head_weight, torch.distributed.tensor.DTensor):
@@ -246,8 +300,6 @@ def _chunked_divergence_loss(
     valid = completion_mask.reshape(-1) != 0
     n_valid_tensor = valid.sum()
 
-    entropy_sum = h_s.new_zeros((), dtype=torch.float32)
-
     # Pack valid positions to the front so masked ones form whole trailing chunks. `argsort` on the boolean mask is a
     # static-shape op (unlike `h_s[valid]`, whose output shape is data-dependent and poisons XLA compilation).
     order = valid.to(torch.int8).argsort(descending=True, stable=True)
@@ -263,27 +315,26 @@ def _chunked_divergence_loss(
     if is_deepspeed_zero3_enabled():
         torch.distributed.all_reduce(n_padded, op=torch.distributed.ReduceOp.MAX)
 
-    loss = h_s.new_zeros((), dtype=torch.float32)
-    for start in range(0, n_padded, chunk_size):
-        chunk_loss, chunk_entropy = torch.utils.checkpoint.checkpoint(
-            _chunk,
-            h_s[start : start + chunk_size],
+    # ZeRO-3 shards the `lm_head`s: gather them once for all chunks, whose gradients are computed within this context.
+    with maybe_gather_lm_head_ctx(
+        student_lm_head_weight, student_lm_head_bias, teacher_lm_head_weight, teacher_lm_head_bias
+    ):
+        loss, entropy_sum = _ChunkedDivergence.apply(
+            h_s[:n_padded],
             student_lm_head_weight,
             student_lm_head_bias,
-            student_logit_scale,
-            student_final_logit_softcapping,
-            h_t[start : start + chunk_size],
+            h_t[:n_padded],
             teacher_lm_head_weight,
             teacher_lm_head_bias,
+            valid[:n_padded],
+            chunk_size,
+            student_logit_scale,
+            student_final_logit_softcapping,
             teacher_logit_scale,
             teacher_final_logit_softcapping,
             beta,
             temperature,
-            valid[start : start + chunk_size].float(),
-            use_reentrant=False,
         )
-        loss = loss + chunk_loss
-        entropy_sum = entropy_sum + chunk_entropy
 
     if num_items_in_batch is None:
         # Clamped for the same reason: a fully-masked rank reduces to a finite zero rather than `0 / 0`.
