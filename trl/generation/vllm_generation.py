@@ -181,6 +181,8 @@ class VLLMGeneration:
             plus `max_completion_length`; if omitted, it is inferred from the model config.
         max_num_seqs (`int`, *optional*):
             Maximum number of sequences to process in parallel, effectively capping the batch size.
+        max_num_batched_tokens (`int`, *optional*, defaults to `4096`):
+            Maximum number of tokens processed per engine step. vLLM's larger default misleads its memory profiler.
         enable_sleep_mode (`bool`, *optional*, defaults to `False`):
             Whether to enable sleep mode for the engine to offload weights/cache during the optimizer step. Keeps GPU
             memory usage low, but waking the engine adds host–device transfer latency.
@@ -252,6 +254,7 @@ class VLLMGeneration:
         gpu_memory_utilization: float = 0.9,
         max_model_length: int | None = None,
         max_num_seqs: int | None = None,
+        max_num_batched_tokens: int = 4096,
         enable_sleep_mode: bool = False,
         share_weights: bool = False,
         native_lora: bool = False,
@@ -289,6 +292,7 @@ class VLLMGeneration:
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_length = max_model_length
         self.max_num_seqs = max_num_seqs
+        self.max_num_batched_tokens = max_num_batched_tokens
         self.enable_sleep_mode = enable_sleep_mode
         self.share_weights = share_weights
         self.native_lora = native_lora
@@ -435,8 +439,7 @@ class VLLMGeneration:
                 distributed_executor_backend="external_launcher",
                 # Feed identical seed for tp groups to ensure sampling results are the same across workers
                 seed=accelerator.process_index // self.tensor_parallel_size,
-                # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
-                max_num_batched_tokens=4096,
+                max_num_batched_tokens=self.max_num_batched_tokens,
                 # Important so temperature scaling/logit tweaking affects the TIS log probs
                 logprobs_mode="processed_logprobs",
                 quantization=quantization,

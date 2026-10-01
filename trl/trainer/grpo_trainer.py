@@ -1096,6 +1096,7 @@ class GRPOTrainer(_BaseTrainer):
                 max_num_seqs=args.per_device_train_batch_size
                 * args.vllm_tensor_parallel_size
                 * args.steps_per_generation,
+                max_num_batched_tokens=args.vllm_max_num_batched_tokens,
                 enable_sleep_mode=args.vllm_enable_sleep_mode,
                 share_weights=args.vllm_share_weights,
                 native_lora=args.vllm_native_lora,
