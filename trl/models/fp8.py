@@ -22,6 +22,8 @@ from transformers.utils import is_torchao_available
 
 if is_torchao_available():
     from torchao.float8 import Float8GemmConfig, Float8LinearConfig, convert_to_float8_training
+    from torchao.prototype.moe_training.mxfp8_linear import MXFP8Linear
+    from torchao.quantization.quantize_.common import KernelPreference
 
 
 def quantize_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -82,23 +84,21 @@ def convert_to_fp8_training(model: nn.Module, recipe: str, skip_modules: list[st
 
     With the rowwise recipes, frozen layers (such as the base of a PEFT model) are replaced by [`FP8Linear`], which
     drops their high-precision weight. The LM head, PEFT adapter layers, layers whose dimensions aren't multiples of
-    16, and layers matching `skip_modules` are left unchanged. TorchAO's FP8 is emulated off CUDA.
+    16 (32 for MXFP8), and layers matching `skip_modules` are left unchanged. TorchAO's FP8 is emulated off CUDA.
 
     Args:
         model (`nn.Module`):
             Model to convert in place.
         recipe (`str`):
-            TorchAO float8 recipe, e.g. `"rowwise_with_gw_hp"`.
+            TorchAO float8 recipe, e.g. `"rowwise_with_gw_hp"`, or `"mxfp8_with_gw_hp"` for MXFP8 with
+            high-precision weight gradients.
         skip_modules (`list[str]`, *optional*):
             Glob patterns of the module names to keep in high precision, e.g. `"model.layers.0.*"`. PEFT prefixes and
             `.base_layer` are removed from the names before matching.
     """
-    config = dataclasses.replace(
-        Float8LinearConfig.from_recipe_name(recipe),
-        # Accurate accumulation in every GEMM
-        gemm_config_output=Float8GemmConfig(use_fast_accum=False),
-        emulate=next(model.parameters()).device.type != "cuda",
-    )
+    emulate = next(model.parameters()).device.type != "cuda"
+    mxfp8 = recipe == "mxfp8_with_gw_hp"
+    multiple = 32 if mxfp8 else 16
     head = model.get_output_embeddings()
 
     def is_eligible(module: nn.Module, name: str) -> bool:
@@ -106,17 +106,39 @@ def convert_to_fp8_training(model: nn.Module, recipe: str, skip_modules: list[st
             isinstance(module, nn.Linear)
             and module.weight is not head.weight
             and "lora_" not in name
-            and module.in_features % 16 == 0
-            and module.out_features % 16 == 0
+            and module.in_features % multiple == 0
+            and module.out_features % multiple == 0
             and not any(
                 fnmatch(name.removeprefix("base_model.model.").replace(".base_layer", ""), pattern)
                 for pattern in skip_modules or []
             )
         )
 
-    if recipe == "rowwise_with_gw_hp":
-        for name, module in list(model.named_modules()):
-            if is_eligible(module, name) and not module.weight.requires_grad:
-                parent, _, child = name.rpartition(".")
-                setattr(model.get_submodule(parent), child, FP8Linear(module))
-    convert_to_float8_training(model, module_filter_fn=is_eligible, config=config)
+    for name, module in list(model.named_modules()):
+        if not is_eligible(module, name):
+            continue
+        if mxfp8:
+            fp8_module = MXFP8Linear(
+                module.in_features,
+                module.out_features,
+                bias=module.bias is not None,
+                device="meta",
+                kernel_preference=KernelPreference.EMULATED if emulate else KernelPreference.AUTO,
+                wgrad_with_hp=True,
+            )
+            fp8_module.weight, fp8_module.bias = module.weight, module.bias
+        elif recipe.startswith("rowwise") and not module.weight.requires_grad:
+            fp8_module = FP8Linear(module)
+        else:
+            continue
+        parent, _, child = name.rpartition(".")
+        setattr(model.get_submodule(parent), child, fp8_module)
+
+    if not mxfp8:
+        config = dataclasses.replace(
+            Float8LinearConfig.from_recipe_name(recipe),
+            # Accurate accumulation in every GEMM
+            gemm_config_output=Float8GemmConfig(use_fast_accum=False),
+            emulate=emulate,
+        )
+        convert_to_float8_training(model, module_filter_fn=is_eligible, config=config)

@@ -62,7 +62,9 @@ class GRPOConfig(_BaseConfig):
             forward and input-gradient GEMMs with dynamic rowwise scales and keeps the weight-gradient GEMM in high
             precision; the frozen base of a PEFT model is quantized once to FP8 with per-channel scales, without a
             high-precision copy, and vLLM serves that same base with `vllm_share_weights=True` and
-            `vllm_native_lora=True` (vLLM 0.30.0 or later). Requires `torchao` and a GPU with FP8 support.
+            `vllm_native_lora=True` (vLLM 0.30.0 or later). `"mxfp8_with_gw_hp"` uses MXFP8 instead, with one
+            power-of-two scale per block of 32 values, on Blackwell GPUs. Requires `torchao` and a GPU with FP8
+            support.
         fp8_skip_modules (`list[str]`, *optional*):
             Glob patterns of the linear layers kept in high precision with `fp8_recipe`, e.g. `"model.layers.0.*"`. The
             `tools/fp8_parity/replay.py --target-kl` sensitivity analysis produces such a list.
@@ -509,7 +511,9 @@ class GRPOConfig(_BaseConfig):
             "quantizes the forward and input-gradient GEMMs with dynamic rowwise scales and keeps the weight-gradient "
             "GEMM in high precision; the frozen base of a PEFT model is quantized once to FP8 with per-channel scales, "
             "without a high-precision copy, and vLLM serves that same base with `vllm_share_weights=True` and "
-            "`vllm_native_lora=True` (vLLM 0.30.0 or later). Requires `torchao` and a GPU with FP8 support.",
+            "`vllm_native_lora=True` (vLLM 0.30.0 or later). `'mxfp8_with_gw_hp'` uses MXFP8 instead, with one "
+            "power-of-two scale per block of 32 values, on Blackwell GPUs. Requires `torchao` and a GPU with FP8 "
+            "support.",
         },
     )
     fp8_skip_modules: list[str] | None = field(

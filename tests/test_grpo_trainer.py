@@ -34,6 +34,8 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
     BitsAndBytesConfig,
+    LlamaConfig,
+    LlamaForCausalLM,
 )
 from transformers.testing_utils import backend_empty_cache, torch_device
 from transformers.utils import is_peft_available, is_torchao_available
@@ -64,6 +66,7 @@ if Version(transformers.__version__) >= Version("5.8.0"):
 
 if is_torchao_available():
     from torchao.float8.float8_linear import Float8Linear
+    from torchao.prototype.moe_training.mxfp8_linear import MXFP8Linear
 
     from trl.models.fp8 import FP8Linear
 
@@ -5020,8 +5023,14 @@ def test_micro_batches_crop_completion_padding(tiny_llama, tmp_path):
 
 
 @require_torchao
-def test_fp8_recipe_trains_the_linear_layers_with_fp8_gemms(tiny_llama, tmp_path):
-    model, tokenizer = tiny_llama
+@pytest.mark.parametrize("recipe", ["rowwise_with_gw_hp", "mxfp8_with_gw_hp"])
+def test_fp8_recipe_trains_the_linear_layers_with_fp8_gemms(tiny_llama, tmp_path, recipe):
+    _, tokenizer = tiny_llama
+    # MXFP8 scales blocks of 32 values
+    config = LlamaConfig(
+        vocab_size=32, hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=2
+    )
+    model = LlamaForCausalLM(config)
     linears = {name for name, module in model.named_modules() if isinstance(module, torch.nn.Linear)}
     trainer = GRPOTrainer(
         model=model,
@@ -5036,7 +5045,7 @@ def test_fp8_recipe_trains_the_linear_layers_with_fp8_gemms(tiny_llama, tmp_path
             num_generations=2,
             max_completion_length=4,
             max_steps=1,
-            fp8_recipe="rowwise_with_gw_hp",
+            fp8_recipe=recipe,
             fp8_skip_modules=["*.mlp.down_proj"],
         ),
         train_dataset=Dataset.from_dict({"prompt": ["a", "a a"]}),
@@ -5045,7 +5054,8 @@ def test_fp8_recipe_trains_the_linear_layers_with_fp8_gemms(tiny_llama, tmp_path
 
     trainer.train()
 
-    fp8 = {name for name, module in trainer.model.named_modules() if isinstance(module, Float8Linear)}
+    fp8_class = Float8Linear if recipe == "rowwise_with_gw_hp" else MXFP8Linear
+    fp8 = {name for name, module in trainer.model.named_modules() if isinstance(module, fp8_class)}
     assert fp8 == linears - {"lm_head", "model.layers.0.mlp.down_proj"}
     for name in fp8:
         assert not torch.equal(trainer.model.get_parameter(f"{name}.weight"), previous[f"{name}.weight"])
