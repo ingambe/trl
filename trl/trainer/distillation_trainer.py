@@ -30,7 +30,7 @@ import torch
 import torch.nn.functional as F
 import transformers
 from accelerate.logging import get_logger
-from accelerate.utils import gather_object, is_peft_model, set_seed
+from accelerate.utils import gather_object, is_peft_model, send_to_device, set_seed
 from datasets import Dataset, IterableDataset
 from packaging.version import Version
 from torch.utils.data import DataLoader, Sampler
@@ -1830,8 +1830,12 @@ class DistillationTrainer(_BaseTrainer):
                     for key in ["token_type_ids", "mm_token_type_ids"]:  # span the prompt and the completion
                         if key in batch:
                             batch[key] = batch[key][:, : batch["prompt_ids"].size(1) + completion_length]
-                self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
-            inputs = self._buffered_inputs[self._step % self.args.gradient_accumulation_steps]
+                self._buffered_inputs = [
+                    send_to_device(unsplit_pixel_values_by_grid(batch), "cpu") for batch in generation_batches
+                ]
+            inputs = send_to_device(
+                self._buffered_inputs[self._step % self.args.gradient_accumulation_steps], self.accelerator.device
+            )
         else:
             # In evaluation, there is neither batch grouping for generation, nor multiple iterations, hence
             # local generation batch == local eval batch

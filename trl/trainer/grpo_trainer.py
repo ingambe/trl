@@ -35,7 +35,7 @@ import torch
 import torch.utils.data
 import transformers
 from accelerate.logging import get_logger
-from accelerate.utils import gather, gather_object, is_peft_model, set_seed
+from accelerate.utils import gather, gather_object, is_peft_model, send_to_device, set_seed
 from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict
 from huggingface_hub import CommitScheduler, DatasetCard, DatasetCardData, create_repo
 from packaging.version import Version
@@ -1543,14 +1543,17 @@ class GRPOTrainer(_BaseTrainer):
                     for key in ["token_type_ids", "mm_token_type_ids"]:  # span the prompt and the completion
                         if key in batch:
                             batch[key] = batch[key][:, : batch["prompt_ids"].size(1) + completion_length]
-                self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
+                self._buffered_inputs = [
+                    send_to_device(unsplit_pixel_values_by_grid(batch), "cpu") for batch in generation_batches
+                ]
             index = self._step % self.args.steps_per_generation
             accumulation_steps = self.current_gradient_accumulation_steps
             # Loss tokens of the optimizer step, extrapolated when it spans several generation batches
             start = index - index % accumulation_steps
             num_items = self._buffered_num_items[start : start + accumulation_steps]
             num_items_in_batch = num_items.sum() * accumulation_steps / len(num_items)
-            inputs = {**self._buffered_inputs[index], "num_items_in_batch": num_items_in_batch}
+            inputs = send_to_device(self._buffered_inputs[index], self.accelerator.device)
+            inputs["num_items_in_batch"] = num_items_in_batch
         else:
             # In evaluation, there is neither batch grouping for generation, nor multiple iterations, hence
             # local generation batch == local eval batch
