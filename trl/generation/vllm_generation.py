@@ -734,7 +734,6 @@ class VLLMGeneration:
             self._unmerge()
             self._weights_dirty = True
         if self.mode == "colocate" and self.enable_sleep_mode and not self._kv_cache_sleeping:
-            # Sleeping clears the engine's multimodal cache, so the renderer's must be cleared with it
             self.llm.reset_mm_cache()
             if self.share_weights:
                 # The model trains on vLLM's weights, so only the KV cache is released
