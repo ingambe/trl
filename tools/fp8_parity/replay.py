@@ -199,7 +199,8 @@ def build_trainer(args, overrides: dict) -> GRPOTrainer:
 
     # Deterministic reward with a learnable target, so groups have non-zero advantages
     def reward(completions, **kwargs):
-        return [max(0.0, 1 - abs(len(text) - args.target_chars) / args.target_chars) for text in completions]
+        lengths = [len(c[-1]["content"] if isinstance(c, list) else c) for c in completions]
+        return [max(0.0, 1 - abs(length - args.target_chars) / args.target_chars) for length in lengths]
 
     config = GRPOConfig(
         output_dir=tempfile.mkdtemp(),
@@ -214,7 +215,9 @@ def build_trainer(args, overrides: dict) -> GRPOTrainer:
         report_to="none",
         **{**json.loads(args.config), **overrides},
     )
-    dataset = load_dataset(args.dataset, split="train").select(range(args.batch_size * args.batches))
+    dataset = load_dataset(args.dataset, split="train").select(
+        range(args.batch_size // args.num_generations * args.batches)
+    )
     peft_config = LoraConfig(r=args.lora_rank, target_modules="all-linear") if args.lora_rank else None
     trainer = GRPOTrainer(
         model=args.model, reward_funcs=reward, args=config, train_dataset=dataset, peft_config=peft_config
@@ -249,7 +252,10 @@ def main():
     ref = build_trainer(args, {})
 
     # Freeze the rollouts, with the reference policy as the behavior policy
-    prompts = ref.train_dataset.to_list()
+    if ref.beta != 0.0:
+        raise ValueError("The replay compares updates without a KL term: set `beta=0.0`.")
+    # Each prompt repeated `num_generations` times, as the trainer's sampler lays out a group
+    prompts = [row for row in ref.train_dataset.to_list() for _ in range(args.num_generations)]
     batches = []
     for start in range(0, len(prompts), args.batch_size):
         batch = ref._generate_and_score_completions(prompts[start : start + args.batch_size])
@@ -284,6 +290,7 @@ def main():
             trainer.compute_loss(trainer.model, batch).backward()
             before = {name: p.detach().clone() for name, p in trainer.model.named_parameters() if p.requires_grad}
             grads = {name: p.grad.detach().clone() for name, p in trainer.model.named_parameters() if p.requires_grad}
+            torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), trainer.args.max_grad_norm)
             trainer.optimizer.step()
             deltas = {
                 name: p.detach() - before[name] for name, p in trainer.model.named_parameters() if p.requires_grad

@@ -155,6 +155,8 @@ def convert_to_fp8_training(
     """
     if recipe not in ("rowwise_with_gw_hp", "rowwise", "tensorwise", "mxfp8_with_gw_hp", "mxfp8"):
         raise ValueError(f"Unknown FP8 recipe: {recipe!r}.")
+    if recipe != "rowwise_with_gw_hp" and not is_torchao_available("0.18.0"):
+        raise ImportError(f"The {recipe!r} FP8 recipe requires torchao 0.18.0 or later: `pip install torchao`.")
     if any("lora_magnitude_vector" in name for name, _ in model.named_parameters()):
         raise ValueError("FP8 training doesn't support DoRA, which needs the high-precision base weights.")
     emulate = not torch.cuda.is_available()

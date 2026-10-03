@@ -1022,6 +1022,8 @@ class GRPOTrainer(_BaseTrainer):
         if args.fp8_recipe is not None:
             if _is_quantized_model:
                 raise ValueError("`fp8_recipe` can't be used with a model quantized by bitsandbytes.")
+            if DistributedBackend(self.accelerator).fsdp_version == 1:
+                raise ValueError("`fp8_recipe` requires FSDP2: FSDP1's mixed precision casts the FP8 weight buffers.")
             convert_to_fp8_training(model, args.fp8_recipe, args.fp8_skip_modules, args.fp8_fast_accum)
             if self.ref_model is not None:
                 convert_to_fp8_training(self.ref_model, args.fp8_recipe, args.fp8_skip_modules, args.fp8_fast_accum)
