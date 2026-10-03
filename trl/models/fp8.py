@@ -93,8 +93,8 @@ class FP8Linear(nn.Module):
     Linear layer computed with FP8 GEMMs from an FP8 copy of its weight with per-output-channel scales, the layout of
     vLLM's per-channel FP8.
 
-    A frozen layer keeps only the FP8 copy. A trainable one keeps its high-precision weight, quantizes it at each
-    forward, and computes its gradient in high precision.
+    A frozen layer keeps only the FP8 copy. A trainable one keeps its high-precision weight, requantizes it when it
+    changes, and computes its gradient in high precision.
 
     Args:
         linear (`nn.Linear`):
@@ -108,18 +108,24 @@ class FP8Linear(nn.Module):
         self.fast_accum = fast_accum or []
         self.in_features, self.out_features = linear.in_features, linear.out_features
         self.weight = linear.weight if linear.weight.requires_grad else None
-        if self.weight is None:
-            weight_fp8, weight_scale = quantize_rowwise(linear.weight.detach())
-            self.register_buffer("weight_fp8", weight_fp8)
-            self.register_buffer("weight_scale", weight_scale)
+        weight_fp8, weight_scale = quantize_rowwise(linear.weight.detach())
+        self.register_buffer("weight_fp8", weight_fp8, persistent=self.weight is None)
+        self.register_buffer("weight_scale", weight_scale, persistent=self.weight is None)
         self.bias = linear.bias
+        self._quantized_version = linear.weight._version
+
+    @torch.no_grad()
+    def quantize_weight(self) -> None:
+        """Requantize the FP8 copy in place if the high-precision weight changed since the last quantization."""
+        if self.weight is not None and self.weight._version != self._quantized_version:
+            weight_fp8, weight_scale = quantize_rowwise(self.weight)
+            self.weight_fp8.copy_(weight_fp8)
+            self.weight_scale.copy_(weight_scale)
+            self._quantized_version = self.weight._version
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.weight is None:
-            weight_fp8, weight_scale = self.weight_fp8, self.weight_scale
-        else:
-            weight_fp8, weight_scale = quantize_rowwise(self.weight.detach())
-        out = _FP8Matmul.apply(x, weight_fp8, weight_scale, self.weight, self.fast_accum)
+        self.quantize_weight()
+        out = _FP8Matmul.apply(x, self.weight_fp8, self.weight_scale, self.weight, self.fast_accum)
         return out if self.bias is None else out + self.bias.to(out.dtype)
 
 

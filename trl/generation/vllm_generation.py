@@ -40,7 +40,7 @@ from transformers.utils import (
 from ..distributed import DistributedBackend
 from ..extras.profiling import ProfilingContext
 from ..import_utils import is_vllm_available
-from ..models.fp8 import FP8Linear, quantize_rowwise
+from ..models.fp8 import FP8Linear
 from ..trainer.utils import ensure_master_addr_port
 from .vllm_client import VLLMClient
 
@@ -577,15 +577,12 @@ class VLLMGeneration:
             weight, scale = fp8_views.get(name, (None, None))
             if weight is None or weight.shape != (module.out_features, module.in_features):
                 raise ValueError(f"vLLM doesn't hold `{name}` in per-channel FP8 like the trainer.")
-            if module.weight is not None:
-                # Requantize the updated high-precision weight straight into vLLM's FP8 copy
-                weight_fp8, weight_scale = quantize_rowwise(module.weight)
-                weight.copy_(weight_fp8)
-                scale.copy_(weight_scale)
-            elif not module.weight_fp8.is_set_to(weight):
+            if not module.weight_fp8.is_set_to(weight):
                 weight.copy_(module.weight_fp8)
                 scale.copy_(module.weight_scale)
                 module.weight_fp8, module.weight_scale = weight, scale
+            # Updated trainable weights are requantized straight into vLLM's FP8 copy
+            module.quantize_weight()
         unshared = []
         for name, param in params:
             if name in self._unshareable:

@@ -40,3 +40,19 @@ def test_fp8_linear_matches_its_dequantized_weight_forward_and_backward(trainabl
         # The weight gradient is computed in high precision
         expected_weight_grad = grad.reshape(-1, 48).T @ x.detach().reshape(-1, 64).float()
         torch.testing.assert_close(linear.weight.grad.float(), expected_weight_grad, rtol=2e-2, atol=2e-2)
+
+
+def test_fp8_linear_requantizes_its_weight_once_per_update():
+    layer = FP8Linear(torch.nn.Linear(64, 48))
+    optimizer = torch.optim.SGD(layer.parameters(), lr=0.1)
+
+    for _ in range(2):  # gradient accumulation
+        layer(torch.randn(5, 64)).sum().backward()
+    assert layer.weight_fp8._version == 0
+    optimizer.step()
+    for _ in range(2):
+        layer(torch.randn(5, 64)).sum().backward()
+
+    assert layer.weight_fp8._version == 1
+    weight_fp8, _ = quantize_rowwise(layer.weight.detach())
+    assert torch.equal(layer.weight_fp8.view(torch.uint8), weight_fp8.view(torch.uint8))
