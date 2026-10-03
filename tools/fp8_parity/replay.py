@@ -226,7 +226,7 @@ def build_trainer(args, overrides: dict) -> GRPOTrainer:
     trainer = GRPOTrainer(
         model=args.model, reward_funcs=reward, args=config, train_dataset=dataset, peft_config=peft_config
     )
-    trainer.create_optimizer()
+    trainer.create_optimizer_and_scheduler(num_training_steps=args.steps)
     trainer.current_gradient_accumulation_steps = 1  # set by the training loop
     return trainer
 
@@ -298,6 +298,7 @@ def main():
             }
             torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), trainer.args.max_grad_norm)
             trainer.optimizer.step()
+            trainer.lr_scheduler.step()
             deltas = {
                 name: p.detach() - before[name] for name, p in trainer.model.named_parameters() if p.requires_grad
             }

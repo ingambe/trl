@@ -1024,12 +1024,9 @@ class GRPOTrainer(_BaseTrainer):
                 raise ValueError("`fp8_recipe` can't be used with a model quantized by bitsandbytes.")
             if DistributedBackend(self.accelerator).fsdp_version == 1:
                 raise ValueError("`fp8_recipe` requires FSDP2: FSDP1's mixed precision casts the FP8 weight buffers.")
-            if self.ref_model is not None:
-                # Same frozen layers as the policy, so the FP8 layouts match for `sync_ref_model`
-                for param, ref_param in zip(model.parameters(), self.ref_model.parameters(), strict=True):
-                    ref_param.requires_grad_(param.requires_grad)
-                convert_to_fp8_training(self.ref_model, args.fp8_recipe, args.fp8_skip_modules, args.fp8_fast_accum)
             convert_to_fp8_training(model, args.fp8_recipe, args.fp8_skip_modules, args.fp8_fast_accum)
+            if self.ref_model is not None:
+                convert_to_fp8_training(self.ref_model, args.fp8_recipe, args.fp8_skip_modules, args.fp8_fast_accum)
 
         # Liger's fused linear cross-entropy replaces `model.forward` when training starts, which would drop the fused
         # LM head, so only its layer kernels are applied

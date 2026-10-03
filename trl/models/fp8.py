@@ -16,6 +16,7 @@ import dataclasses
 from fnmatch import fnmatch
 
 import torch
+from packaging.version import Version
 from torch import nn
 from transformers.utils import is_torchao_available
 
@@ -105,6 +106,8 @@ class FP8Linear(nn.Module):
 
     def __init__(self, linear: nn.Linear, fast_accum: list[str] | None = None):
         super().__init__()
+        if torch.version.hip is not None:
+            raise ValueError("FP8Linear uses the OCP float8_e4m3fn format, which ROCm doesn't compute natively.")
         self.fast_accum = fast_accum or []
         self.in_features, self.out_features = linear.in_features, linear.out_features
         self.weight = linear.weight if linear.weight.requires_grad else None
@@ -136,9 +139,9 @@ def convert_to_fp8_training(
     Run the linear layers of a model with FP8 GEMMs, keeping their parameters in their original precision.
 
     `"rowwise_with_gw_hp"` uses [`FP8Linear`], whose FP8 weights vLLM can share, and so does `"rowwise"` for frozen
-    layers. Frozen [`FP8Linear`] layers, such as the base of a PEFT model, drop their high-precision weight. The LM
-    head, MoE experts, PEFT adapter layers, layers whose dimensions aren't multiples of 16 (32 for MXFP8), and layers
-    matching `skip_modules` are left unchanged. TorchAO's FP8 is emulated without CUDA.
+    layers of a PEFT base, which drop their high-precision weight. Other frozen layers stay in high precision with
+    `"rowwise_with_gw_hp"`. The LM head, MoE experts, PEFT adapter layers, layers whose dimensions aren't multiples of
+    16 (32 for MXFP8), and layers matching `skip_modules` are left unchanged. TorchAO's FP8 is emulated without CUDA.
 
     Args:
         model (`nn.Module`):
@@ -157,6 +160,8 @@ def convert_to_fp8_training(
         raise ValueError(f"Unknown FP8 recipe: {recipe!r}.")
     if recipe != "rowwise_with_gw_hp" and not is_torchao_available("0.18.0"):
         raise ImportError(f"The {recipe!r} FP8 recipe requires torchao 0.18.0 or later: `pip install torchao`.")
+    if recipe == "rowwise_with_gw_hp" and Version(torch.__version__) < Version("2.5.0"):
+        raise ImportError("The 'rowwise_with_gw_hp' FP8 recipe requires PyTorch 2.5.0 or later.")
     if any("lora_magnitude_vector" in name for name, _ in model.named_parameters()):
         raise ValueError("FP8 training doesn't support DoRA, which needs the high-precision base weights.")
     emulate = not torch.cuda.is_available()
@@ -192,7 +197,10 @@ def convert_to_fp8_training(
                 wgrad_with_hp=recipe == "mxfp8_with_gw_hp",
             )
             fp8_module.weight, fp8_module.bias = module.weight, module.bias
-        elif recipe == "rowwise_with_gw_hp" or (recipe == "rowwise" and not module.weight.requires_grad):
+        # Only a PEFT base, which checkpoints never include, can drop its high-precision weight
+        elif recipe in ("rowwise_with_gw_hp", "rowwise") and ".base_layer" in name and not module.weight.requires_grad:
+            fp8_module = FP8Linear(module, fast_accum)
+        elif recipe == "rowwise_with_gw_hp" and module.weight.requires_grad:
             fp8_module = FP8Linear(module, fast_accum)
         else:
             continue
