@@ -34,11 +34,15 @@ from functools import partial
 
 import torch
 from datasets import load_dataset
-from peft import LoraConfig
 from transformers import set_seed
+from transformers.utils import is_peft_available
 
 from trl import GRPOConfig, GRPOTrainer
 from trl.models.fp8 import convert_to_fp8_training
+
+
+if is_peft_available():
+    from peft import LoraConfig
 
 
 # Smallest positive float8_e4m3fn value
@@ -202,19 +206,19 @@ def build_trainer(args, overrides: dict) -> GRPOTrainer:
         lengths = [len(c[-1]["content"] if isinstance(c, list) else c) for c in completions]
         return [max(0.0, 1 - abs(length - args.target_chars) / args.target_chars) for length in lengths]
 
-    config = GRPOConfig(
-        output_dir=tempfile.mkdtemp(),
-        model_init_kwargs={"dtype": "bfloat16"},
-        bf16=True,
-        disable_dropout=True,
-        per_device_train_batch_size=args.batch_size,
-        num_generations=args.num_generations,
-        max_completion_length=args.max_completion_length,
-        learning_rate=args.learning_rate,
-        seed=args.seed,
-        report_to="none",
-        **{**json.loads(args.config), **overrides},
-    )
+    config = {
+        "output_dir": tempfile.mkdtemp(),
+        "model_init_kwargs": {"dtype": "bfloat16"},
+        "bf16": True,
+        "disable_dropout": True,
+        "per_device_train_batch_size": args.batch_size,
+        "num_generations": args.num_generations,
+        "max_completion_length": args.max_completion_length,
+        "learning_rate": args.learning_rate,
+        "seed": args.seed,
+        "report_to": "none",
+    }
+    config = GRPOConfig(**{**config, **json.loads(args.config), **overrides})
     dataset = load_dataset(args.dataset, split="train").select(
         range(args.batch_size // args.num_generations * args.batches)
     )
@@ -289,7 +293,9 @@ def main():
             trainer.optimizer.zero_grad()
             trainer.compute_loss(trainer.model, batch).backward()
             before = {name: p.detach().clone() for name, p in trainer.model.named_parameters() if p.requires_grad}
-            grads = {name: p.grad.detach().clone() for name, p in trainer.model.named_parameters() if p.requires_grad}
+            grads = {
+                name: p.grad.detach().clone() for name, p in trainer.model.named_parameters() if p.grad is not None
+            }
             torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), trainer.args.max_grad_norm)
             trainer.optimizer.step()
             deltas = {
@@ -301,7 +307,9 @@ def main():
                 handle.remove()
 
         (ref_grads, ref_deltas), (cand_grads, cand_deltas) = updates
-        grad_cosines = {name: cosine(ref_grads[name], cand_grads[name]) for name in ref_grads}
+        grad_cosines = {
+            name: cosine(ref_grads[name], cand_grads[name]) for name in ref_grads.keys() & cand_grads.keys()
+        }
         cand_params = dict(cand.model.named_parameters())
         drift = sum(
             (cand_params[name].detach() - p.detach()).float().norm() ** 2

@@ -137,8 +137,8 @@ def convert_to_fp8_training(
 
     `"rowwise_with_gw_hp"` uses [`FP8Linear`], whose FP8 weights vLLM can share, and so does `"rowwise"` for frozen
     layers. Frozen [`FP8Linear`] layers, such as the base of a PEFT model, drop their high-precision weight. The LM
-    head, PEFT adapter layers, layers whose dimensions aren't multiples of 16 (32 for MXFP8), and layers matching
-    `skip_modules` are left unchanged. TorchAO's FP8 is emulated without CUDA.
+    head, MoE experts, PEFT adapter layers, layers whose dimensions aren't multiples of 16 (32 for MXFP8), and layers
+    matching `skip_modules` are left unchanged. TorchAO's FP8 is emulated without CUDA.
 
     Args:
         model (`nn.Module`):
@@ -170,6 +170,7 @@ def convert_to_fp8_training(
             isinstance(module, nn.Linear)
             and module.weight is not head.weight
             and "lora_" not in name
+            and ".experts." not in name
             and module.in_features % multiple == 0
             and module.out_features % multiple == 0
             and not any(
