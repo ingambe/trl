@@ -483,7 +483,8 @@ class OnlineDPOTrainer(_BaseTrainer):
                     "tensor_parallel_size": self.vllm_tensor_parallel_size,
                     "gpu_memory_utilization": self.vllm_gpu_memory_utilization,
                     "model_impl": self.vllm_model_impl,
-                    "max_num_seqs": self.args.per_device_train_batch_size * self.vllm_tensor_parallel_size,
+                    "max_num_seqs": self.args.vllm_max_num_seqs
+                    or self.args.per_device_train_batch_size * self.vllm_tensor_parallel_size,
                     "max_model_len": args.max_length + args.max_new_tokens,  # max_length includes prompt + completion
                     "distributed_executor_backend": "external_launcher",
                     # Feed identical seed for tp groups to ensure sampling results are the same across workers
