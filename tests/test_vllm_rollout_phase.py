@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import call
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -46,3 +46,15 @@ def test_sleep_does_not_sleep_an_asleep_engine(vllm_generation):
     vllm_generation.sleep()
 
     vllm_generation.llm.sleep.assert_not_called()
+
+
+@pytest.mark.parametrize("share_weights", [False, True])
+def test_sleep_resets_the_multimodal_cache(vllm_generation, monkeypatch, share_weights):
+    monkeypatch.setattr("trl.generation.vllm_generation.is_vllm_available", lambda min_version: True)
+    monkeypatch.setattr("trl.generation.vllm_generation.CuMemAllocator", Mock(), raising=False)
+    vllm_generation.enable_sleep_mode = True
+    vllm_generation.share_weights = share_weights
+    vllm_generation._kv_cache_sleeping = False
+    vllm_generation.sleep()
+
+    vllm_generation.llm.reset_mm_cache.assert_called_once_with()
