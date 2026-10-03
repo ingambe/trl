@@ -184,6 +184,10 @@ class VLLMGeneration:
             Maximum number of sequences to process in parallel, effectively capping the batch size.
         max_num_batched_tokens (`int`, *optional*, defaults to `4096`):
             Maximum number of tokens processed per engine step. vLLM's larger default misleads its memory profiler.
+        kv_cache_dtype (`str`, *optional*, defaults to `"auto"`):
+            Data type of the KV cache, e.g. `"fp8_per_token_head"`.
+        kv_cache_dtype_skip_layers (`list[str]`, *optional*):
+            Layer indices or attention types whose KV cache keeps the model dtype. Requires vLLM 0.30.0 or later.
         enable_sleep_mode (`bool`, *optional*, defaults to `False`):
             Whether to enable sleep mode for the engine to offload weights/cache during the optimizer step. Keeps GPU
             memory usage low, but waking the engine adds host–device transfer latency.
@@ -256,6 +260,8 @@ class VLLMGeneration:
         max_model_length: int | None = None,
         max_num_seqs: int | None = None,
         max_num_batched_tokens: int = 4096,
+        kv_cache_dtype: str = "auto",
+        kv_cache_dtype_skip_layers: list[str] | None = None,
         enable_sleep_mode: bool = False,
         share_weights: bool = False,
         native_lora: bool = False,
@@ -294,6 +300,8 @@ class VLLMGeneration:
         self.max_model_length = max_model_length
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens
+        self.kv_cache_dtype = kv_cache_dtype
+        self.kv_cache_dtype_skip_layers = kv_cache_dtype_skip_layers
         self.enable_sleep_mode = enable_sleep_mode
         self.share_weights = share_weights
         self.native_lora = native_lora
@@ -396,6 +404,8 @@ class VLLMGeneration:
                     "quantization."
                 )
             fp8_kwargs = {}
+            if self.kv_cache_dtype_skip_layers:
+                fp8_kwargs["kv_cache_dtype_skip_layers"] = self.kv_cache_dtype_skip_layers
             if fp8_base:
                 if not is_vllm_available(min_version="0.30.0"):
                     raise ImportError("Sharing an FP8 base with vLLM requires vLLM 0.30.0 or later.")
@@ -463,6 +473,7 @@ class VLLMGeneration:
                 # Feed identical seed for tp groups to ensure sampling results are the same across workers
                 seed=accelerator.process_index // self.tensor_parallel_size,
                 max_num_batched_tokens=self.max_num_batched_tokens,
+                kv_cache_dtype=self.kv_cache_dtype,
                 # Important so temperature scaling/logit tweaking affects the TIS log probs
                 logprobs_mode="processed_logprobs",
                 quantization=quantization,

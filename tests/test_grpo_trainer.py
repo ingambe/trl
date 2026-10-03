@@ -4901,6 +4901,7 @@ def test_cast_lm_head_to_fp32_sets_vllm_head_dtype(tiny_llama, tmp_path):
     with (
         patch("trl.generation.vllm_generation.is_vllm_available", return_value=True),
         patch("trl.generation.vllm_generation.LLM", create=True) as llm,
+        patch.dict(os.environ),  # colocated vLLM sets RANK, LOCAL_RANK and WORLD_SIZE
     ):
         GRPOTrainer(
             model=model,
@@ -4920,6 +4921,34 @@ def test_cast_lm_head_to_fp32_sets_vllm_head_dtype(tiny_llama, tmp_path):
         )
 
     assert llm.call_args.kwargs["hf_overrides"] == {"head_dtype": "float32"}
+
+
+def test_vllm_kv_cache_dtype_reaches_vllm(tiny_llama, tmp_path):
+    model, tokenizer = tiny_llama
+    with (
+        patch("trl.generation.vllm_generation.is_vllm_available", return_value=True),
+        patch("trl.generation.vllm_generation.LLM", create=True) as llm,
+        patch.dict(os.environ),  # colocated vLLM sets RANK, LOCAL_RANK and WORLD_SIZE
+    ):
+        GRPOTrainer(
+            model=model,
+            processing_class=tokenizer,
+            reward_funcs=lambda completions, **kwargs: [0.0] * len(completions),
+            args=GRPOConfig(
+                output_dir=str(tmp_path),
+                report_to="none",
+                per_device_train_batch_size=2,
+                num_generations=2,
+                use_vllm=True,
+                vllm_mode="colocate",
+                vllm_kv_cache_dtype="fp8_per_token_head",
+                vllm_kv_cache_dtype_skip_layers=["0"],
+            ),
+            train_dataset=Dataset.from_dict({"prompt": ["a", "a"]}),
+        )
+
+    assert llm.call_args.kwargs["kv_cache_dtype"] == "fp8_per_token_head"
+    assert llm.call_args.kwargs["kv_cache_dtype_skip_layers"] == ["0"]
 
 
 @pytest.mark.parametrize("loss_type", ["grpo", "dapo"])
