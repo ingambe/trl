@@ -204,6 +204,7 @@ def build_trainer(args, overrides: dict) -> GRPOTrainer:
         output_dir=tempfile.mkdtemp(),
         model_init_kwargs={"dtype": "bfloat16"},
         bf16=True,
+        disable_dropout=True,
         per_device_train_batch_size=args.batch_size,
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,

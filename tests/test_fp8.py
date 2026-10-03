@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from trl.models.fp8 import FP8Linear, quantize_rowwise
+from trl.trainer.callbacks import SyncRefModelCallback
 
 
 @pytest.mark.parametrize("trainable", [False, True])
@@ -56,3 +57,13 @@ def test_fp8_linear_requantizes_its_weight_once_per_update():
     assert layer.weight_fp8._version == 1
     weight_fp8, _ = quantize_rowwise(layer.weight.detach())
     assert torch.equal(layer.weight_fp8.view(torch.uint8), weight_fp8.view(torch.uint8))
+
+
+def test_fp8_reference_model_sees_synced_weights():
+    model, ref_model = torch.nn.Linear(64, 48), FP8Linear(torch.nn.Linear(64, 48))
+
+    SyncRefModelCallback._sync_target_model(model, ref_model, alpha=1.0)
+    ref_model(torch.randn(5, 64))
+
+    weight_fp8, _ = quantize_rowwise(model.weight.detach())
+    assert torch.equal(ref_model.weight_fp8.view(torch.uint8), weight_fp8.view(torch.uint8))

@@ -1020,6 +1020,8 @@ class GRPOTrainer(_BaseTrainer):
                 _cast_lm_head_to_fp32(self.ref_model)
 
         if args.fp8_recipe is not None:
+            if _is_quantized_model:
+                raise ValueError("`fp8_recipe` can't be used with a model quantized by bitsandbytes.")
             convert_to_fp8_training(model, args.fp8_recipe, args.fp8_skip_modules, args.fp8_fast_accum)
             if self.ref_model is not None:
                 convert_to_fp8_training(self.ref_model, args.fp8_recipe, args.fp8_skip_modules, args.fp8_fast_accum)
