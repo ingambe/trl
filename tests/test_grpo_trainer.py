@@ -34,6 +34,7 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
     BitsAndBytesConfig,
+    TrainerCallback,
 )
 from transformers.testing_utils import backend_empty_cache, torch_device
 from transformers.utils import is_peft_available
@@ -2905,7 +2906,7 @@ class TestGRPOTrainer(TrlTestCase):
             output_dir=self.tmp_dir,
             learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
             max_completion_length=8,  # reduce the completion length to reduce memory usage
-            gradient_accumulation_steps=3,  # can be anything in this test
+            gradient_accumulation_steps=2,  # any divisor of steps_per_generation
             # steps_per_generation*per_device_train_batch_size=24 is divisible by num_generations=4
             steps_per_generation=4,
             num_generations=4,
@@ -4982,3 +4983,114 @@ def test_micro_batches_crop_completion_padding(tiny_llama, tmp_path):
     widths = [batch["completion_ids"].size(1) for batch in trainer._buffered_inputs]
     assert widths == [batch["completion_lengths"].max().item() for batch in trainer._buffered_inputs]
     assert min(widths) < 32
+
+
+@pytest.mark.parametrize("loss_type", ["dapo", "cispo", "vespo"])
+def test_token_level_loss_is_normalized_per_optimizer_step(loss_type, tiny_llama, tmp_path):
+    model, tokenizer = tiny_llama
+    # Fixed rollouts with unequal lengths, environment tokens, a truncated row (index 3) and a tied group (rows 0-1)
+    lengths = [5, 5, 1, 12, 9, 2, 14, 4]
+    generator = torch.Generator().manual_seed(0)
+    completion_ids = [torch.randint(2, 32, (n - 1,), generator=generator).tolist() + [1] for n in lengths]
+    completion_ids[3][-1] = 2
+
+    def rollout_func(prompts, trainer):
+        return {
+            "prompt_ids": [[2]] * len(prompts),
+            "completion_ids": completion_ids,
+            "logprobs": [[0.0] * len(ids) for ids in completion_ids],
+            "env_mask": [[int(i % 3 != 2) for i in range(len(ids))] for ids in completion_ids],
+        }
+
+    def reward(completion_ids, **kwargs):
+        return [float(len(ids)) for ids in completion_ids]
+
+    class RecordGradients(TrainerCallback):
+        def on_pre_optimizer_step(self, args, state, control, model, **kwargs):
+            gradients.append({n: p.grad.clone() for n, p in model.named_parameters()})
+
+    runs = []
+    for per_device_train_batch_size, gradient_accumulation_steps, num_iterations, skip_zero_advantages in [
+        (4, 1, 1, False),  # two optimizer steps of 4 rows
+        (2, 2, 2, True),  # the same steps split into micro-batches, skipping zero advantages, run twice
+        (8, 1, 1, True),  # one optimizer step of 8 rows
+    ]:
+        gradients = []
+        trainer = GRPOTrainer(
+            model=copy.deepcopy(model),
+            processing_class=tokenizer,
+            reward_funcs=reward,
+            args=GRPOConfig(
+                output_dir=str(tmp_path),
+                report_to="none",
+                bf16=False,
+                loss_type=loss_type,
+                learning_rate=0.0,
+                max_grad_norm=0.0,
+                per_device_train_batch_size=per_device_train_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                generation_batch_size=8,
+                num_generations=2,
+                num_iterations=num_iterations,
+                max_steps=8 * num_iterations // (per_device_train_batch_size * gradient_accumulation_steps),
+                mask_truncated_completions=True,
+                skip_zero_advantages=skip_zero_advantages,
+            ),
+            train_dataset=Dataset.from_dict({"prompt": ["a"] * 4}),
+            rollout_func=rollout_func,
+            callbacks=[RecordGradients()],
+        )
+        trainer.train()
+        runs.append(gradients)
+        if len(runs) == 1:  # loss tokens of each optimizer step
+            num_tokens = [(b["completion_mask"] * b["tool_mask"]).sum() for b in trainer._buffered_inputs]
+
+    reference, split, merged = runs
+    # The micro-batch split, skipped rows and rollout reuse leave each optimizer step's gradient unchanged
+    for i, gradient in enumerate(split):
+        torch.testing.assert_close(gradient, reference[i % 2])
+    # Splitting a step in two is a token-weighted average of the two steps
+    expected = {
+        n: sum(t * g[n] for t, g in zip(num_tokens, reference, strict=True)) / sum(num_tokens) for n in merged[0]
+    }
+    torch.testing.assert_close(merged[0], expected)
+
+
+def test_token_level_loss_extrapolates_across_generation_batches(tiny_llama, tmp_path):
+    model, tokenizer = tiny_llama
+
+    def reward(completion_ids, **kwargs):
+        return [float(len(ids)) for ids in completion_ids]
+
+    trainer = GRPOTrainer(
+        model=model,
+        processing_class=tokenizer,
+        reward_funcs=reward,
+        args=GRPOConfig(
+            output_dir=str(tmp_path),
+            report_to="none",
+            bf16=False,
+            per_device_train_batch_size=2,
+            gradient_accumulation_steps=4,
+            generation_batch_size=4,
+            num_generations=2,
+            max_completion_length=8,
+            num_train_epochs=2,
+        ),
+        train_dataset=Dataset.from_dict({"prompt": ["a", "a a", "a a a"]}),
+    )
+    seen = []
+    compute_loss = trainer._compute_loss
+
+    def spy(model, inputs):
+        num_items = trainer._buffered_num_items.sum() * trainer.current_gradient_accumulation_steps / 2
+        seen.append((inputs["num_items_in_batch"], num_items, trainer.current_gradient_accumulation_steps))
+        return compute_loss(model, inputs)
+
+    trainer._compute_loss = spy
+    trainer.train()
+
+    # A step spanning several generation batches extrapolates each one's token count, short final steps included
+    assert any(accumulation_steps < 4 for _, _, accumulation_steps in seen)
+    for num_items_in_batch, num_items, _ in seen:
+        torch.testing.assert_close(num_items_in_batch, num_items)
