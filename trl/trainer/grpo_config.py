@@ -63,11 +63,14 @@ class GRPOConfig(_BaseConfig):
             precision; the frozen base of a PEFT model is quantized once to FP8 with per-channel scales, without a
             high-precision copy, and vLLM serves that same base with `vllm_share_weights=True` and
             `vllm_native_lora=True` (vLLM 0.30.0 or later). `"mxfp8_with_gw_hp"` uses MXFP8 instead, with one
-            power-of-two scale per block of 32 values, on Blackwell GPUs. Requires `torchao` and a GPU with FP8
-            support.
+            power-of-two scale per block of 32 values, on Blackwell GPUs. `"rowwise"`, `"tensorwise"` and `"mxfp8"`
+            also quantize the weight-gradient GEMM. Requires `torchao` and a GPU with FP8 support.
         fp8_skip_modules (`list[str]`, *optional*):
             Glob patterns of the linear layers kept in high precision with `fp8_recipe`, e.g. `"model.layers.0.*"`. The
             `tools/fp8_parity/replay.py --target-kl` sensitivity analysis produces such a list.
+        fp8_fast_accum (`list[str]`, *optional*):
+            FP8 GEMMs (`"output"`, `"grad_input"`, `"grad_weight"`) that use the faster, less accurate accumulation
+            with `fp8_recipe`. All GEMMs accumulate accurately by default. Not available with MXFP8.
 
         > Parameters that control the data preprocessing
 
@@ -512,8 +515,8 @@ class GRPOConfig(_BaseConfig):
             "GEMM in high precision; the frozen base of a PEFT model is quantized once to FP8 with per-channel scales, "
             "without a high-precision copy, and vLLM serves that same base with `vllm_share_weights=True` and "
             "`vllm_native_lora=True` (vLLM 0.30.0 or later). `'mxfp8_with_gw_hp'` uses MXFP8 instead, with one "
-            "power-of-two scale per block of 32 values, on Blackwell GPUs. Requires `torchao` and a GPU with FP8 "
-            "support.",
+            "power-of-two scale per block of 32 values, on Blackwell GPUs. `'rowwise'`, `'tensorwise'` and `'mxfp8'` "
+            "also quantize the weight-gradient GEMM. Requires `torchao` and a GPU with FP8 support.",
         },
     )
     fp8_skip_modules: list[str] | None = field(
@@ -522,6 +525,13 @@ class GRPOConfig(_BaseConfig):
             "help": "Glob patterns of the linear layers kept in high precision with `fp8_recipe`, e.g. "
             "`'model.layers.0.*'`. The `tools/fp8_parity/replay.py --target-kl` sensitivity analysis produces such a "
             "list."
+        },
+    )
+    fp8_fast_accum: list[str] | None = field(
+        default=None,
+        metadata={
+            "help": "FP8 GEMMs (`'output'`, `'grad_input'`, `'grad_weight'`) that use the faster, less accurate "
+            "accumulation with `fp8_recipe`. All GEMMs accumulate accurately by default. Not available with MXFP8."
         },
     )
 

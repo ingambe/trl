@@ -5023,7 +5023,7 @@ def test_micro_batches_crop_completion_padding(tiny_llama, tmp_path):
 
 
 @require_torchao
-@pytest.mark.parametrize("recipe", ["rowwise_with_gw_hp", "mxfp8_with_gw_hp"])
+@pytest.mark.parametrize("recipe", ["rowwise_with_gw_hp", "rowwise", "tensorwise", "mxfp8_with_gw_hp", "mxfp8"])
 def test_fp8_recipe_trains_the_linear_layers_with_fp8_gemms(tiny_llama, tmp_path, recipe):
     _, tokenizer = tiny_llama
     # MXFP8 scales blocks of 32 values
@@ -5047,6 +5047,7 @@ def test_fp8_recipe_trains_the_linear_layers_with_fp8_gemms(tiny_llama, tmp_path
             max_steps=1,
             fp8_recipe=recipe,
             fp8_skip_modules=["*.mlp.down_proj"],
+            fp8_fast_accum=["grad_weight"],
         ),
         train_dataset=Dataset.from_dict({"prompt": ["a", "a a"]}),
     )
@@ -5054,9 +5055,12 @@ def test_fp8_recipe_trains_the_linear_layers_with_fp8_gemms(tiny_llama, tmp_path
 
     trainer.train()
 
-    fp8_class = Float8Linear if recipe == "rowwise_with_gw_hp" else MXFP8Linear
+    fp8_class = MXFP8Linear if recipe.startswith("mxfp8") else Float8Linear
     fp8 = {name for name, module in trainer.model.named_modules() if isinstance(module, fp8_class)}
     assert fp8 == linears - {"lm_head", "model.layers.0.mlp.down_proj"}
+    if fp8_class is Float8Linear:
+        gemms = trainer.model.get_submodule(next(iter(fp8))).config
+        assert not gemms.gemm_config_output.use_fast_accum and gemms.gemm_config_grad_weight.use_fast_accum
     for name in fp8:
         assert not torch.equal(trainer.model.get_parameter(f"{name}.weight"), previous[f"{name}.weight"])
 
