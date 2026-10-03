@@ -71,6 +71,7 @@ from ..extras.profiling import profiling_context, profiling_decorator
 from ..generation.vllm_generation import VLLMGeneration
 from ..import_utils import is_jmespath_available
 from ..models import prepare_deepspeed, prepare_fsdp, unwrap_model_for_generation
+from ..models.fp8 import convert_to_fp8_training
 from ..models.utils import disable_gradient_checkpointing
 from .base_trainer import _BaseTrainer
 from .callbacks import SyncRefModelCallback
@@ -1017,6 +1018,11 @@ class GRPOTrainer(_BaseTrainer):
             _cast_lm_head_to_fp32(model)
             if self.ref_model is not None:
                 _cast_lm_head_to_fp32(self.ref_model)
+
+        if args.fp8_recipe is not None:
+            convert_to_fp8_training(model, args.fp8_recipe)
+            if self.ref_model is not None:
+                convert_to_fp8_training(self.ref_model, args.fp8_recipe)
 
         # Liger's fused linear cross-entropy replaces `model.forward` when training starts, which would drop the fused
         # LM head, so only its layer kernels are applied

@@ -36,7 +36,7 @@ from transformers import (
     BitsAndBytesConfig,
 )
 from transformers.testing_utils import backend_empty_cache, torch_device
-from transformers.utils import is_peft_available
+from transformers.utils import is_peft_available, is_torchao_available
 
 from trl import GRPOConfig, GRPOTrainer
 
@@ -50,6 +50,7 @@ from .testing_utils import (
     require_peft_target_parameters,
     require_response_parsing,
     require_torch_accelerator,
+    require_torchao,
     require_vision,
     require_vllm,
     xfail_data_parallel,
@@ -60,6 +61,9 @@ if Version(transformers.__version__) >= Version("5.8.0"):
     from transformers.generation import ContinuousBatchingConfig
     from transformers.generation.continuous_batching.continuous_api import ContinuousMixin
     from transformers.generation.continuous_batching.requests import GenerationOutput
+
+if is_torchao_available():
+    from torchao.float8.float8_linear import Float8Linear
 
 if is_peft_available():
     import peft
@@ -4982,3 +4986,34 @@ def test_micro_batches_crop_completion_padding(tiny_llama, tmp_path):
     widths = [batch["completion_ids"].size(1) for batch in trainer._buffered_inputs]
     assert widths == [batch["completion_lengths"].max().item() for batch in trainer._buffered_inputs]
     assert min(widths) < 32
+
+
+@require_torchao
+def test_fp8_recipe_trains_every_linear_layer_but_the_lm_head_with_fp8_gemms(tiny_llama, tmp_path):
+    model, tokenizer = tiny_llama
+    linears = {name for name, module in model.named_modules() if isinstance(module, torch.nn.Linear)}
+    trainer = GRPOTrainer(
+        model=model,
+        processing_class=tokenizer,
+        reward_funcs=lambda completions, **kwargs: [float(i % 2) for i in range(len(completions))],
+        args=GRPOConfig(
+            output_dir=str(tmp_path),
+            report_to="none",
+            bf16=False,
+            learning_rate=0.1,
+            per_device_train_batch_size=4,
+            num_generations=2,
+            max_completion_length=4,
+            max_steps=1,
+            fp8_recipe="rowwise_with_gw_hp",
+        ),
+        train_dataset=Dataset.from_dict({"prompt": ["a", "a a"]}),
+    )
+    previous = {name: param.detach().clone() for name, param in trainer.model.named_parameters()}
+
+    trainer.train()
+
+    fp8 = {name for name, module in trainer.model.named_modules() if isinstance(module, Float8Linear)}
+    assert fp8 == linears - {"lm_head"}
+    for name in fp8:
+        assert not torch.equal(trainer.model.get_parameter(f"{name}.weight"), previous[f"{name}.weight"])

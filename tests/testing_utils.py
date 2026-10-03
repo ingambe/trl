@@ -30,6 +30,7 @@ from transformers.utils import (
     is_torch_available,
     is_torch_bf16_gpu_available,
     is_torch_xla_available,
+    is_torchao_available,
     is_vision_available,
 )
 
@@ -58,6 +59,7 @@ require_math_latex = pytest.mark.skipif(not is_math_verify_available(), reason="
 require_mergekit = pytest.mark.skipif(not is_mergekit_available(), reason="test requires mergekit")
 require_openreward = pytest.mark.skipif(not is_openreward_available(), reason="test requires openreward")
 require_peft = pytest.mark.skipif(not is_peft_available(), reason="test requires peft")
+require_torchao = pytest.mark.skipif(not is_torchao_available(), reason="test requires torchao")
 # `LoraConfig.target_parameters` was added in peft 0.17.0; on older versions the field doesn't exist at all.
 require_peft_target_parameters = pytest.mark.skipif(
     not is_peft_available() or Version(peft.__version__) < Version("0.17.0"),

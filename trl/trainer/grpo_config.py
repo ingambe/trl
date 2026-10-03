@@ -56,6 +56,11 @@ class GRPOConfig(_BaseConfig):
             has untied word embedding and language modeling head layers i.e. `tie_word_embeddings` in the model config
             is False. Also applies to vLLM in colocate mode; in server mode, start the server with `--hf-overrides
             '{"head_dtype": "float32"}'` (vLLM 0.26.0 or later).
+        fp8_recipe (`str`, *optional*):
+            TorchAO float8 recipe used to run the linear layers with FP8 GEMMs, keeping the parameters, the LM head,
+            the norms, the attention and the loss in their original precision. `"rowwise_with_gw_hp"` quantizes the
+            forward and input-gradient GEMMs with dynamic rowwise scales and keeps the weight-gradient GEMM in high
+            precision. Requires `torchao` and a GPU with FP8 support.
 
         > Parameters that control the data preprocessing
 
@@ -482,6 +487,15 @@ class GRPOConfig(_BaseConfig):
             "supported when the model has untied word embedding and language modeling head layers i.e. "
             "`tie_word_embeddings` in the model config is False. Also applies to vLLM in colocate mode; in server mode, "
             'start the server with `--hf-overrides \'{"head_dtype": "float32"}\'` (vLLM 0.26.0 or later).'
+        },
+    )
+    fp8_recipe: str | None = field(
+        default=None,
+        metadata={
+            "help": "TorchAO float8 recipe used to run the linear layers with FP8 GEMMs, keeping the parameters, the "
+            "LM head, the norms, the attention and the loss in their original precision. `'rowwise_with_gw_hp'` "
+            "quantizes the forward and input-gradient GEMMs with dynamic rowwise scales and keeps the weight-gradient "
+            "GEMM in high precision. Requires `torchao` and a GPU with FP8 support.",
         },
     )
 
