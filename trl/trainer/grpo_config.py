@@ -60,7 +60,8 @@ class GRPOConfig(_BaseConfig):
             TorchAO float8 recipe used to run the linear layers with FP8 GEMMs, keeping the parameters, the LM head,
             the norms, the attention and the loss in their original precision. `"rowwise_with_gw_hp"` quantizes the
             forward and input-gradient GEMMs with dynamic rowwise scales and keeps the weight-gradient GEMM in high
-            precision. Requires `torchao` and a GPU with FP8 support.
+            precision; the frozen base of a PEFT model is quantized once to FP8 with per-channel scales, without a
+            high-precision copy. Requires `torchao` and a GPU with FP8 support.
         fp8_skip_modules (`list[str]`, *optional*):
             Glob patterns of the linear layers kept in high precision with `fp8_recipe`, e.g. `"model.layers.0.*"`. The
             `tools/fp8_parity/replay.py --target-kl` sensitivity analysis produces such a list.
@@ -498,7 +499,8 @@ class GRPOConfig(_BaseConfig):
             "help": "TorchAO float8 recipe used to run the linear layers with FP8 GEMMs, keeping the parameters, the "
             "LM head, the norms, the attention and the loss in their original precision. `'rowwise_with_gw_hp'` "
             "quantizes the forward and input-gradient GEMMs with dynamic rowwise scales and keeps the weight-gradient "
-            "GEMM in high precision. Requires `torchao` and a GPU with FP8 support.",
+            "GEMM in high precision; the frozen base of a PEFT model is quantized once to FP8 with per-channel scales, "
+            "without a high-precision copy. Requires `torchao` and a GPU with FP8 support.",
         },
     )
     fp8_skip_modules: list[str] | None = field(

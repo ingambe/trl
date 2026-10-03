@@ -1020,6 +1020,11 @@ class GRPOTrainer(_BaseTrainer):
                 _cast_lm_head_to_fp32(self.ref_model)
 
         if args.fp8_recipe is not None:
+            if is_peft_model(model) and args.fp8_recipe == "rowwise_with_gw_hp" and self.use_vllm:
+                raise ValueError(
+                    "vLLM can't serve a PEFT adapter over an FP8 base: merging the adapter into the base would change "
+                    "the policy."
+                )
             convert_to_fp8_training(model, args.fp8_recipe, args.fp8_skip_modules)
             if self.ref_model is not None:
                 convert_to_fp8_training(self.ref_model, args.fp8_recipe, args.fp8_skip_modules)

@@ -65,6 +65,8 @@ if Version(transformers.__version__) >= Version("5.8.0"):
 if is_torchao_available():
     from torchao.float8.float8_linear import Float8Linear
 
+    from trl.models.fp8 import FP8Linear
+
 if is_peft_available():
     import peft
     from peft import LoraConfig, PromptTuningConfig, get_peft_model
@@ -5018,3 +5020,42 @@ def test_fp8_recipe_trains_the_linear_layers_with_fp8_gemms(tiny_llama, tmp_path
     assert fp8 == linears - {"lm_head", "model.layers.0.mlp.down_proj"}
     for name in fp8:
         assert not torch.equal(trainer.model.get_parameter(f"{name}.weight"), previous[f"{name}.weight"])
+
+
+@require_peft
+@require_torchao
+def test_fp8_recipe_trains_lora_over_an_immutable_fp8_base(tiny_llama, tmp_path):
+    model, tokenizer = tiny_llama
+    trainer = GRPOTrainer(
+        model=model,
+        processing_class=tokenizer,
+        reward_funcs=lambda completions, **kwargs: [float(i % 2) for i in range(len(completions))],
+        args=GRPOConfig(
+            output_dir=str(tmp_path),
+            report_to="none",
+            bf16=False,
+            learning_rate=0.1,
+            per_device_train_batch_size=4,
+            num_generations=2,
+            max_completion_length=4,
+            max_steps=1,
+            fp8_recipe="rowwise_with_gw_hp",
+        ),
+        train_dataset=Dataset.from_dict({"prompt": ["a", "a a"]}),
+        peft_config=LoraConfig(r=2, target_modules="all-linear"),
+    )
+    bases = {name: m for name, m in trainer.model.named_modules() if isinstance(m, FP8Linear)}
+    previous = {name: param.detach().clone() for name, param in trainer.model.named_parameters()}
+    base_weights = {name: m.weight_fp8.clone() for name, m in bases.items()}
+
+    trainer.train()
+
+    # Every adapted layer but the LM head runs on an FP8 base without a high-precision copy
+    assert len(bases) == 7 and all(name.endswith(".base_layer") for name in bases)
+    assert not any(name.endswith("base_layer.weight") for name in previous)
+    for name, module in bases.items():
+        assert torch.equal(module.weight_fp8, base_weights[name])
+    # The input gradients flow through the FP8 bases down to the first layer's adapters
+    for name, param in trainer.model.named_parameters():
+        if "lora_B" in name:
+            assert not torch.equal(param, previous[name]), name
