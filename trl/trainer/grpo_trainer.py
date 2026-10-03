@@ -1020,9 +1020,9 @@ class GRPOTrainer(_BaseTrainer):
                 _cast_lm_head_to_fp32(self.ref_model)
 
         if args.fp8_recipe is not None:
-            convert_to_fp8_training(model, args.fp8_recipe)
+            convert_to_fp8_training(model, args.fp8_recipe, args.fp8_skip_modules)
             if self.ref_model is not None:
-                convert_to_fp8_training(self.ref_model, args.fp8_recipe)
+                convert_to_fp8_training(self.ref_model, args.fp8_recipe, args.fp8_skip_modules)
 
         # Liger's fused linear cross-entropy replaces `model.forward` when training starts, which would drop the fused
         # LM head, so only its layer kernels are applied

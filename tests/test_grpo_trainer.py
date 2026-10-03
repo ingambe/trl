@@ -4989,7 +4989,7 @@ def test_micro_batches_crop_completion_padding(tiny_llama, tmp_path):
 
 
 @require_torchao
-def test_fp8_recipe_trains_every_linear_layer_but_the_lm_head_with_fp8_gemms(tiny_llama, tmp_path):
+def test_fp8_recipe_trains_the_linear_layers_with_fp8_gemms(tiny_llama, tmp_path):
     model, tokenizer = tiny_llama
     linears = {name for name, module in model.named_modules() if isinstance(module, torch.nn.Linear)}
     trainer = GRPOTrainer(
@@ -5006,6 +5006,7 @@ def test_fp8_recipe_trains_every_linear_layer_but_the_lm_head_with_fp8_gemms(tin
             max_completion_length=4,
             max_steps=1,
             fp8_recipe="rowwise_with_gw_hp",
+            fp8_skip_modules=["*.mlp.down_proj"],
         ),
         train_dataset=Dataset.from_dict({"prompt": ["a", "a a"]}),
     )
@@ -5014,6 +5015,6 @@ def test_fp8_recipe_trains_every_linear_layer_but_the_lm_head_with_fp8_gemms(tin
     trainer.train()
 
     fp8 = {name for name, module in trainer.model.named_modules() if isinstance(module, Float8Linear)}
-    assert fp8 == linears - {"lm_head"}
+    assert fp8 == linears - {"lm_head", "model.layers.0.mlp.down_proj"}
     for name in fp8:
         assert not torch.equal(trainer.model.get_parameter(f"{name}.weight"), previous[f"{name}.weight"])

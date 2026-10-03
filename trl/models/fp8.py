@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+from fnmatch import fnmatch
 
 from torch import nn
 from transformers.utils import is_torchao_available
@@ -22,18 +23,21 @@ if is_torchao_available():
     from torchao.float8 import Float8GemmConfig, Float8LinearConfig, convert_to_float8_training
 
 
-def convert_to_fp8_training(model: nn.Module, recipe: str) -> None:
+def convert_to_fp8_training(model: nn.Module, recipe: str, skip_modules: list[str] | None = None) -> None:
     """
     Run the linear layers of a model with FP8 GEMMs, keeping their parameters in their original precision.
 
-    The LM head, PEFT adapter layers, and layers whose dimensions aren't multiples of 16 are left unchanged. FP8 is
-    emulated off CUDA.
+    The LM head, PEFT adapter layers, layers whose dimensions aren't multiples of 16, and layers matching
+    `skip_modules` are left unchanged. FP8 is emulated off CUDA.
 
     Args:
         model (`nn.Module`):
             Model to convert in place.
         recipe (`str`):
             TorchAO float8 recipe, e.g. `"rowwise_with_gw_hp"`.
+        skip_modules (`list[str]`, *optional*):
+            Glob patterns of the module names to keep in high precision, e.g. `"model.layers.0.*"`. PEFT prefixes and
+            `.base_layer` are removed from the names before matching.
     """
     config = dataclasses.replace(
         Float8LinearConfig.from_recipe_name(recipe),
@@ -50,6 +54,10 @@ def convert_to_fp8_training(model: nn.Module, recipe: str) -> None:
             and "lora_" not in name
             and module.in_features % 16 == 0
             and module.out_features % 16 == 0
+            and not any(
+                fnmatch(name.removeprefix("base_model.model.").replace(".base_layer", ""), pattern)
+                for pattern in skip_modules or []
+            )
         )
 
     convert_to_float8_training(model, module_filter_fn=is_eligible, config=config)

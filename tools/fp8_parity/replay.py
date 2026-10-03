@@ -20,12 +20,17 @@ Rollouts are generated once by the reference trainer, then both trainers take th
 python tools/fp8_parity/replay.py --model Qwen/Qwen2.5-0.5B-Instruct --dataset trl-lib/DeepMath-103K \
     --candidate '{"fp8_recipe": "rowwise_with_gw_hp"}' --steps 100 --output fp8_replay.json
 ```
+
+With `--target-kl`, it instead measures the policy KL each linear layer causes alone in FP8 and lists the layers to
+keep in high precision, for `fp8_skip_modules`.
 """
 
 import argparse
+import copy
 import json
 import tempfile
 from collections import defaultdict
+from functools import partial
 
 import torch
 from datasets import load_dataset
@@ -33,6 +38,7 @@ from peft import LoraConfig
 from transformers import set_seed
 
 from trl import GRPOConfig, GRPOTrainer
+from trl.models.fp8 import convert_to_fp8_training
 
 
 # Smallest positive float8_e4m3fn value
@@ -87,19 +93,74 @@ def cosine(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 @torch.no_grad()
-def policy_kl(ref_trainer, cand_trainer, batch, rows: int) -> float:
-    """Mean KL(ref || cand) over the completion tokens of the first `rows` rows."""
+def next_token_logps(trainer, batch, rows: int) -> torch.Tensor:
+    """Full next-token log-distribution of `trainer.model` over the completions of the first `rows` rows."""
     input_ids = torch.cat([batch["prompt_ids"], batch["completion_ids"]], dim=1)[:rows]
     attention_mask = torch.cat([batch["prompt_mask"], batch["completion_mask"]], dim=1)[:rows]
     length = batch["completion_ids"].size(1)
-    logps = []
-    for trainer in (ref_trainer, cand_trainer):
-        with trainer.accelerator.autocast():
-            logits = trainer.model(input_ids=input_ids, attention_mask=attention_mask).logits[:, -length - 1 : -1]
-        logps.append(torch.log_softmax(logits.float() / trainer.temperature, dim=-1))
-    kl = (logps[0].exp() * (logps[0] - logps[1])).sum(-1)
-    mask = batch["completion_mask"][:rows].bool()
-    return kl[mask].mean().item()
+    with trainer.accelerator.autocast():
+        logits = trainer.model(input_ids=input_ids, attention_mask=attention_mask).logits[:, -length - 1 : -1]
+    return torch.log_softmax(logits.float() / trainer.temperature, dim=-1)
+
+
+def kl_divergence(ref_logps: torch.Tensor, cand_logps: torch.Tensor, batch, rows: int) -> float:
+    """Mean KL(ref || cand) over the completion tokens."""
+    kl = (ref_logps.exp() * (ref_logps - cand_logps)).sum(-1)
+    return kl[batch["completion_mask"][:rows].bool()].mean().item()
+
+
+def sensitivity(trainer, batch, recipe: str, rows: int, target_kl: float) -> dict:
+    """Rank the linear layers by the policy KL each one causes alone in FP8, then keep the worst in high precision
+    until the KL of the whole model is below `target_kl`."""
+    model = trainer.model
+    fp8_model = copy.deepcopy(model)
+    convert_to_fp8_training(fp8_model, recipe)
+    modules = dict(model.named_modules())
+    fp8_modules = {
+        name: m
+        for name, m in fp8_model.named_modules()
+        if isinstance(modules.get(name), torch.nn.Linear) and type(m) is not type(modules[name])
+    }
+
+    def swap(name, module):
+        parent, _, child = name.rpartition(".")
+        setattr(model.get_submodule(parent), child, module)
+
+    # Output error of each layer in FP8 on its high-precision input
+    local_error = {}
+
+    def hook(module, args, output, name):
+        fp8_output = fp8_modules[name](args[0])
+        local_error[name] = ((fp8_output - output).float().norm() / output.float().norm()).item()
+
+    handles = [modules[name].register_forward_hook(partial(hook, name=name)) for name in fp8_modules]
+    ref_logps = next_token_logps(trainer, batch, rows)
+    for handle in handles:
+        handle.remove()
+
+    kl = {}
+    for name, fp8_module in fp8_modules.items():
+        swap(name, fp8_module)
+        kl[name] = kl_divergence(ref_logps, next_token_logps(trainer, batch, rows), batch, rows)
+        swap(name, modules[name])
+
+    # Greedy fallback: all layers in FP8, then the most sensitive ones back to high precision
+    for name, fp8_module in fp8_modules.items():
+        swap(name, fp8_module)
+    skip, ranked = [], sorted(kl, key=kl.get, reverse=True)
+    model_kl = kl_divergence(ref_logps, next_token_logps(trainer, batch, rows), batch, rows)
+    while model_kl > target_kl and ranked:
+        skip.append(ranked.pop(0))
+        swap(skip[-1], modules[skip[-1]])
+        model_kl = kl_divergence(ref_logps, next_token_logps(trainer, batch, rows), batch, rows)
+    for name in fp8_modules:
+        swap(name, modules[name])
+    return {
+        "kl": kl,
+        "local_error": local_error,
+        "model_kl": model_kl,
+        "fp8_skip_modules": [name.removeprefix("base_model.model.").replace(".base_layer", "") for name in skip],
+    }
 
 
 def per_token_logps(trainer, batch) -> torch.Tensor:
@@ -176,12 +237,14 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--target-chars", type=int, default=200)
     parser.add_argument("--kl-rows", type=int, default=2, help="Rows whose full next-token distribution is compared")
+    parser.add_argument(
+        "--target-kl", type=float, help="Instead of replaying, find the layers to keep in high precision for this KL"
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
     ref = build_trainer(args, {})
-    cand = build_trainer(args, json.loads(args.candidate))
 
     # Freeze the rollouts, with the reference policy as the behavior policy
     prompts = ref.train_dataset.to_list()
@@ -191,6 +254,15 @@ def main():
         batch["old_per_token_logps"] = per_token_logps(ref, batch)
         batches.append(batch)
 
+    if args.target_kl is not None:
+        recipe = json.loads(args.candidate)["fp8_recipe"]
+        report = sensitivity(ref, batches[0], recipe, args.kl_rows, args.target_kl)
+        with open(args.output, "w") as f:
+            json.dump(report, f, indent=2)
+        return
+
+    cand = build_trainer(args, json.loads(args.candidate))
+
     initial = {name: p.detach().clone() for name, p in ref.model.named_parameters() if p.requires_grad}
     activations, handles = record_activations(ref.model)
     report = {"args": vars(args), "steps": []}
@@ -199,7 +271,9 @@ def main():
         mask = batch["completion_mask"]
         logps = [per_token_logps(trainer, batch) for trainer in (ref, cand)]
         metrics = compare_logps(*logps, batch["old_per_token_logps"], mask, ref.epsilon_low, ref.epsilon_high)
-        metrics["kl"] = policy_kl(ref, cand, batch, args.kl_rows)
+        metrics["kl"] = kl_divergence(
+            *(next_token_logps(t, batch, args.kl_rows) for t in (ref, cand)), batch, args.kl_rows
+        )
 
         updates = []
         for trainer in (ref, cand):

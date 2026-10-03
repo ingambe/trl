@@ -61,6 +61,9 @@ class GRPOConfig(_BaseConfig):
             the norms, the attention and the loss in their original precision. `"rowwise_with_gw_hp"` quantizes the
             forward and input-gradient GEMMs with dynamic rowwise scales and keeps the weight-gradient GEMM in high
             precision. Requires `torchao` and a GPU with FP8 support.
+        fp8_skip_modules (`list[str]`, *optional*):
+            Glob patterns of the linear layers kept in high precision with `fp8_recipe`, e.g. `"model.layers.0.*"`. The
+            `tools/fp8_parity/replay.py --target-kl` sensitivity analysis produces such a list.
 
         > Parameters that control the data preprocessing
 
@@ -496,6 +499,14 @@ class GRPOConfig(_BaseConfig):
             "LM head, the norms, the attention and the loss in their original precision. `'rowwise_with_gw_hp'` "
             "quantizes the forward and input-gradient GEMMs with dynamic rowwise scales and keeps the weight-gradient "
             "GEMM in high precision. Requires `torchao` and a GPU with FP8 support.",
+        },
+    )
+    fp8_skip_modules: list[str] | None = field(
+        default=None,
+        metadata={
+            "help": "Glob patterns of the linear layers kept in high precision with `fp8_recipe`, e.g. "
+            "`'model.layers.0.*'`. The `tools/fp8_parity/replay.py --target-kl` sensitivity analysis produces such a "
+            "list."
         },
     )
 
