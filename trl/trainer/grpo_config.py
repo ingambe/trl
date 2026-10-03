@@ -57,14 +57,14 @@ class GRPOConfig(_BaseConfig):
             is False. Also applies to vLLM in colocate mode; in server mode, start the server with `--hf-overrides
             '{"head_dtype": "float32"}'` (vLLM 0.26.0 or later).
         fp8_recipe (`str`, *optional*):
-            TorchAO float8 recipe used to run the linear layers with FP8 GEMMs, keeping the parameters, the LM head,
-            the norms, the attention and the loss in their original precision. `"rowwise_with_gw_hp"` quantizes the
-            forward and input-gradient GEMMs with dynamic rowwise scales and keeps the weight-gradient GEMM in high
-            precision; the frozen base of a PEFT model is quantized once to FP8 with per-channel scales, without a
-            high-precision copy, and vLLM serves that same base with `vllm_share_weights=True` and
-            `vllm_native_lora=True` (vLLM 0.30.0 or later). `"mxfp8_with_gw_hp"` uses MXFP8 instead, with one
-            power-of-two scale per block of 32 values, on Blackwell GPUs. `"rowwise"`, `"tensorwise"` and `"mxfp8"`
-            also quantize the weight-gradient GEMM. Requires `torchao` and a GPU with FP8 support.
+            Recipe used to run the linear layers with FP8 GEMMs, keeping the parameters, the LM head, the norms, the
+            attention and the loss in their original precision. `"rowwise_with_gw_hp"` quantizes the weights per
+            output channel and the activations and their gradients per token, and computes the weight gradients in
+            high precision; the frozen base of a PEFT model is quantized once, without a high-precision copy. With
+            `vllm_share_weights=True` (and `vllm_native_lora=True` for PEFT), vLLM generates from these FP8 weights
+            (vLLM 0.30.0 or later). `"mxfp8_with_gw_hp"` uses TorchAO's MXFP8 instead, with one power-of-two scale per
+            block of 32 values, on Blackwell GPUs. TorchAO's `"rowwise"` and `"tensorwise"` recipes and `"mxfp8"` also
+            quantize the weight-gradient GEMM. Requires a GPU with FP8 support, and `torchao` for TorchAO's recipes.
         fp8_skip_modules (`list[str]`, *optional*):
             Glob patterns of the linear layers kept in high precision with `fp8_recipe`, e.g. `"model.layers.0.*"`. The
             `tools/fp8_parity/replay.py --target-kl` sensitivity analysis produces such a list.
@@ -509,14 +509,15 @@ class GRPOConfig(_BaseConfig):
     fp8_recipe: str | None = field(
         default=None,
         metadata={
-            "help": "TorchAO float8 recipe used to run the linear layers with FP8 GEMMs, keeping the parameters, the "
-            "LM head, the norms, the attention and the loss in their original precision. `'rowwise_with_gw_hp'` "
-            "quantizes the forward and input-gradient GEMMs with dynamic rowwise scales and keeps the weight-gradient "
-            "GEMM in high precision; the frozen base of a PEFT model is quantized once to FP8 with per-channel scales, "
-            "without a high-precision copy, and vLLM serves that same base with `vllm_share_weights=True` and "
-            "`vllm_native_lora=True` (vLLM 0.30.0 or later). `'mxfp8_with_gw_hp'` uses MXFP8 instead, with one "
-            "power-of-two scale per block of 32 values, on Blackwell GPUs. `'rowwise'`, `'tensorwise'` and `'mxfp8'` "
-            "also quantize the weight-gradient GEMM. Requires `torchao` and a GPU with FP8 support.",
+            "help": "Recipe used to run the linear layers with FP8 GEMMs, keeping the parameters, the LM head, the "
+            "norms, the attention and the loss in their original precision. `'rowwise_with_gw_hp'` quantizes the "
+            "weights per output channel and the activations and their gradients per token, and computes the weight "
+            "gradients in high precision; the frozen base of a PEFT model is quantized once, without a high-precision "
+            "copy. With `vllm_share_weights=True` (and `vllm_native_lora=True` for PEFT), vLLM generates from these "
+            "FP8 weights (vLLM 0.30.0 or later). `'mxfp8_with_gw_hp'` uses TorchAO's MXFP8 instead, with one "
+            "power-of-two scale per block of 32 values, on Blackwell GPUs. TorchAO's `'rowwise'` and `'tensorwise'` "
+            "recipes and `'mxfp8'` also quantize the weight-gradient GEMM. Requires a GPU with FP8 support, and "
+            "`torchao` for TorchAO's recipes."
         },
     )
     fp8_skip_modules: list[str] | None = field(

@@ -40,7 +40,7 @@ from transformers.utils import (
 from ..distributed import DistributedBackend
 from ..extras.profiling import ProfilingContext
 from ..import_utils import is_vllm_available
-from ..models.fp8 import FP8Linear
+from ..models.fp8 import FP8Linear, quantize_rowwise
 from ..trainer.utils import ensure_master_addr_port
 from .vllm_client import VLLMClient
 
@@ -341,8 +341,8 @@ class VLLMGeneration:
                 "`pip install trl[vllm]` to use it."
             )
 
-        fp8_base = any(isinstance(module, FP8Linear) for module in model.modules())
-        if fp8_base and not (
+        fp8_layers = [module for module in model.modules() if isinstance(module, FP8Linear)]
+        if any(layer.weight is None for layer in fp8_layers) and not (
             self.mode == "colocate" and self.share_weights and is_peft_model(model) and self.native_lora
         ):
             raise ValueError(
@@ -406,10 +406,10 @@ class VLLMGeneration:
             fp8_kwargs = {}
             if self.kv_cache_dtype_skip_layers:
                 fp8_kwargs["kv_cache_dtype_skip_layers"] = self.kv_cache_dtype_skip_layers
-            if fp8_base:
+            if self.share_weights and fp8_layers:
                 if not is_vllm_available(min_version="0.30.0"):
-                    raise ImportError("Sharing an FP8 base with vLLM requires vLLM 0.30.0 or later.")
-                # vLLM quantizes the same layers as the trainer, whose FP8 base it then shares
+                    raise ImportError("Sharing FP8 weights with vLLM requires vLLM 0.30.0 or later.")
+                # vLLM quantizes the same layers as the trainer, whose FP8 weights it then shares
                 quantization = "fp8_per_channel"
                 fp8_kwargs["quantization_config"] = {
                     "ignore": [
@@ -537,11 +537,18 @@ class VLLMGeneration:
                 for name, module in self.model.named_modules()
                 if isinstance(module, BaseTunerLayer)
             }
+        fp8_layers = {
+            self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", "")): module
+            for name, module in self.model.named_modules()
+            if isinstance(module, FP8Linear)
+        }
         params = [
             (self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", "")), param)
             for name, param in self.model.named_parameters()
             if not (adapter_prefix and adapter_prefix in name)
         ]
+        # vLLM gets the FP8 copies of these layers' weights, never the high-precision ones
+        params = [(name, param) for name, param in params if name.removesuffix(".weight") not in fp8_layers]
         if self._unshareable is None:
             self._unshareable = set()
             # vLLM's loader can't address layers wrapped by native LoRA
@@ -566,16 +573,19 @@ class VLLMGeneration:
                 view.copy_(original)
             for parent, child_name, child in wrapped:
                 setattr(parent, child_name, child)
-        for name, module in self.model.named_modules():
-            if isinstance(module, FP8Linear):
-                name = self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", ""))
-                weight, scale = fp8_views.get(name, (None, None))
-                if weight is None or weight.shape != module.weight_fp8.shape:
-                    raise ValueError(f"vLLM doesn't hold `{name}` in per-channel FP8 like the trainer.")
-                if not module.weight_fp8.is_set_to(weight):
-                    weight.copy_(module.weight_fp8)
-                    scale.copy_(module.weight_scale)
-                    module.weight_fp8, module.weight_scale = weight, scale
+        for name, module in fp8_layers.items():
+            weight, scale = fp8_views.get(name, (None, None))
+            if weight is None or weight.shape != (module.out_features, module.in_features):
+                raise ValueError(f"vLLM doesn't hold `{name}` in per-channel FP8 like the trainer.")
+            if module.weight is not None:
+                # Requantize the updated high-precision weight straight into vLLM's FP8 copy
+                weight_fp8, weight_scale = quantize_rowwise(module.weight)
+                weight.copy_(weight_fp8)
+                scale.copy_(weight_scale)
+            elif not module.weight_fp8.is_set_to(weight):
+                weight.copy_(module.weight_fp8)
+                scale.copy_(module.weight_scale)
+                module.weight_fp8, module.weight_scale = weight, scale
         unshared = []
         for name, param in params:
             if name in self._unshareable:

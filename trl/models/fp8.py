@@ -42,12 +42,19 @@ def quantize_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 class _FP8Matmul(torch.autograd.Function):
-    """`x @ (weight_scale * weight_fp8).T` with FP8 GEMMs and per-token scales for `x` and its gradient."""
+    """
+    `x @ (weight_scale * weight_fp8).T` with FP8 GEMMs and per-token scales for `x` and its gradient. The gradient of
+    the high-precision `weight` it was quantized from, if given, is computed in high precision.
+    """
 
     @staticmethod
-    def forward(ctx, x, weight_fp8, weight_scale, fast_accum):
-        ctx.save_for_backward(weight_fp8, weight_scale)
-        ctx.fast_accum = fast_accum
+    def forward(ctx, x, weight_fp8, weight_scale, weight, fast_accum):
+        ctx.save_for_backward(x if weight is not None else None, weight_fp8, weight_scale)
+        ctx.input_shape, ctx.weight_dtype, ctx.fast_accum = (
+            x.shape,
+            None if weight is None else weight.dtype,
+            fast_accum,
+        )
         x_fp8, x_scale = quantize_rowwise(x.reshape(-1, x.shape[-1]))
         out = torch._scaled_mm(
             x_fp8,
@@ -61,10 +68,10 @@ class _FP8Matmul(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        weight_fp8, weight_scale = ctx.saved_tensors
+        x, weight_fp8, weight_scale = ctx.saved_tensors
+        grad_output = grad_output.reshape(-1, grad_output.shape[-1])
         # The weight scales run along the reduced dimension, so they are folded into the gradient
-        grad = grad_output.reshape(-1, grad_output.shape[-1]).float() * weight_scale.t()
-        grad_fp8, grad_scale = quantize_rowwise(grad)
+        grad_fp8, grad_scale = quantize_rowwise(grad_output.float() * weight_scale.t())
         ones = weight_scale.new_ones(1, weight_fp8.shape[1])
         grad_input = torch._scaled_mm(
             grad_fp8,
@@ -74,16 +81,24 @@ class _FP8Matmul(torch.autograd.Function):
             out_dtype=torch.bfloat16,
             use_fast_accum="grad_input" in ctx.fast_accum,
         )
-        return grad_input.to(grad_output.dtype).view(*grad_output.shape[:-1], -1), None, None, None
+        grad_weight = None
+        if x is not None:
+            x = x.reshape(-1, x.shape[-1])
+            grad_weight = (grad_output.t().to(x.dtype) @ x).to(ctx.weight_dtype)
+        return grad_input.to(grad_output.dtype).view(ctx.input_shape), None, None, grad_weight, None
 
 
 class FP8Linear(nn.Module):
     """
-    Frozen linear layer stored as FP8 with per-output-channel scales, computed with FP8 GEMMs.
+    Linear layer computed with FP8 GEMMs from an FP8 copy of its weight with per-output-channel scales, the layout of
+    vLLM's per-channel FP8.
+
+    A frozen layer keeps only the FP8 copy. A trainable one keeps its high-precision weight, quantizes it at each
+    forward, and computes its gradient in high precision.
 
     Args:
         linear (`nn.Linear`):
-            Layer to quantize. Its high-precision weight is not kept.
+            Layer to convert. Its high-precision weight is kept only if it requires gradients.
         fast_accum (`list[str]`, *optional*):
             GEMMs (`"output"`, `"grad_input"`) that use the faster, less accurate FP8 accumulation.
     """
@@ -92,14 +107,20 @@ class FP8Linear(nn.Module):
         super().__init__()
         self.fast_accum = fast_accum or []
         self.in_features, self.out_features = linear.in_features, linear.out_features
-        weight_fp8, weight_scale = quantize_rowwise(linear.weight.detach())
-        self.register_buffer("weight_fp8", weight_fp8)
-        self.register_buffer("weight_scale", weight_scale)
+        self.weight = linear.weight if linear.weight.requires_grad else None
+        if self.weight is None:
+            weight_fp8, weight_scale = quantize_rowwise(linear.weight.detach())
+            self.register_buffer("weight_fp8", weight_fp8)
+            self.register_buffer("weight_scale", weight_scale)
         self.bias = linear.bias
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = _FP8Matmul.apply(x, self.weight_fp8, self.weight_scale, self.fast_accum)
-        return out if self.bias is None else out + self.bias
+        if self.weight is None:
+            weight_fp8, weight_scale = self.weight_fp8, self.weight_scale
+        else:
+            weight_fp8, weight_scale = quantize_rowwise(self.weight.detach())
+        out = _FP8Matmul.apply(x, weight_fp8, weight_scale, self.weight, self.fast_accum)
+        return out if self.bias is None else out + self.bias.to(out.dtype)
 
 
 def convert_to_fp8_training(
@@ -108,15 +129,16 @@ def convert_to_fp8_training(
     """
     Run the linear layers of a model with FP8 GEMMs, keeping their parameters in their original precision.
 
-    With the rowwise recipes, frozen layers (such as the base of a PEFT model) are replaced by [`FP8Linear`], which
-    drops their high-precision weight. The LM head, PEFT adapter layers, layers whose dimensions aren't multiples of 16
-    (32 for MXFP8), and layers matching `skip_modules` are left unchanged. TorchAO's FP8 is emulated off CUDA.
+    `"rowwise_with_gw_hp"` uses [`FP8Linear`], whose FP8 weights vLLM can share, and so does `"rowwise"` for frozen
+    layers. Frozen [`FP8Linear`] layers, such as the base of a PEFT model, drop their high-precision weight. The LM
+    head, PEFT adapter layers, layers whose dimensions aren't multiples of 16 (32 for MXFP8), and layers matching
+    `skip_modules` are left unchanged. TorchAO's FP8 is emulated off CUDA.
 
     Args:
         model (`nn.Module`):
             Model to convert in place.
         recipe (`str`):
-            TorchAO float8 recipe (`"rowwise_with_gw_hp"`, `"rowwise"` or `"tensorwise"`), or MXFP8 (`"mxfp8"`, or
+            `"rowwise_with_gw_hp"`, TorchAO float8 recipes (`"rowwise"` or `"tensorwise"`), or MXFP8 (`"mxfp8"`, or
             `"mxfp8_with_gw_hp"` with high-precision weight gradients).
         skip_modules (`list[str]`, *optional*):
             Glob patterns of the module names to keep in high precision, e.g. `"model.layers.0.*"`. PEFT prefixes and
@@ -157,14 +179,14 @@ def convert_to_fp8_training(
                 wgrad_with_hp=recipe == "mxfp8_with_gw_hp",
             )
             fp8_module.weight, fp8_module.bias = module.weight, module.bias
-        elif recipe.startswith("rowwise") and not module.weight.requires_grad:
+        elif recipe == "rowwise_with_gw_hp" or (recipe == "rowwise" and not module.weight.requires_grad):
             fp8_module = FP8Linear(module, fast_accum)
         else:
             continue
         parent, _, child = name.rpartition(".")
         setattr(model.get_submodule(parent), child, fp8_module)
 
-    if not mxfp8:
+    if recipe in ("rowwise", "tensorwise"):
         config = dataclasses.replace(
             Float8LinearConfig.from_recipe_name(recipe),
             gemm_config_output=Float8GemmConfig(use_fast_accum="output" in fast_accum),

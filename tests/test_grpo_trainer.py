@@ -5055,7 +5055,8 @@ def test_fp8_recipe_trains_the_linear_layers_with_fp8_gemms(tiny_llama, tmp_path
 
     trainer.train()
 
-    fp8_class = MXFP8Linear if recipe.startswith("mxfp8") else Float8Linear
+    fp8_class = {"rowwise_with_gw_hp": FP8Linear, "mxfp8_with_gw_hp": MXFP8Linear, "mxfp8": MXFP8Linear}
+    fp8_class = fp8_class.get(recipe, Float8Linear)
     fp8 = {name for name, module in trainer.model.named_modules() if isinstance(module, fp8_class)}
     assert fp8 == linears - {"lm_head", "model.layers.0.mlp.down_proj"}
     if fp8_class is Float8Linear:
