@@ -64,7 +64,7 @@ if Version(transformers.__version__) >= Version("5.8.0"):
     from transformers.generation.continuous_batching.continuous_api import ContinuousMixin
     from transformers.generation.continuous_batching.requests import GenerationOutput
 
-if is_torchao_available():
+if is_torchao_available("0.18.0"):
     from torchao.float8.float8_linear import Float8Linear
     from torchao.prototype.moe_training.mxfp8_linear import MXFP8Linear
 

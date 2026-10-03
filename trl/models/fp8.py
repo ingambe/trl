@@ -20,7 +20,7 @@ from torch import nn
 from transformers.utils import is_torchao_available
 
 
-if is_torchao_available():
+if is_torchao_available("0.18.0"):
     from torchao.float8 import Float8GemmConfig, Float8LinearConfig, convert_to_float8_training
     from torchao.prototype.moe_training.mxfp8_linear import MXFP8Linear
     from torchao.quantization.quantize_.common import KernelPreference
@@ -155,6 +155,8 @@ def convert_to_fp8_training(
     """
     if recipe not in ("rowwise_with_gw_hp", "rowwise", "tensorwise", "mxfp8_with_gw_hp", "mxfp8"):
         raise ValueError(f"Unknown FP8 recipe: {recipe!r}.")
+    if any("lora_magnitude_vector" in name for name, _ in model.named_parameters()):
+        raise ValueError("FP8 training doesn't support DoRA, which needs the high-precision base weights.")
     emulate = not torch.cuda.is_available()
     mxfp8 = recipe.startswith("mxfp8")
     fast_accum = fast_accum or []

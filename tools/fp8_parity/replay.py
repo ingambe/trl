@@ -49,7 +49,8 @@ def tensor_stats(x: torch.Tensor, max_samples: int = 1 << 20) -> dict[str, float
     """Magnitude percentiles of `x`, and the fraction a tensorwise E4M3 cast would flush to zero."""
     x = x.detach().flatten().abs().float()
     amax = x.max()
-    sample = x[torch.randperm(x.numel(), generator=torch.Generator().manual_seed(0))[:max_samples].to(x.device)]
+    index = torch.randint(x.numel(), (min(x.numel(), max_samples),), generator=torch.Generator().manual_seed(0))
+    sample = x if x.numel() <= max_samples else x[index.to(x.device)]
     p99, p999, p9999 = torch.quantile(sample, torch.tensor([0.99, 0.999, 0.9999], device=x.device)).tolist()
     scale = amax / torch.finfo(torch.float8_e4m3fn).max
     return {

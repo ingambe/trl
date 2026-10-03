@@ -235,6 +235,13 @@ class SDPOConfig(_BaseConfig):
             Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in fewer steps
             but use more activation memory. If you are using `vllm_mode="server"`, pass `--max-num-batched-tokens` when
             launching the vLLM server instead.
+        vllm_kv_cache_dtype (`str`, *optional*, defaults to `"auto"`):
+            Data type of vLLM's KV cache in colocate mode. `"fp8_per_token_head"` scales each token and head
+            dynamically (vLLM 0.30.0 or later, Triton attention backend), while `"fp8"` uses the scales stored in the
+            checkpoint, or `1.0` without them. In server mode, pass `--kv-cache-dtype` to the server instead.
+        vllm_kv_cache_dtype_skip_layers (`list[str]`, *optional*):
+            Layer indices (e.g. `"0"`) or attention types (e.g. `"sliding_window"`) whose KV cache keeps the model
+            dtype with `vllm_kv_cache_dtype`. Requires vLLM 0.30.0 or later.
 
         > Parameters that control the training
 
@@ -476,6 +483,21 @@ class SDPOConfig(_BaseConfig):
             "help": "Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in "
             "fewer steps but use more activation memory. If you are using `vllm_mode='server'`, pass "
             "`--max-num-batched-tokens` when launching the vLLM server instead."
+        },
+    )
+    vllm_kv_cache_dtype: str = field(
+        default="auto",
+        metadata={
+            "help": "Data type of vLLM's KV cache in colocate mode. `'fp8_per_token_head'` scales each token and head "
+            "dynamically (vLLM 0.30.0 or later, Triton attention backend), while `'fp8'` uses the scales stored in "
+            "the checkpoint, or `1.0` without them. In server mode, pass `--kv-cache-dtype` to the server instead."
+        },
+    )
+    vllm_kv_cache_dtype_skip_layers: list[str] | None = field(
+        default=None,
+        metadata={
+            "help": "Layer indices (e.g. `'0'`) or attention types (e.g. `'sliding_window'`) whose KV cache keeps the "
+            "model dtype with `vllm_kv_cache_dtype`. Requires vLLM 0.30.0 or later."
         },
     )
     num_iterations: int = field(

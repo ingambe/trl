@@ -409,10 +409,12 @@ class VLLMGeneration:
             if self.share_weights and fp8_layers:
                 if not is_vllm_available(min_version="0.30.0"):
                     raise ImportError("Sharing FP8 weights with vLLM requires vLLM 0.30.0 or later.")
-                # vLLM quantizes the same layers as the trainer, whose FP8 weights it then shares
+                # vLLM quantizes the same layers as the trainer, whose FP8 weights it then shares. Its fused MoE
+                # experts have no trainer counterpart.
                 quantization = "fp8_per_channel"
                 fp8_kwargs["quantization_config"] = {
-                    "ignore": [
+                    "ignore": ["*.experts"]
+                    + [
                         self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", ""))
                         for name, module in model.named_modules()
                         if isinstance(module, nn.Linear) and "lora_" not in name
