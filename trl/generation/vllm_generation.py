@@ -41,7 +41,7 @@ from transformers.utils import (
 from ..distributed import DistributedBackend
 from ..extras.profiling import ProfilingContext
 from ..import_utils import is_vllm_available
-from ..models.fp8 import FP8Linear, fused_layer_name
+from ..models.fp8 import BlockFP8Linear, FP8Linear, fused_layer_name
 from ..trainer.utils import ensure_master_addr_port
 from .vllm_client import VLLMClient
 
@@ -343,7 +343,10 @@ class VLLMGeneration:
             )
 
         fp8_layers = [module for module in model.modules() if isinstance(module, FP8Linear)]
-        if any(layer.weight is None for layer in fp8_layers) and not (
+        frozen_fp8 = any(layer.weight is None for layer in fp8_layers) or any(
+            isinstance(module, BlockFP8Linear) for module in model.modules()
+        )
+        if frozen_fp8 and not (
             self.mode == "colocate" and self.share_weights and is_peft_model(model) and self.native_lora
         ):
             raise ValueError(
@@ -539,6 +542,9 @@ class VLLMGeneration:
             parts = packed.get(fused)
             prefix = module_name.removesuffix(fused)
             params = dict(module.named_parameters(recurse=False))
+            if "weight_scale_inv" in params:
+                # vLLM loaded the blockwise FP8 weights of the checkpoint itself, like the trainer
+                del params["weight"], params["weight_scale_inv"]
             if "weight" in params and params["weight"].dtype == torch.float8_e4m3fn:
                 # Per-channel FP8: one row and one scale per output channel, whatever layout the kernel uses
                 weight = params.pop("weight").data

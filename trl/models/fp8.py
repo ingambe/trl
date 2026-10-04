@@ -24,6 +24,7 @@ from transformers.utils import is_torchao_available
 
 if is_torchao_available("0.18.0"):
     from torchao.float8 import Float8GemmConfig, Float8LinearConfig, convert_to_float8_training
+    from torchao.prototype.blockwise_fp8_training.kernels import triton_fp8_gemm_1x128_128x128
     from torchao.prototype.moe_training.mxfp8_linear import MXFP8Linear
     from torchao.quantization.quantize_.common import KernelPreference
 
@@ -149,9 +150,72 @@ class FP8Linear(nn.Module):
         return out if self.bias is None else out + self.bias.to(out.dtype)
 
 
+def _block_scaled_mm(a, a_scale, b, b_scale):
+    """`a @ b` in bfloat16, from FP8 `a` scaled per 1x128 group and FP8 `b` scaled per 128x128 block."""
+    if a.is_cuda:
+        # The kernel takes `a` row-major and `b` and both scales column-major
+        column_major = [t if t.stride(0) == 1 else t.t().contiguous().t() for t in (a_scale, b, b_scale)]
+        return triton_fp8_gemm_1x128_128x128(
+            a, column_major[1], column_major[0], column_major[2], out_dtype=torch.bfloat16
+        )
+    # Emulated without CUDA
+    a = a.float() * a_scale.repeat_interleave(128, dim=1)
+    b = b.float() * b_scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    return (a @ b).bfloat16()
+
+
+class _BlockFP8Matmul(torch.autograd.Function):
+    """`x @ weight.T` with FP8 GEMMs, for an FP8 `weight` scaled per 128x128 block and `x` and its gradient per 1x128
+    group."""
+
+    @staticmethod
+    def forward(ctx, x, weight_fp8, weight_scale):
+        ctx.save_for_backward(weight_fp8, weight_scale)
+        ctx.input_shape = x.shape
+        x_fp8, x_scale = _quantize_tokens(x.reshape(-1, 128))
+        x_fp8, x_scale = x_fp8.view(-1, x.shape[-1]), x_scale.view(-1, x.shape[-1] // 128)
+        out = _block_scaled_mm(x_fp8, x_scale, weight_fp8.t(), weight_scale.t())
+        return out.to(x.dtype).view(*x.shape[:-1], -1)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        weight_fp8, weight_scale = ctx.saved_tensors
+        grad_fp8, grad_scale = _quantize_tokens(grad_output.reshape(-1, 128))
+        grad_fp8 = grad_fp8.view(-1, grad_output.shape[-1])
+        grad_scale = grad_scale.view(-1, grad_output.shape[-1] // 128)
+        grad_input = _block_scaled_mm(grad_fp8, grad_scale, weight_fp8, weight_scale)
+        return grad_input.to(grad_output.dtype).view(ctx.input_shape), None, None
+
+
+class BlockFP8Linear(nn.Module):
+    """
+    Frozen linear layer of a checkpoint quantized to FP8 in 128x128 blocks, computed with FP8 GEMMs like vLLM serves
+    it: the activations and their gradients are scaled per group of 128 values.
+
+    Args:
+        linear (`nn.Linear`):
+            Layer of the checkpoint, with its FP8 `weight` and the `weight_scale_inv` multiplying each of its blocks.
+    """
+
+    def __init__(self, linear: nn.Linear):
+        super().__init__()
+        if linear.in_features % 128 or linear.out_features % 128 or linear.weight_scale_inv.dtype != torch.float32:
+            raise ValueError("Only FP8 checkpoints with float32 scales for 128x128 blocks of weights are supported.")
+        self.in_features, self.out_features = linear.in_features, linear.out_features
+        self.weight = None  # no high-precision weight, as for a frozen `FP8Linear`
+        self.register_buffer("weight_fp8", linear.weight.detach())
+        self.register_buffer("weight_scale", linear.weight_scale_inv.detach())
+        self.bias = linear.bias
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = _BlockFP8Matmul.apply(x, self.weight_fp8, self.weight_scale)
+        return out if self.bias is None else out + self.bias.to(out.dtype)
+
+
 def dequantize_fp8_layers(model: nn.Module, dtype: torch.dtype) -> None:
     """
-    Turn the [`FP8Linear`] layers of a model back into `nn.Linear` layers, e.g. before PEFT's `merge_and_unload`.
+    Turn the [`FP8Linear`] and [`BlockFP8Linear`] layers of a model back into `nn.Linear` layers, e.g. before PEFT's
+    `merge_and_unload`.
 
     The frozen layers get their FP8 weights dequantized, so the model then computes in high precision, unlike in
     training. An adapter can instead be saved alone, and loaded over the same base converted with the same recipe and
@@ -164,11 +228,14 @@ def dequantize_fp8_layers(model: nn.Module, dtype: torch.dtype) -> None:
             Dtype of the dequantized weights.
     """
     for name, module in list(model.named_modules()):
-        if isinstance(module, FP8Linear):
+        if isinstance(module, (FP8Linear, BlockFP8Linear)):
             linear = nn.Linear(module.in_features, module.out_features, bias=module.bias is not None, device="meta")
             weight = module.weight
             if weight is None:
-                weight = nn.Parameter((module.weight_fp8.float() * module.weight_scale).to(dtype), requires_grad=False)
+                scale = module.weight_scale
+                if isinstance(module, BlockFP8Linear):
+                    scale = scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+                weight = nn.Parameter((module.weight_fp8.float() * scale).to(dtype), requires_grad=False)
             linear.weight, linear.bias = weight, module.bias
             parent, _, child = name.rpartition(".")
             setattr(model.get_submodule(parent), child, linear)
@@ -184,6 +251,9 @@ def convert_to_fp8_training(
     layers of a PEFT base, which drop their high-precision weight. Other frozen layers stay in high precision with
     `"rowwise_with_gw_hp"`. The LM head, MoE experts, PEFT adapter layers, layers whose dimensions aren't multiples of
     16 (32 for MXFP8), and layers matching `skip_modules` are left unchanged. TorchAO's FP8 is emulated without CUDA.
+
+    The layers of a checkpoint quantized to FP8 in 128x128 blocks become frozen [`BlockFP8Linear`] layers instead,
+    whatever the recipe, and the other layers are left unchanged.
 
     Args:
         model (`nn.Module`):
@@ -206,6 +276,23 @@ def convert_to_fp8_training(
         raise ImportError("The 'rowwise_with_gw_hp' FP8 recipe requires PyTorch 2.5.0 or later.")
     if any("lora_magnitude_vector" in name for name, _ in model.named_parameters()):
         raise ValueError("FP8 training doesn't support DoRA, which needs the high-precision base weights.")
+    # The quantized layers of an FP8 checkpoint keep its FP8 weights, the others their precision
+    prequantized = [
+        (name, module)
+        for name, module in model.named_modules()
+        if isinstance(module, nn.Linear) and module.weight.dtype == torch.float8_e4m3fn
+    ]
+    if prequantized:
+        if not is_torchao_available("0.18.0"):
+            raise ImportError(
+                "Training over an FP8 checkpoint requires torchao 0.18.0 or later: `pip install torchao`."
+            )
+        if skip_modules:
+            raise ValueError("`skip_modules` can't keep the layers of an FP8 checkpoint in high precision.")
+        for name, module in prequantized:
+            parent, _, child = name.rpartition(".")
+            setattr(model.get_submodule(parent), child, BlockFP8Linear(module))
+        return
     emulate = not torch.cuda.is_available()
     mxfp8 = recipe.startswith("mxfp8")
     fast_accum = fast_accum or []

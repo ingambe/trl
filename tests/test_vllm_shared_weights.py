@@ -23,9 +23,9 @@ from transformers.pytorch_utils import Conv1D
 from transformers.utils import is_peft_available
 
 import trl.generation.vllm_generation as vllm_generation_module
-from trl.models.fp8 import FP8Linear, quantize_rowwise
+from trl.models.fp8 import BlockFP8Linear, FP8Linear, quantize_rowwise
 
-from .testing_utils import require_peft
+from .testing_utils import quantize_like_fp8_checkpoint, require_peft
 
 
 if is_peft_available():
@@ -315,3 +315,26 @@ def test_fp8_server_must_keep_the_trainer_layers_in_high_precision(vllm_generati
         init_vllm(vllm_generation)
     client.get_model_config.return_value["quantization_config"]["ignore"] = ["lm_head", "*.experts"]
     init_vllm(vllm_generation)
+
+
+@require_peft
+def test_lora_over_a_blockwise_fp8_checkpoint_leaves_vllm_its_own_fp8_base(vllm_generation):
+    linears = {name: torch.nn.Linear(128, 128, bias=False) for name in ("q_proj", "k_proj")}
+    for linear in linears.values():
+        quantize_like_fp8_checkpoint(linear)
+    # vLLM loaded the same checkpoint into one fused layer
+    vllm_model = torch.nn.ModuleDict({"qk_proj": torch.nn.Module()})
+    for name in ("weight", "weight_scale_inv"):
+        fused = torch.cat([linear.get_parameter(name) for linear in linears.values()])
+        vllm_model.qk_proj.register_parameter(name, torch.nn.Parameter(fused, requires_grad=False))
+    vllm_model.qk_proj.output_sizes = [128, 128]
+    vllm_model.packed_modules_mapping = {"qk_proj": ["q_proj", "k_proj"]}
+    model = get_peft_model(torch.nn.ModuleDict(linears), LoraConfig(r=1, target_modules=["q_proj", "k_proj"]))
+    for name in linears:
+        layer = model.base_model.model[name]
+        layer.base_layer = BlockFP8Linear(layer.base_layer)
+    runner = vllm_generation.llm.llm_engine.model_executor.driver_worker.model_runner
+    runner.model = vllm_model
+    vllm_generation.model, vllm_generation.share_weights, vllm_generation.native_lora = model, True, True
+
+    assert vllm_generation._share_weights() == []

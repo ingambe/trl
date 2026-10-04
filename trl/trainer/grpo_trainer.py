@@ -1021,10 +1021,16 @@ class GRPOTrainer(_BaseTrainer):
 
         if args.fp8_recipe is not None:
             quantization_config = model.config.to_dict().get("quantization_config")
-            if quantization_config is not None:
+            # On GPU, Transformers keeps the FP8 weights of a blockwise FP8 checkpoint, for a PEFT adapter to train
+            if quantization_config is not None and not (
+                quantization_config["quant_method"] == "fp8"
+                and quantization_config.get("weight_block_size") == [128, 128]
+                and not quantization_config.get("dequantize")
+                and is_peft_model(model)
+            ):
                 raise ValueError(
-                    f"`fp8_recipe` needs a high-precision checkpoint, not one quantized with "
-                    f"{quantization_config['quant_method']}."
+                    "`fp8_recipe` needs a high-precision checkpoint, or an FP8 one quantized in 128x128 blocks loaded "
+                    f"on GPU with a PEFT adapter, not one quantized with {quantization_config['quant_method']}."
                 )
             if DistributedBackend(self.accelerator).fsdp_version == 1:
                 raise ValueError("`fp8_recipe` requires FSDP2: FSDP1's mixed precision casts the FP8 weight buffers.")

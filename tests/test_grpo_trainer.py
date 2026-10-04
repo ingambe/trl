@@ -46,6 +46,7 @@ from .testing_utils import (
     TrlTestCase,
     is_ampere_or_newer,
     is_bf16_supported,
+    quantize_like_fp8_checkpoint,
     require_bitsandbytes,
     require_liger_kernel,
     require_peft,
@@ -68,7 +69,7 @@ if is_torchao_available("0.18.0"):
     from torchao.float8.float8_linear import Float8Linear
     from torchao.prototype.moe_training.mxfp8_linear import MXFP8Linear
 
-    from trl.models.fp8 import FP8Linear
+    from trl.models.fp8 import BlockFP8Linear, FP8Linear
 
 if is_peft_available():
     import peft
@@ -5114,6 +5115,52 @@ def test_fp8_recipe_trains_lora_over_an_immutable_fp8_base(tiny_llama, tmp_path)
     for name, module in bases.items():
         assert torch.equal(module.weight_fp8, base_weights[name])
     # The input gradients flow through the FP8 bases down to the first layer's adapters
+    for name, param in trainer.model.named_parameters():
+        if "lora_B" in name:
+            assert not torch.equal(param, previous[name]), name
+
+
+@require_peft
+@require_torchao
+def test_fp8_recipe_trains_lora_over_a_blockwise_fp8_checkpoint(tiny_llama, tmp_path):
+    _, tokenizer = tiny_llama
+    # FP8 checkpoints scale blocks of 128x128 weights
+    config = LlamaConfig(
+        vocab_size=32, hidden_size=128, intermediate_size=256, num_hidden_layers=1, num_attention_heads=2
+    )
+    config.quantization_config = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+    model = LlamaForCausalLM(config)
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear) and name != "lm_head":
+            quantize_like_fp8_checkpoint(module)
+    trainer = GRPOTrainer(
+        model=model,
+        processing_class=tokenizer,
+        reward_funcs=lambda completions, **kwargs: [float(i % 2) for i in range(len(completions))],
+        args=GRPOConfig(
+            output_dir=str(tmp_path),
+            report_to="none",
+            bf16=False,
+            learning_rate=0.1,
+            per_device_train_batch_size=4,
+            num_generations=2,
+            max_completion_length=4,
+            max_steps=1,
+            fp8_recipe="rowwise_with_gw_hp",
+        ),
+        train_dataset=Dataset.from_dict({"prompt": ["a", "a a"]}),
+        peft_config=LoraConfig(r=2, target_modules=["q_proj"]),
+    )
+    bases = {name: m for name, m in trainer.model.named_modules() if isinstance(m, BlockFP8Linear)}
+    base_weights = {name: m.weight_fp8.clone() for name, m in bases.items()}
+    previous = {name: param.detach().clone() for name, param in trainer.model.named_parameters()}
+
+    trainer.train()
+
+    # Every linear layer but the LM head keeps the checkpoint's FP8 weights
+    assert len(bases) == 7
+    for name, module in bases.items():
+        assert torch.equal(module.weight_fp8.view(torch.uint8), base_weights[name].view(torch.uint8))
     for name, param in trainer.model.named_parameters():
         if "lora_B" in name:
             assert not torch.equal(param, previous[name]), name

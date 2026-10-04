@@ -16,10 +16,10 @@ import pytest
 import torch
 from transformers.utils import is_peft_available
 
-from trl.models.fp8 import FP8Linear, dequantize_fp8_layers, quantize_rowwise
+from trl.models.fp8 import BlockFP8Linear, FP8Linear, dequantize_fp8_layers, quantize_rowwise
 from trl.trainer.callbacks import SyncRefModelCallback
 
-from .testing_utils import require_peft
+from .testing_utils import quantize_like_fp8_checkpoint, require_peft
 
 
 if is_peft_available():
@@ -78,6 +78,26 @@ def test_fp8_layers_propagate_small_gradients_to_earlier_layers():
 
     expected_grad = layers[0].weight.grad.float()
     assert (fp8_grad - expected_grad).norm() / expected_grad.norm() < 0.05
+
+
+def test_block_fp8_linear_matches_its_dequantized_weight_forward_and_backward():
+    torch.manual_seed(0)
+    linear = torch.nn.Linear(256, 384, dtype=torch.bfloat16)
+    quantize_like_fp8_checkpoint(linear)
+    scale = linear.weight_scale_inv.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    weight = linear.weight.float() * scale
+    layer = BlockFP8Linear(linear)
+    x = torch.randn(2, 5, 256, dtype=torch.bfloat16, requires_grad=True)
+    grad = torch.randn(2, 5, 384) * 2.0**-20
+
+    out = layer(x)
+    out.backward(grad.bfloat16())
+
+    # Only the FP8 rounding of the activations and gradients, per group of 128 values, remains
+    expected_out = x.detach().float() @ weight.T + linear.bias.float()
+    assert (out.float() - expected_out).norm() / expected_out.norm() < 0.05
+    expected_grad = grad @ weight
+    assert (x.grad.float() - expected_grad).norm() / expected_grad.norm() < 0.05
 
 
 def test_fp8_linear_requantizes_its_weight_once_per_update():

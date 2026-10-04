@@ -170,3 +170,13 @@ def kill_process(process):
         process.kill()
     except psutil.NoSuchProcess:
         pass
+
+
+@torch.no_grad()
+def quantize_like_fp8_checkpoint(linear: torch.nn.Linear) -> None:
+    """Store the weight of `linear` in FP8 with a scale per 128x128 block, as Transformers loads an FP8 checkpoint."""
+    blocks = linear.weight.float().unflatten(0, (-1, 128)).unflatten(-1, (-1, 128))
+    scale = blocks.abs().amax(dim=(1, 3)) / torch.finfo(torch.float8_e4m3fn).max
+    weight = (blocks / scale[:, None, :, None]).flatten(2).flatten(0, 1).to(torch.float8_e4m3fn)
+    linear.weight = torch.nn.Parameter(weight, requires_grad=False)
+    linear.weight_scale_inv = torch.nn.Parameter(scale, requires_grad=False)
