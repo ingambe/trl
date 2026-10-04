@@ -166,6 +166,10 @@ class GRPOConfig(_BaseConfig):
             Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in fewer steps
             but use more activation memory. If you are using `vllm_mode="server"`, pass `--max-num-batched-tokens` when
             launching the vLLM server instead.
+        vllm_max_num_seqs (`int`, *optional*):
+            Maximum number of sequences vLLM schedules at once per engine. Defaults to the number of completions each
+            engine generates per generation batch. If you are using `vllm_mode="server"`, pass `--max-num-seqs` when
+            launching the vLLM server instead.
         vllm_tensor_parallel_size (`int`, *optional*, defaults to `1`):
             Control the tensor parallel size for vLLM. This setting only applies when `vllm_mode` is set to
             `"colocate"`. If you are using `vllm_mode="server"`, this parameter must be passed separately when
@@ -185,6 +189,9 @@ class GRPOConfig(_BaseConfig):
             learning](https://huggingface.co/papers/2501.12948) use a value of `0.001`.
         num_iterations (`int`, *optional*, defaults to `1`):
             Number of iterations per batch (denoted as μ in the algorithm).
+        per_device_scoring_batch_size (`int`, *optional*):
+            Batch size per device for computing old-policy and reference log-probabilities, which run without
+            gradients. Defaults to `per_device_train_batch_size`.
         epsilon (`float`, *optional*, defaults to `0.2`):
             Epsilon value for clipping.
         delta (`float`, *optional*):
@@ -694,6 +701,14 @@ class GRPOConfig(_BaseConfig):
             "`--max-num-batched-tokens` when launching the vLLM server instead."
         },
     )
+    vllm_max_num_seqs: int | None = field(
+        default=None,
+        metadata={
+            "help": "Maximum number of sequences vLLM schedules at once per engine. Defaults to the number of "
+            "completions each engine generates per generation batch. If you are using `vllm_mode='server'`, pass "
+            "`--max-num-seqs` when launching the vLLM server instead."
+        },
+    )
     vllm_tensor_parallel_size: int = field(
         default=1,
         metadata={
@@ -730,6 +745,13 @@ class GRPOConfig(_BaseConfig):
     num_iterations: int = field(
         default=1,
         metadata={"help": "Number of iterations per batch (denoted as μ in the algorithm)."},
+    )
+    per_device_scoring_batch_size: int | None = field(
+        default=None,
+        metadata={
+            "help": "Batch size per device for computing old-policy and reference log-probabilities, which run "
+            "without gradients. Defaults to `per_device_train_batch_size`."
+        },
     )
     epsilon: float = field(
         default=0.2,

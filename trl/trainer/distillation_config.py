@@ -129,6 +129,10 @@ class DistillationConfig(_BaseConfig):
             Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in fewer steps
             but use more activation memory. If you are using `vllm_mode="server"`, pass `--max-num-batched-tokens` when
             launching the vLLM server instead.
+        vllm_max_num_seqs (`int`, *optional*):
+            Maximum number of sequences vLLM schedules at once per engine. Defaults to the number of completions each
+            engine generates per generation batch. If you are using `vllm_mode="server"`, pass `--max-num-seqs` when
+            launching the vLLM server instead.
         vllm_tensor_parallel_size (`int`, *optional*, defaults to `1`):
             Tensor parallel size for the colocated student vLLM engine.
         vllm_share_weights (`bool`, *optional*, defaults to `False`):
@@ -361,6 +365,14 @@ class DistillationConfig(_BaseConfig):
             "help": "Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in "
             "fewer steps but use more activation memory. If you are using `vllm_mode='server'`, pass "
             "`--max-num-batched-tokens` when launching the vLLM server instead."
+        },
+    )
+    vllm_max_num_seqs: int | None = field(
+        default=None,
+        metadata={
+            "help": "Maximum number of sequences vLLM schedules at once per engine. Defaults to the number of "
+            "completions each engine generates per generation batch. If you are using `vllm_mode='server'`, pass "
+            "`--max-num-seqs` when launching the vLLM server instead."
         },
     )
     vllm_tensor_parallel_size: int = field(

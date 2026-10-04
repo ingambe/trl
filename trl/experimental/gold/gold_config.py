@@ -150,6 +150,10 @@ class GOLDConfig(SFTConfig):
             Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in fewer steps
             but use more activation memory. If you are using `vllm_mode="server"`, pass `--max-num-batched-tokens` when
             launching the vLLM server instead.
+        vllm_max_num_seqs (`int`, *optional*):
+            Maximum number of sequences vLLM schedules at once per engine. Defaults to the number of completions each
+            engine generates per generation batch. If you are using `vllm_mode="server"`, pass `--max-num-seqs` when
+            launching the vLLM server instead.
         vllm_model_impl (`str`, *optional*, defaults to `"vllm"`):
             Model implementation backend to use in vLLM. Use `"vllm"` (default) or `"transformers"`.
         vllm_sync_frequency (`int`, *optional*, defaults to `1`):
@@ -439,6 +443,14 @@ class GOLDConfig(SFTConfig):
             "help": "Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in "
             "fewer steps but use more activation memory. If you are using `vllm_mode='server'`, pass "
             "`--max-num-batched-tokens` when launching the vLLM server instead."
+        },
+    )
+    vllm_max_num_seqs: int | None = field(
+        default=None,
+        metadata={
+            "help": "Maximum number of sequences vLLM schedules at once per engine. Defaults to the number of "
+            "completions each engine generates per generation batch. If you are using `vllm_mode='server'`, pass "
+            "`--max-num-seqs` when launching the vLLM server instead."
         },
     )
     vllm_model_impl: str = field(
