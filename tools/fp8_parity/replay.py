@@ -252,6 +252,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
+    if args.lora_rank and not is_peft_available():
+        raise ImportError("`--lora-rank` requires PEFT: `pip install peft`.")
 
     ref = build_trainer(args, {})
 
