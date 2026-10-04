@@ -71,6 +71,7 @@ from ..extras.profiling import profiling_context, profiling_decorator
 from ..generation.vllm_generation import VLLMGeneration
 from ..import_utils import is_jmespath_available
 from ..models import prepare_deepspeed, prepare_fsdp, unwrap_model_for_generation
+from ..models.fp8 import convert_to_fp8_training
 from ..models.utils import disable_gradient_checkpointing
 from .base_trainer import _BaseTrainer
 from .callbacks import SyncRefModelCallback
@@ -1018,6 +1019,18 @@ class GRPOTrainer(_BaseTrainer):
             if self.ref_model is not None:
                 _cast_lm_head_to_fp32(self.ref_model)
 
+        if args.fp8_recipe is not None:
+            if _is_quantized_model:
+                raise ValueError("`fp8_recipe` can't be used with a model quantized by bitsandbytes.")
+            if DistributedBackend(self.accelerator).fsdp_version == 1:
+                raise ValueError("`fp8_recipe` requires FSDP2: FSDP1's mixed precision casts the FP8 weight buffers.")
+            if self.ref_model is not None:
+                # The reference converts the same layers as the policy, whose frozen layers stay in high precision
+                for param, ref_param in zip(model.parameters(), self.ref_model.parameters(), strict=True):
+                    ref_param.requires_grad_(param.requires_grad)
+                convert_to_fp8_training(self.ref_model, args.fp8_recipe, args.fp8_skip_modules, args.fp8_fast_accum)
+            convert_to_fp8_training(model, args.fp8_recipe, args.fp8_skip_modules, args.fp8_fast_accum)
+
         # Liger's fused linear cross-entropy replaces `model.forward` when training starts, which would drop the fused
         # LM head, so only its layer kernels are applied
         if args.use_liger_kernel:
@@ -1097,6 +1110,8 @@ class GRPOTrainer(_BaseTrainer):
                 * args.vllm_tensor_parallel_size
                 * args.steps_per_generation,
                 max_num_batched_tokens=args.vllm_max_num_batched_tokens,
+                kv_cache_dtype=args.vllm_kv_cache_dtype,
+                kv_cache_dtype_skip_layers=args.vllm_kv_cache_dtype_skip_layers,
                 enable_sleep_mode=args.vllm_enable_sleep_mode,
                 share_weights=args.vllm_share_weights,
                 native_lora=args.vllm_native_lora,

@@ -842,6 +842,8 @@ class DistillationTrainer(_BaseTrainer):
                 * args.vllm_tensor_parallel_size
                 * args.gradient_accumulation_steps,
                 max_num_batched_tokens=args.vllm_max_num_batched_tokens,
+                kv_cache_dtype=args.vllm_kv_cache_dtype,
+                kv_cache_dtype_skip_layers=args.vllm_kv_cache_dtype_skip_layers,
                 enable_sleep_mode=args.vllm_enable_sleep_mode,
                 share_weights=args.vllm_share_weights,
                 native_lora=args.vllm_native_lora,

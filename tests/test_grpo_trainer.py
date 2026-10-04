@@ -34,9 +34,11 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
     BitsAndBytesConfig,
+    LlamaConfig,
+    LlamaForCausalLM,
 )
 from transformers.testing_utils import backend_empty_cache, torch_device
-from transformers.utils import is_peft_available
+from transformers.utils import is_peft_available, is_torchao_available
 
 from trl import GRPOConfig, GRPOTrainer
 
@@ -50,6 +52,7 @@ from .testing_utils import (
     require_peft_target_parameters,
     require_response_parsing,
     require_torch_accelerator,
+    require_torchao,
     require_vision,
     require_vllm,
     xfail_data_parallel,
@@ -60,6 +63,12 @@ if Version(transformers.__version__) >= Version("5.8.0"):
     from transformers.generation import ContinuousBatchingConfig
     from transformers.generation.continuous_batching.continuous_api import ContinuousMixin
     from transformers.generation.continuous_batching.requests import GenerationOutput
+
+if is_torchao_available("0.18.0"):
+    from torchao.float8.float8_linear import Float8Linear
+    from torchao.prototype.moe_training.mxfp8_linear import MXFP8Linear
+
+    from trl.models.fp8 import FP8Linear
 
 if is_peft_available():
     import peft
@@ -4895,6 +4904,7 @@ def test_cast_lm_head_to_fp32_sets_vllm_head_dtype(tiny_llama, tmp_path):
     with (
         patch("trl.generation.vllm_generation.is_vllm_available", return_value=True),
         patch("trl.generation.vllm_generation.LLM", create=True) as llm,
+        patch.dict(os.environ),  # colocated vLLM sets RANK, LOCAL_RANK and WORLD_SIZE
     ):
         GRPOTrainer(
             model=model,
@@ -4914,6 +4924,34 @@ def test_cast_lm_head_to_fp32_sets_vllm_head_dtype(tiny_llama, tmp_path):
         )
 
     assert llm.call_args.kwargs["hf_overrides"] == {"head_dtype": "float32"}
+
+
+def test_vllm_kv_cache_dtype_reaches_vllm(tiny_llama, tmp_path):
+    model, tokenizer = tiny_llama
+    with (
+        patch("trl.generation.vllm_generation.is_vllm_available", return_value=True),
+        patch("trl.generation.vllm_generation.LLM", create=True) as llm,
+        patch.dict(os.environ),  # colocated vLLM sets RANK, LOCAL_RANK and WORLD_SIZE
+    ):
+        GRPOTrainer(
+            model=model,
+            processing_class=tokenizer,
+            reward_funcs=lambda completions, **kwargs: [0.0] * len(completions),
+            args=GRPOConfig(
+                output_dir=str(tmp_path),
+                report_to="none",
+                per_device_train_batch_size=2,
+                num_generations=2,
+                use_vllm=True,
+                vllm_mode="colocate",
+                vllm_kv_cache_dtype="fp8_per_token_head",
+                vllm_kv_cache_dtype_skip_layers=["0"],
+            ),
+            train_dataset=Dataset.from_dict({"prompt": ["a", "a"]}),
+        )
+
+    assert llm.call_args.kwargs["kv_cache_dtype"] == "fp8_per_token_head"
+    assert llm.call_args.kwargs["kv_cache_dtype_skip_layers"] == ["0"]
 
 
 @pytest.mark.parametrize("loss_type", ["grpo", "dapo"])
@@ -4982,3 +5020,86 @@ def test_micro_batches_crop_completion_padding(tiny_llama, tmp_path):
     widths = [batch["completion_ids"].size(1) for batch in trainer._buffered_inputs]
     assert widths == [batch["completion_lengths"].max().item() for batch in trainer._buffered_inputs]
     assert min(widths) < 32
+
+
+@require_torchao
+@pytest.mark.parametrize("recipe", ["rowwise_with_gw_hp", "rowwise", "tensorwise", "mxfp8_with_gw_hp", "mxfp8"])
+def test_fp8_recipe_trains_the_linear_layers_with_fp8_gemms(tiny_llama, tmp_path, recipe):
+    _, tokenizer = tiny_llama
+    # MXFP8 scales blocks of 32 values
+    config = LlamaConfig(
+        vocab_size=32, hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=2
+    )
+    model = LlamaForCausalLM(config)
+    linears = {name for name, module in model.named_modules() if isinstance(module, torch.nn.Linear)}
+    trainer = GRPOTrainer(
+        model=model,
+        processing_class=tokenizer,
+        reward_funcs=lambda completions, **kwargs: [float(i % 2) for i in range(len(completions))],
+        args=GRPOConfig(
+            output_dir=str(tmp_path),
+            report_to="none",
+            bf16=False,
+            learning_rate=0.1,
+            per_device_train_batch_size=4,
+            num_generations=2,
+            max_completion_length=4,
+            max_steps=1,
+            fp8_recipe=recipe,
+            fp8_skip_modules=["*.mlp.down_proj"],
+            fp8_fast_accum=["grad_weight"],
+        ),
+        train_dataset=Dataset.from_dict({"prompt": ["a", "a a"]}),
+    )
+    previous = {name: param.detach().clone() for name, param in trainer.model.named_parameters()}
+
+    trainer.train()
+
+    fp8_class = {"rowwise_with_gw_hp": FP8Linear, "mxfp8_with_gw_hp": MXFP8Linear, "mxfp8": MXFP8Linear}
+    fp8_class = fp8_class.get(recipe, Float8Linear)
+    fp8 = {name for name, module in trainer.model.named_modules() if isinstance(module, fp8_class)}
+    assert fp8 == linears - {"lm_head", "model.layers.0.mlp.down_proj"}
+    if fp8_class is Float8Linear:
+        gemms = trainer.model.get_submodule(next(iter(fp8))).config
+        assert not gemms.gemm_config_output.use_fast_accum and gemms.gemm_config_grad_weight.use_fast_accum
+    for name in fp8:
+        assert not torch.equal(trainer.model.get_parameter(f"{name}.weight"), previous[f"{name}.weight"])
+
+
+@require_peft
+@require_torchao
+def test_fp8_recipe_trains_lora_over_an_immutable_fp8_base(tiny_llama, tmp_path):
+    model, tokenizer = tiny_llama
+    trainer = GRPOTrainer(
+        model=model,
+        processing_class=tokenizer,
+        reward_funcs=lambda completions, **kwargs: [float(i % 2) for i in range(len(completions))],
+        args=GRPOConfig(
+            output_dir=str(tmp_path),
+            report_to="none",
+            bf16=False,
+            learning_rate=0.1,
+            per_device_train_batch_size=4,
+            num_generations=2,
+            max_completion_length=4,
+            max_steps=1,
+            fp8_recipe="rowwise_with_gw_hp",
+        ),
+        train_dataset=Dataset.from_dict({"prompt": ["a", "a a"]}),
+        peft_config=LoraConfig(r=2, target_modules=["q_proj"]),
+    )
+    bases = {name: m for name, m in trainer.model.named_modules() if isinstance(m, FP8Linear)}
+    previous = {name: param.detach().clone() for name, param in trainer.model.named_parameters()}
+    base_weights = {name: m.weight_fp8.clone() for name, m in bases.items()}
+
+    trainer.train()
+
+    # Every linear layer but the LM head, adapted or not, runs on an FP8 base without a high-precision copy
+    assert len(bases) == 7
+    assert not any(f"{name}.weight" in previous for name in bases)
+    for name, module in bases.items():
+        assert torch.equal(module.weight_fp8, base_weights[name])
+    # The input gradients flow through the FP8 bases down to the first layer's adapters
+    for name, param in trainer.model.named_parameters():
+        if "lora_B" in name:
+            assert not torch.equal(param, previous[name]), name

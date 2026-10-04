@@ -56,6 +56,21 @@ class GRPOConfig(_BaseConfig):
             has untied word embedding and language modeling head layers i.e. `tie_word_embeddings` in the model config
             is False. Also applies to vLLM in colocate mode; in server mode, start the server with `--hf-overrides
             '{"head_dtype": "float32"}'` (vLLM 0.26.0 or later).
+        fp8_recipe (`str`, *optional*):
+            Recipe used to run the linear layers with FP8 GEMMs, keeping the parameters, the LM head, the norms, the
+            attention and the loss in their original precision. `"rowwise_with_gw_hp"` quantizes the weights per
+            output channel and the activations and their gradients per token, and computes the weight gradients in
+            high precision; the frozen base of a PEFT model is quantized once, without a high-precision copy. With
+            `vllm_share_weights=True` (and `vllm_native_lora=True` for PEFT), vLLM generates from these FP8 weights
+            (vLLM 0.30.0 or later). `"mxfp8_with_gw_hp"` uses TorchAO's MXFP8 instead, with one power-of-two scale per
+            block of 32 values, on Blackwell GPUs. TorchAO's `"rowwise"` and `"tensorwise"` recipes and `"mxfp8"` also
+            quantize the weight-gradient GEMM. Requires a GPU with FP8 support, and `torchao` for TorchAO's recipes.
+        fp8_skip_modules (`list[str]`, *optional*):
+            Glob patterns of the linear layers kept in high precision with `fp8_recipe`, e.g. `"model.layers.0.*"`. The
+            `tools/fp8_parity/replay.py --target-kl` sensitivity analysis produces such a list.
+        fp8_fast_accum (`list[str]`, *optional*):
+            FP8 GEMMs (`"output"`, `"grad_input"`, `"grad_weight"`) that use the faster, less accurate accumulation
+            with `fp8_recipe`. All GEMMs accumulate accurately by default. Not available with MXFP8.
 
         > Parameters that control the data preprocessing
 
@@ -166,6 +181,13 @@ class GRPOConfig(_BaseConfig):
             Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in fewer steps
             but use more activation memory. If you are using `vllm_mode="server"`, pass `--max-num-batched-tokens` when
             launching the vLLM server instead.
+        vllm_kv_cache_dtype (`str`, *optional*, defaults to `"auto"`):
+            Data type of vLLM's KV cache in colocate mode. `"fp8_per_token_head"` scales each token and head
+            dynamically (vLLM 0.30.0 or later, Triton attention backend), while `"fp8"` uses the scales stored in the
+            checkpoint, or `1.0` without them. In server mode, pass `--kv-cache-dtype` to the server instead.
+        vllm_kv_cache_dtype_skip_layers (`list[str]`, *optional*):
+            Layer indices (e.g. `"0"`) or attention types (e.g. `"sliding_window"`) whose KV cache keeps the model
+            dtype with `vllm_kv_cache_dtype`. Requires vLLM 0.30.0 or later.
         vllm_tensor_parallel_size (`int`, *optional*, defaults to `1`):
             Control the tensor parallel size for vLLM. This setting only applies when `vllm_mode` is set to
             `"colocate"`. If you are using `vllm_mode="server"`, this parameter must be passed separately when
@@ -484,6 +506,35 @@ class GRPOConfig(_BaseConfig):
             'start the server with `--hf-overrides \'{"head_dtype": "float32"}\'` (vLLM 0.26.0 or later).'
         },
     )
+    fp8_recipe: str | None = field(
+        default=None,
+        metadata={
+            "help": "Recipe used to run the linear layers with FP8 GEMMs, keeping the parameters, the LM head, the "
+            "norms, the attention and the loss in their original precision. `'rowwise_with_gw_hp'` quantizes the "
+            "weights per output channel and the activations and their gradients per token, and computes the weight "
+            "gradients in high precision; the frozen base of a PEFT model is quantized once, without a high-precision "
+            "copy. With `vllm_share_weights=True` (and `vllm_native_lora=True` for PEFT), vLLM generates from these "
+            "FP8 weights (vLLM 0.30.0 or later). `'mxfp8_with_gw_hp'` uses TorchAO's MXFP8 instead, with one "
+            "power-of-two scale per block of 32 values, on Blackwell GPUs. TorchAO's `'rowwise'` and `'tensorwise'` "
+            "recipes and `'mxfp8'` also quantize the weight-gradient GEMM. Requires a GPU with FP8 support, and "
+            "`torchao` for TorchAO's recipes."
+        },
+    )
+    fp8_skip_modules: list[str] | None = field(
+        default=None,
+        metadata={
+            "help": "Glob patterns of the linear layers kept in high precision with `fp8_recipe`, e.g. "
+            "`'model.layers.0.*'`. The `tools/fp8_parity/replay.py --target-kl` sensitivity analysis produces such a "
+            "list."
+        },
+    )
+    fp8_fast_accum: list[str] | None = field(
+        default=None,
+        metadata={
+            "help": "FP8 GEMMs (`'output'`, `'grad_input'`, `'grad_weight'`) that use the faster, less accurate "
+            "accumulation with `fp8_recipe`. All GEMMs accumulate accurately by default. Not available with MXFP8."
+        },
+    )
 
     # Parameters that control the data preprocessing
     # The default value remove_unused_columns is overwritten from the parent class, because in GRPO we usually rely on
@@ -688,6 +739,21 @@ class GRPOConfig(_BaseConfig):
             "help": "Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in "
             "fewer steps but use more activation memory. If you are using `vllm_mode='server'`, pass "
             "`--max-num-batched-tokens` when launching the vLLM server instead."
+        },
+    )
+    vllm_kv_cache_dtype: str = field(
+        default="auto",
+        metadata={
+            "help": "Data type of vLLM's KV cache in colocate mode. `'fp8_per_token_head'` scales each token and head "
+            "dynamically (vLLM 0.30.0 or later, Triton attention backend), while `'fp8'` uses the scales stored in "
+            "the checkpoint, or `1.0` without them. In server mode, pass `--kv-cache-dtype` to the server instead."
+        },
+    )
+    vllm_kv_cache_dtype_skip_layers: list[str] | None = field(
+        default=None,
+        metadata={
+            "help": "Layer indices (e.g. `'0'`) or attention types (e.g. `'sliding_window'`) whose KV cache keeps the "
+            "model dtype with `vllm_kv_cache_dtype`. Requires vLLM 0.30.0 or later."
         },
     )
     vllm_tensor_parallel_size: int = field(
