@@ -42,6 +42,13 @@ def quantize_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return (x.float() / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn), scale
 
 
+def _quantize_tokens(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Like `quantize_rowwise`, but without its scale floor, so rows of tiny activations or gradients keep their value."""
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    scale = (x.abs().amax(dim=-1, keepdim=True).float() / fp8_max).clamp(min=torch.finfo(torch.float32).tiny)
+    return (x.float() / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn), scale
+
+
 class _FP8Matmul(torch.autograd.Function):
     """
     `x @ (weight_scale * weight_fp8).T` with FP8 GEMMs and per-token scales for `x` and its gradient. The gradient of
@@ -56,7 +63,7 @@ class _FP8Matmul(torch.autograd.Function):
             None if weight is None else weight.dtype,
             fast_accum,
         )
-        x_fp8, x_scale = quantize_rowwise(x.reshape(-1, x.shape[-1]))
+        x_fp8, x_scale = _quantize_tokens(x.reshape(-1, x.shape[-1]))
         out = torch._scaled_mm(
             x_fp8,
             weight_fp8.t(),
@@ -72,7 +79,7 @@ class _FP8Matmul(torch.autograd.Function):
         x, weight_fp8, weight_scale = ctx.saved_tensors
         grad_output = grad_output.reshape(-1, grad_output.shape[-1])
         # The weight scales run along the reduced dimension, so they are folded into the gradient
-        grad_fp8, grad_scale = quantize_rowwise(grad_output.float() * weight_scale.t())
+        grad_fp8, grad_scale = _quantize_tokens(grad_output.float() * weight_scale.t())
         ones = weight_scale.new_ones(1, weight_fp8.shape[1])
         grad_input = torch._scaled_mm(
             grad_fp8,

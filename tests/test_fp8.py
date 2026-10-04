@@ -43,6 +43,36 @@ def test_fp8_linear_matches_its_dequantized_weight_forward_and_backward(trainabl
         torch.testing.assert_close(linear.weight.grad.float(), expected_weight_grad, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.parametrize("trainable", [False, True])
+def test_fp8_linear_does_not_flush_tiny_gradients_to_zero(trainable):
+    linear = torch.nn.Linear(64, 64, bias=False, dtype=torch.bfloat16).requires_grad_(trainable)
+    torch.nn.init.constant_(linear.weight, 1 / 16)
+    x = torch.randn(3, 64, dtype=torch.bfloat16, requires_grad=True)
+    grad = torch.tensor([[2.0**-20], [2.0**-40], [0.0]]).expand(3, 64)
+
+    FP8Linear(linear)(x).backward(grad.bfloat16())
+
+    torch.testing.assert_close(x.grad.float(), 4 * grad, rtol=0, atol=0)
+
+
+def test_fp8_layers_propagate_small_gradients_to_earlier_layers():
+    torch.manual_seed(0)
+    layers = [torch.nn.Linear(64, 64, dtype=torch.bfloat16) for _ in range(4)]
+    for layer in layers[1:]:
+        layer.requires_grad_(False)
+    fp8_model = torch.nn.Sequential(layers[0], *[FP8Linear(layer) for layer in layers[1:]])
+    x = torch.randn(512, 64, dtype=torch.bfloat16)
+
+    # A mean over many tokens gives the small per-token gradients of real training
+    fp8_model(x).float().mean().mul(1e-4).backward()
+    fp8_grad = layers[0].weight.grad.float()
+    layers[0].weight.grad = None
+    torch.nn.Sequential(*layers)(x).float().mean().mul(1e-4).backward()
+
+    expected_grad = layers[0].weight.grad.float()
+    assert (fp8_grad - expected_grad).norm() / expected_grad.norm() < 0.05
+
+
 def test_fp8_linear_requantizes_its_weight_once_per_update():
     layer = FP8Linear(torch.nn.Linear(64, 48))
     optimizer = torch.optim.SGD(layer.parameters(), lr=0.1)
