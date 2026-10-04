@@ -1032,8 +1032,9 @@ class GRPOTrainer(_BaseTrainer):
                     "`fp8_recipe` needs a high-precision checkpoint, or an FP8 one quantized in 128x128 blocks loaded "
                     f"on GPU with a PEFT adapter, not one quantized with {quantization_config['quant_method']}."
                 )
-            if DistributedBackend(self.accelerator).fsdp_version == 1:
-                raise ValueError("`fp8_recipe` requires FSDP2: FSDP1's mixed precision casts the FP8 weight buffers.")
+            backend = DistributedBackend(self.accelerator)
+            if backend.is_fsdp or backend.is_zero3:
+                raise ValueError("`fp8_recipe` keeps its FP8 weights in buffers, which FSDP and ZeRO-3 don't shard.")
             if self.ref_model is not None:
                 # The reference converts the same layers as the policy, whose frozen layers stay in high precision
                 for param, ref_param in zip(model.parameters(), self.ref_model.parameters(), strict=True):

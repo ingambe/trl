@@ -228,7 +228,7 @@ def build_trainer(args, overrides: dict) -> GRPOTrainer:
     }
     config = GRPOConfig(**{**config, **json.loads(args.config), **overrides})
     dataset = load_dataset(args.dataset, split="train").select(
-        range(args.batch_size // args.num_generations * args.batches)
+        range(config.per_device_train_batch_size // config.num_generations * args.batches)
     )
     peft_config = LoraConfig(r=args.lora_rank, target_modules="all-linear") if args.lora_rank else None
     trainer = GRPOTrainer(
@@ -271,10 +271,10 @@ def main():
     if ref.args.gradient_accumulation_steps != 1:
         raise ValueError("The replay steps the optimizer after every batch: set `gradient_accumulation_steps=1`.")
     # Each prompt repeated `num_generations` times, as the trainer's sampler lays out a group
-    prompts = [row for row in ref.train_dataset.to_list() for _ in range(args.num_generations)]
+    prompts = [row for row in ref.train_dataset.to_list() for _ in range(ref.args.num_generations)]
     batches = []
-    for start in range(0, len(prompts), args.batch_size):
-        batch = ref._generate_and_score_completions(prompts[start : start + args.batch_size])
+    for start in range(0, len(prompts), ref.args.per_device_train_batch_size):
+        batch = ref._generate_and_score_completions(prompts[start : start + ref.args.per_device_train_batch_size])
         batch["old_per_token_logps"] = per_token_logps(ref, batch)
         batches.append(batch)
 
