@@ -1506,6 +1506,13 @@ class GRPOTrainer(_BaseTrainer):
                 generation_batch = split_pixel_values_by_grid(generation_batch)
                 generation_batch = shuffle_sequence_dict(generation_batch)
                 generation_batches = split_tensor_dict(generation_batch, self.args.steps_per_generation)
+                # Loss tokens per micro-batch, summed over processes
+                num_items = [
+                    (batch["completion_mask"] * batch.get("tool_mask", 1)).sum() for batch in generation_batches
+                ]
+                self._buffered_num_items = (
+                    self.accelerator.gather(torch.stack(num_items)).view(-1, len(num_items)).sum(0)
+                )
                 if self.skip_zero_advantages:
                     # Skip rows with zero advantage, but keep one so every process still runs forward and backward.
                     # The loss still averages over every row.
@@ -1538,7 +1545,13 @@ class GRPOTrainer(_BaseTrainer):
                         if key in batch:
                             batch[key] = batch[key][:, : batch["prompt_ids"].size(1) + completion_length]
                 self._buffered_inputs = [unsplit_pixel_values_by_grid(batch) for batch in generation_batches]
-            inputs = self._buffered_inputs[self._step % self.args.steps_per_generation]
+            index = self._step % self.args.steps_per_generation
+            accumulation_steps = self.current_gradient_accumulation_steps
+            # Loss tokens of the optimizer step, extrapolated when it spans several generation batches
+            start = index - index % accumulation_steps
+            num_items = self._buffered_num_items[start : start + accumulation_steps]
+            num_items_in_batch = num_items.sum() * accumulation_steps / len(num_items)
+            inputs = {**self._buffered_inputs[index], "num_items_in_batch": num_items_in_batch}
         else:
             # In evaluation, there is neither batch grouping for generation, nor multiple iterations, hence
             # local generation batch == local eval batch
@@ -3125,10 +3138,8 @@ class GRPOTrainer(_BaseTrainer):
             policy_loss = loss.detach()
             loss = loss / normalizer
         elif self.loss_type in ["cispo", "dapo", "vespo"]:
-            # `num_items_in_batch` spans the generation batch, so rescale it to one accumulation window
+            # `num_items_in_batch` counts the loss tokens of the whole optimizer step
             normalizer = inputs["num_items_in_batch"].clamp(min=1.0) / self.accelerator.num_processes
-            if mode == "train":  # in eval, the batch is neither split across steps nor accumulated
-                normalizer = normalizer * self.current_gradient_accumulation_steps / self.args.steps_per_generation
             loss = (per_token_loss * mask).sum() / normalizer
             policy_loss = loss.detach()
         elif self.loss_type == "luspo":

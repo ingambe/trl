@@ -122,6 +122,18 @@ class MiniLLMConfig(GRPOConfig):
                 "'generation_batch_size' and 'steps_per_generation' can not be both configured at the same time"
             )
 
+        # Token-level losses normalize by the tokens of each optimizer step, so a step and a generation batch must
+        # not straddle each other's boundaries
+        if (
+            self.loss_type in ["cispo", "dapo", "vespo"]
+            and self.steps_per_generation % self.gradient_accumulation_steps != 0
+            and self.gradient_accumulation_steps % self.steps_per_generation != 0
+        ):
+            raise ValueError(
+                f"steps_per_generation ({self.steps_per_generation}) and gradient_accumulation_steps "
+                f"({self.gradient_accumulation_steps}) must be multiples of one another when loss_type='{self.loss_type}'."
+            )
+
         if self.do_eval and self.eval_strategy != "no":
             # Determine the number of generations to use for evaluation
             num_generations = self.num_generations_eval or self.num_generations
