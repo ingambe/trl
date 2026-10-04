@@ -192,6 +192,13 @@ class GRPOConfig(_BaseConfig):
         per_device_scoring_batch_size (`int`, *optional*):
             Batch size per device for computing old-policy and reference log-probabilities, which run without
             gradients. Defaults to `per_device_train_batch_size`.
+        max_tokens_per_microbatch (`int`, *optional*):
+            Per-device budget of padded tokens (rows × longest row) in one training forward and backward. When set,
+            `per_device_train_batch_size` is the number of rows per device in an optimizer step, and each step's rows
+            are split into micro-batches that fit the budget, the same number on every process. A row longer than the
+            budget gets a micro-batch of its own. Requires `gradient_accumulation_steps=1`, a `loss_type` of `"dapo"`,
+            `"cispo"` or `"vespo"`, and no entropy bonus. Not supported with DeepSpeed, LOMO or layer-wise optimizers,
+            or a router auxiliary loss.
         epsilon (`float`, *optional*, defaults to `0.2`):
             Epsilon value for clipping.
         delta (`float`, *optional*):
@@ -753,6 +760,17 @@ class GRPOConfig(_BaseConfig):
             "without gradients. Defaults to `per_device_train_batch_size`."
         },
     )
+    max_tokens_per_microbatch: int | None = field(
+        default=None,
+        metadata={
+            "help": "Per-device budget of padded tokens (rows × longest row) in one training forward and backward. "
+            "When set, `per_device_train_batch_size` is the number of rows per device in an optimizer step, and each "
+            "step's rows are split into micro-batches that fit the budget, the same number on every process. A row "
+            "longer than the budget gets a micro-batch of its own. Requires `gradient_accumulation_steps=1`, a "
+            "`loss_type` of 'dapo', 'cispo' or 'vespo', and no entropy bonus. Not supported with DeepSpeed, LOMO "
+            "or layer-wise optimizers, or a router auxiliary loss."
+        },
+    )
     epsilon: float = field(
         default=0.2,
         metadata={"help": "Epsilon value for clipping."},
@@ -1214,6 +1232,24 @@ class GRPOConfig(_BaseConfig):
                 f"generation_batch_size ({self.generation_batch_size}) must be divisible by num_generations "
                 f"({self.num_generations})."
             )
+
+        if self.max_tokens_per_microbatch is not None:
+            if self.gradient_accumulation_steps != 1:
+                raise ValueError(
+                    "`max_tokens_per_microbatch` requires `gradient_accumulation_steps=1`: set "
+                    "`per_device_train_batch_size` to the rows per device of an optimizer step instead."
+                )
+            if (
+                self.loss_type not in ["cispo", "dapo", "vespo"]
+                or self.top_entropy_quantile < 1.0
+                or self.entropy_coef != 0.0
+                or self.use_adaptive_entropy
+            ):
+                raise ValueError(
+                    "`max_tokens_per_microbatch` requires `loss_type` 'dapo', 'cispo' or 'vespo', "
+                    "`top_entropy_quantile=1.0` and no entropy bonus, so the loss doesn't depend on how a step is "
+                    "split."
+                )
 
         if self.num_generations < 2:
             raise ValueError(

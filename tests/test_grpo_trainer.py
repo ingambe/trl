@@ -5122,3 +5122,62 @@ def test_scoring_uses_its_own_batch_size(tiny_llama, tmp_path):
 
     scoring_calls = [call for call in spy.call_args_list if "batch_size" in call.kwargs]
     assert scoring_calls and all(call.kwargs["batch_size"] == 1 for call in scoring_calls)
+
+
+@pytest.mark.parametrize("max_tokens_per_microbatch", [1, 30, 1000])
+def test_token_budget_micro_batches_keep_the_update(max_tokens_per_microbatch, tiny_llama, tmp_path):
+    model, tokenizer = tiny_llama
+    lengths = [5, 6, 1, 12, 9, 2, 14, 4] * 2
+    generator = torch.Generator().manual_seed(0)
+    completion_ids = [torch.randint(2, 32, (n - 1,), generator=generator).tolist() + [1] for n in lengths]
+
+    def rollout_func(prompts, trainer):
+        return {
+            "prompt_ids": [[2]] * len(prompts),
+            "completion_ids": completion_ids,
+            "logprobs": [[0.0] * len(ids) for ids in completion_ids],
+        }
+
+    def reward(completion_ids, **kwargs):
+        return [float(len(ids)) for ids in completion_ids]
+
+    class RecordGradients(TrainerCallback):
+        def on_pre_optimizer_step(self, args, state, control, model, **kwargs):
+            gradients.append({n: p.grad.clone() for n, p in model.named_parameters()})
+
+    runs = []
+    # 2 steps of 8 rows: 4 micro-batches of 2 rows vs. micro-batches planned by the budget
+    for per_device_train_batch_size, gradient_accumulation_steps, budget in [
+        (2, 4, None),
+        (8, 1, max_tokens_per_microbatch),
+    ]:
+        gradients = []
+        trainer = GRPOTrainer(
+            model=copy.deepcopy(model),
+            processing_class=tokenizer,
+            reward_funcs=reward,
+            args=GRPOConfig(
+                output_dir=str(tmp_path),
+                report_to="none",
+                bf16=False,
+                learning_rate=0.0,
+                max_grad_norm=0.0,
+                per_device_train_batch_size=per_device_train_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                max_tokens_per_microbatch=budget,
+                generation_batch_size=16,
+                num_generations=2,
+                max_steps=2,
+                pad_to_multiple_of=4,
+            ),
+            train_dataset=Dataset.from_dict({"prompt": ["a"] * 8}),
+            rollout_func=rollout_func,
+            callbacks=[RecordGradients()],
+        )
+        trainer.train()
+        runs.append(gradients)
+
+    torch.testing.assert_close(runs[1], runs[0])
+    for batch in trainer._buffered_inputs:
+        rows, width = batch["prompt_ids"].size(0), batch["prompt_ids"].size(1) + batch["completion_ids"].size(1)
+        assert rows * width <= max_tokens_per_microbatch or rows == 1
