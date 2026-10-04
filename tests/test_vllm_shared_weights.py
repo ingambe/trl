@@ -15,6 +15,7 @@
 import copy
 from types import SimpleNamespace
 
+import pytest
 import torch
 from safetensors.torch import load_file
 from transformers.pytorch_utils import Conv1D
@@ -183,8 +184,8 @@ def test_lora_is_merged_for_generation_only(vllm_generation):
     vllm_generation.llm.llm_engine.add_lora.assert_not_called()
 
 
-def fp8_vllm_model():
-    """vLLM model with per-channel FP8 q, k (fused, transposed by the kernel) and o projections."""
+def fp8_vllm_model(weights):
+    """vLLM model that loaded `weights` of q, k (fused, transposed by the kernel) and o projections in per-channel FP8."""
 
     def fp8_layer(out_features, transposed):
         layer = torch.nn.Module()
@@ -207,6 +208,16 @@ def fp8_vllm_model():
             else:
                 vllm_model[module].get_parameter(kind).data.copy_(weight)
 
+    qk_rows, qk_scales = vllm_model.qk_proj.weight.data.t(), vllm_model.qk_proj.weight_scale.data
+    views = {
+        "q_proj": (qk_rows[:16], qk_scales[:16]),
+        "k_proj": (qk_rows[16:], qk_scales[16:]),
+        "o_proj": (vllm_model.o_proj.weight.data, vllm_model.o_proj.weight_scale.data),
+    }
+    for name, weight in weights.items():
+        weight_fp8, weight_scale = quantize_rowwise(weight.detach())
+        views[name][0].copy_(weight_fp8)
+        views[name][1].copy_(weight_scale)
     vllm_model.load_weights = load_weights
     return vllm_model
 
@@ -218,11 +229,11 @@ def test_lora_shares_the_fp8_base_in_any_vllm_layout(vllm_generation):
         LoraConfig(r=1, target_modules=["q_proj", "k_proj", "o_proj"]),
     )
     layers = {name: model.base_model.model[name] for name in ("q_proj", "k_proj", "o_proj")}
+    vllm_model = fp8_vllm_model({name: layer.base_layer.weight for name, layer in layers.items()})
     for layer in layers.values():
         layer.base_layer = FP8Linear(layer.base_layer)
     x = torch.randn(3, 16)
     expected = {name: layer(x) for name, layer in layers.items()}
-    vllm_model = fp8_vllm_model()
     runner = vllm_generation.llm.llm_engine.model_executor.driver_worker.model_runner
     runner.model = vllm_model
     vllm_generation.model = model
@@ -243,7 +254,7 @@ def test_lora_shares_the_fp8_base_in_any_vllm_layout(vllm_generation):
 
 def test_fp8_copies_of_updated_weights_are_written_into_vllm(vllm_generation):
     model = torch.nn.ModuleDict({name: FP8Linear(torch.nn.Linear(16, 16)) for name in ("q_proj", "k_proj", "o_proj")})
-    vllm_model = fp8_vllm_model()
+    vllm_model = fp8_vllm_model({name: layer.weight for name, layer in model.items()})
     runner = vllm_generation.llm.llm_engine.model_executor.driver_worker.model_runner
     runner.model = vllm_model
     vllm_generation.model = model
@@ -261,3 +272,16 @@ def test_fp8_copies_of_updated_weights_are_written_into_vllm(vllm_generation):
     torch.testing.assert_close(vllm_model.qk_proj.weight_scale[16:], weight_scale, rtol=0, atol=0)
     assert model.k_proj.bias.data_ptr() == vllm_model.qk_proj.bias[16:].data_ptr()
     assert published == []
+
+
+def test_fp8_sharing_rejects_a_vllm_loader_that_reorders_rows(vllm_generation):
+    model = torch.nn.ModuleDict({name: FP8Linear(torch.nn.Linear(16, 16)) for name in ("q_proj", "k_proj", "o_proj")})
+    # Same shapes, but vLLM's loader swapped the q and k rows, as GPT-NeoX's QKV repacking does
+    weights = {"q_proj": model.k_proj.weight, "k_proj": model.q_proj.weight, "o_proj": model.o_proj.weight}
+    runner = vllm_generation.llm.llm_engine.model_executor.driver_worker.model_runner
+    runner.model = fp8_vllm_model(weights)
+    vllm_generation.model = model
+    vllm_generation.share_weights = True
+
+    with pytest.raises(ValueError, match="layout of `q_proj`"):
+        vllm_generation._share_weights()

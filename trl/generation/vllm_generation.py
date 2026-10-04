@@ -580,6 +580,12 @@ class VLLMGeneration:
             if weight is None or weight.shape != (module.out_features, module.in_features):
                 raise ValueError(f"vLLM doesn't hold `{name}` in per-channel FP8 like the trainer.")
             if not module.weight_fp8.is_set_to(weight):
+                # vLLM loaded the same checkpoint, unless its loader reordered the rows (e.g. GPT-NeoX's QKV)
+                vllm_weight, trainer_weight = weight.float() * scale, module.weight_fp8.float() * module.weight_scale
+                if (vllm_weight - trainer_weight).norm() > 0.1 * trainer_weight.norm():
+                    raise ValueError(
+                        f"vLLM's loader changes the layout of `{name}`, so its FP8 weights can't be shared."
+                    )
                 weight.copy_(module.weight_fp8)
                 scale.copy_(module.weight_scale)
                 module.weight_fp8, module.weight_scale = weight, scale
