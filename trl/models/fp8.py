@@ -149,6 +149,31 @@ class FP8Linear(nn.Module):
         return out if self.bias is None else out + self.bias.to(out.dtype)
 
 
+def dequantize_fp8_layers(model: nn.Module, dtype: torch.dtype) -> None:
+    """
+    Turn the [`FP8Linear`] layers of a model back into `nn.Linear` layers, e.g. before PEFT's `merge_and_unload`.
+
+    The frozen layers get their FP8 weights dequantized, so the model then computes in high precision, unlike in
+    training. An adapter can instead be saved alone, and loaded over the same base converted with the same recipe and
+    `skip_modules`.
+
+    Args:
+        model (`nn.Module`):
+            Model to convert in place.
+        dtype (`torch.dtype`):
+            Dtype of the dequantized weights.
+    """
+    for name, module in list(model.named_modules()):
+        if isinstance(module, FP8Linear):
+            linear = nn.Linear(module.in_features, module.out_features, bias=module.bias is not None, device="meta")
+            weight = module.weight
+            if weight is None:
+                weight = nn.Parameter((module.weight_fp8.float() * module.weight_scale).to(dtype), requires_grad=False)
+            linear.weight, linear.bias = weight, module.bias
+            parent, _, child = name.rpartition(".")
+            setattr(model.get_submodule(parent), child, linear)
+
+
 def convert_to_fp8_training(
     model: nn.Module, recipe: str, skip_modules: list[str] | None = None, fast_accum: list[str] | None = None
 ) -> None:

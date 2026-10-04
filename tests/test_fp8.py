@@ -14,9 +14,16 @@
 
 import pytest
 import torch
+from transformers.utils import is_peft_available
 
-from trl.models.fp8 import FP8Linear, quantize_rowwise
+from trl.models.fp8 import FP8Linear, dequantize_fp8_layers, quantize_rowwise
 from trl.trainer.callbacks import SyncRefModelCallback
+
+from .testing_utils import require_peft
+
+
+if is_peft_available():
+    from peft import LoraConfig, get_peft_model
 
 
 @pytest.mark.parametrize("trainable", [False, True])
@@ -97,3 +104,21 @@ def test_fp8_reference_model_sees_synced_weights():
 
     weight_fp8, _ = quantize_rowwise(model.weight.detach())
     assert torch.equal(ref_model.weight_fp8.view(torch.uint8), weight_fp8.view(torch.uint8))
+
+
+@require_peft
+def test_fp8_lora_merges_into_the_dequantized_base():
+    model = get_peft_model(
+        torch.nn.ModuleDict({"proj": torch.nn.Linear(64, 48)}),
+        LoraConfig(r=2, target_modules=["proj"], init_lora_weights=False),
+    )
+    layer = model.base_model.model["proj"]
+    layer.base_layer = FP8Linear(layer.base_layer)
+    x = torch.randn(5, 64)
+    expected = layer(x)
+
+    dequantize_fp8_layers(model, torch.float32)
+    merged = model.merge_and_unload()["proj"]
+
+    assert type(merged) is torch.nn.Linear
+    assert (merged(x) - expected).norm() / expected.norm() < 0.05
