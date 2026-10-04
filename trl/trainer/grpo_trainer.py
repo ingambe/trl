@@ -1029,8 +1029,11 @@ class GRPOTrainer(_BaseTrainer):
                 and is_peft_model(model)
             ):
                 raise ValueError(
-                    "`fp8_recipe` needs a high-precision checkpoint, or an FP8 one quantized in 128x128 blocks loaded "
-                    f"on GPU with a PEFT adapter, not one quantized with {quantization_config['quant_method']}."
+                    "`fp8_recipe` trains a quantized checkpoint only as the frozen base of a PEFT adapter, and only an "
+                    "FP8 one quantized in 128x128 blocks and loaded on GPU, not one quantized with "
+                    f"{quantization_config['quant_method']}. Full fine-tuning needs high-precision master weights, so a "
+                    "dequantized FP8 checkpoint saves no memory over the BF16 one, starts from rounded weights and "
+                    "trains in a different FP8 layout than vLLM serves it: train the BF16 checkpoint instead."
                 )
             backend = DistributedBackend(self.accelerator)
             if backend.is_fsdp or backend.is_zero3:

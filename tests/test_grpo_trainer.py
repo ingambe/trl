@@ -5071,7 +5071,7 @@ def test_fp8_recipe_rejects_a_prequantized_checkpoint(tiny_llama, tmp_path):
     model, tokenizer = tiny_llama
     model.config.quantization_config = {"quant_method": "fp8", "weight_block_size": [128, 128]}
 
-    with pytest.raises(ValueError, match="not one quantized with fp8"):
+    with pytest.raises(ValueError, match="Full fine-tuning needs high-precision master weights"):
         GRPOTrainer(
             model=model,
             processing_class=tokenizer,
