@@ -5066,6 +5066,20 @@ def test_fp8_recipe_trains_the_linear_layers_with_fp8_gemms(tiny_llama, tmp_path
         assert not torch.equal(trainer.model.get_parameter(f"{name}.weight"), previous[f"{name}.weight"])
 
 
+def test_fp8_recipe_rejects_a_prequantized_checkpoint(tiny_llama, tmp_path):
+    model, tokenizer = tiny_llama
+    model.config.quantization_config = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+
+    with pytest.raises(ValueError, match="not one quantized with fp8"):
+        GRPOTrainer(
+            model=model,
+            processing_class=tokenizer,
+            reward_funcs=lambda completions, **kwargs: [0.0] * len(completions),
+            args=GRPOConfig(output_dir=str(tmp_path), report_to="none", fp8_recipe="rowwise_with_gw_hp"),
+            train_dataset=Dataset.from_dict({"prompt": ["a"]}),
+        )
+
+
 @require_peft
 @require_torchao
 def test_fp8_recipe_trains_lora_over_an_immutable_fp8_base(tiny_llama, tmp_path):

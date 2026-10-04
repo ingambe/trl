@@ -311,6 +311,14 @@ class VLLMClient:
         """
         return self._get(f"{self.base_url}/get_world_size")["world_size"]
 
+    def get_model_config(self) -> dict:
+        """
+        Returns the vLLM configuration of the served model, e.g. its `quantization` and `quantization_config`.
+        """
+        return self._get(f"{self.base_url}/server_info", params={"config_format": "json"})["vllm_config"][
+            "model_config"
+        ]
+
     def image_features(
         self, images: list[list | None], max_concurrent_requests: int = _DEFAULT_GENERATION_CONCURRENCY
     ) -> list[dict | None]:

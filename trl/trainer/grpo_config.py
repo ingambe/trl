@@ -58,16 +58,19 @@ class GRPOConfig(_BaseConfig):
             '{"head_dtype": "float32"}'` (vLLM 0.26.0 or later).
         fp8_recipe (`str`, *optional*):
             Recipe used to run the linear layers with FP8 GEMMs, keeping the parameters, the LM head, the norms, the
-            attention and the loss in their original precision. `"rowwise_with_gw_hp"` quantizes the weights per
-            output channel and the activations and their gradients per token, and computes the weight gradients in
-            high precision; the frozen base of a PEFT model is quantized once, without a high-precision copy. With
+            attention and the loss in their original precision. `"rowwise_with_gw_hp"` quantizes the weights per output
+            channel and the activations and their gradients per token, and computes the weight gradients in high
+            precision; the frozen base of a PEFT model is quantized once, without a high-precision copy. With
             `vllm_share_weights=True` (and `vllm_native_lora=True` for PEFT), vLLM generates from these FP8 weights
-            (vLLM 0.30.0 or later). `"mxfp8_with_gw_hp"` uses TorchAO's MXFP8 instead, with one power-of-two scale per
-            block of 32 values, on Blackwell GPUs. TorchAO's `"rowwise"` and `"tensorwise"` recipes and `"mxfp8"` also
-            quantize the weight-gradient GEMM. Requires a GPU with FP8 support, and `torchao` for TorchAO's recipes.
+            (vLLM 0.30.0 or later). In server mode, a server started with `--quantization fp8_per_channel` requantizes
+            the high-precision weights it receives. `"mxfp8_with_gw_hp"` uses TorchAO's MXFP8 instead, with one
+            power-of-two scale per block of 32 values, on Blackwell GPUs. TorchAO's `"rowwise"` and `"tensorwise"`
+            recipes and `"mxfp8"` also quantize the weight-gradient GEMM. Requires a high-precision checkpoint, a GPU
+            with FP8 support, and `torchao` for TorchAO's recipes.
         fp8_skip_modules (`list[str]`, *optional*):
             Glob patterns of the linear layers kept in high precision with `fp8_recipe`, e.g. `"model.layers.0.*"`. The
-            `tools/fp8_parity/replay.py --target-kl` sensitivity analysis produces such a list.
+            `tools/fp8_parity/replay.py --target-kl` sensitivity analysis produces such a list. vLLM quantizes the
+            q/k/v and gate/up projections together, so they're skipped together.
         fp8_fast_accum (`list[str]`, *optional*):
             FP8 GEMMs (`"output"`, `"grad_input"`, `"grad_weight"`) that use the faster, less accurate accumulation
             with `fp8_recipe`. All GEMMs accumulate accurately by default. Not available with MXFP8.
@@ -514,10 +517,12 @@ class GRPOConfig(_BaseConfig):
             "weights per output channel and the activations and their gradients per token, and computes the weight "
             "gradients in high precision; the frozen base of a PEFT model is quantized once, without a high-precision "
             "copy. With `vllm_share_weights=True` (and `vllm_native_lora=True` for PEFT), vLLM generates from these "
-            "FP8 weights (vLLM 0.30.0 or later). `'mxfp8_with_gw_hp'` uses TorchAO's MXFP8 instead, with one "
-            "power-of-two scale per block of 32 values, on Blackwell GPUs. TorchAO's `'rowwise'` and `'tensorwise'` "
-            "recipes and `'mxfp8'` also quantize the weight-gradient GEMM. Requires a GPU with FP8 support, and "
-            "`torchao` for TorchAO's recipes."
+            "FP8 weights (vLLM 0.30.0 or later). In server mode, a server started with "
+            "`--quantization fp8_per_channel` requantizes the high-precision weights it receives. "
+            "`'mxfp8_with_gw_hp'` uses TorchAO's MXFP8 instead, with one power-of-two scale per block of 32 values, "
+            "on Blackwell GPUs. TorchAO's `'rowwise'` and `'tensorwise'` recipes and `'mxfp8'` also quantize the "
+            "weight-gradient GEMM. Requires a high-precision checkpoint, a GPU with FP8 support, and `torchao` for "
+            "TorchAO's recipes."
         },
     )
     fp8_skip_modules: list[str] | None = field(
@@ -525,7 +530,7 @@ class GRPOConfig(_BaseConfig):
         metadata={
             "help": "Glob patterns of the linear layers kept in high precision with `fp8_recipe`, e.g. "
             "`'model.layers.0.*'`. The `tools/fp8_parity/replay.py --target-kl` sensitivity analysis produces such a "
-            "list."
+            "list. vLLM quantizes the q/k/v and gate/up projections together, so they're skipped together."
         },
     )
     fp8_fast_accum: list[str] | None = field(

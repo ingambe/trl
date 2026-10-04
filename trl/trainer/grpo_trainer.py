@@ -1020,8 +1020,12 @@ class GRPOTrainer(_BaseTrainer):
                 _cast_lm_head_to_fp32(self.ref_model)
 
         if args.fp8_recipe is not None:
-            if _is_quantized_model:
-                raise ValueError("`fp8_recipe` can't be used with a model quantized by bitsandbytes.")
+            quantization_config = model.config.to_dict().get("quantization_config")
+            if quantization_config is not None:
+                raise ValueError(
+                    f"`fp8_recipe` needs a high-precision checkpoint, not one quantized with "
+                    f"{quantization_config['quant_method']}."
+                )
             if DistributedBackend(self.accelerator).fsdp_version == 1:
                 raise ValueError("`fp8_recipe` requires FSDP2: FSDP1's mixed precision casts the FP8 weight buffers.")
             if self.ref_model is not None:

@@ -14,6 +14,7 @@
 
 """vLLM-based generation backend for TRL trainers."""
 
+import json
 import logging
 import math
 import os
@@ -360,6 +361,22 @@ class VLLMGeneration:
                     base_url=base_url, group_port=self.group_port, connection_timeout=self.server_timeout
                 )
                 self.vllm_client.init_communicator(device=accelerator.device)
+                if fp8_layers:
+                    # The server requantizes the high-precision weights it receives on each update
+                    server_config = self.vllm_client.get_model_config()
+                    quantization = server_config["quantization"]
+                    if quantization == "fp8_per_channel":
+                        ignore = self._fp8_ignore_list(model)
+                        if sorted(server_config["quantization_config"]["ignore"]) != sorted(ignore):
+                            raise ValueError(
+                                "The vLLM server must keep the same layers in high precision as the trainer: start it "
+                                f"with `--quantization-config '{json.dumps({'ignore': ignore})}'`."
+                            )
+                    elif quantization is not None:
+                        raise ValueError(
+                            f"The vLLM server runs `{quantization}` quantization, unlike `fp8_recipe`: serve the "
+                            "high-precision checkpoint, with `--quantization fp8_per_channel` for FP8 inference."
+                        )
 
         elif self.mode == "colocate":
             # Make sure tensor_parallel_size group size evenly divides the world size - each group should have
@@ -409,30 +426,9 @@ class VLLMGeneration:
             if self.share_weights and fp8_layers:
                 if not is_vllm_available(min_version="0.30.0"):
                     raise ImportError("Sharing FP8 weights with vLLM requires vLLM 0.30.0 or later.")
-                # vLLM quantizes the same layers as the trainer, whose FP8 weights it then shares. Its fused MoE
-                # experts have no trainer counterpart.
+                # vLLM quantizes the same layers as the trainer, whose FP8 weights it then shares
                 quantization = "fp8_per_channel"
-                ignored = [
-                    name
-                    for name, module in model.named_modules()
-                    if isinstance(module, nn.Linear) and "lora_" not in name
-                ]
-                fused_fp8 = {
-                    fused_layer_name(name) for name, module in model.named_modules() if isinstance(module, FP8Linear)
-                }
-                for name in ignored:
-                    if fused_layer_name(name) in fused_fp8:
-                        raise ValueError(
-                            f"vLLM quantizes `{name}` together with the projections it fuses it with: keep all of them "
-                            "in high precision with `fp8_skip_modules`, or none."
-                        )
-                fp8_kwargs["quantization_config"] = {
-                    "ignore": ["*.experts"]
-                    + [
-                        self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", ""))
-                        for name in ignored
-                    ]
-                }
+                fp8_kwargs["quantization_config"] = {"ignore": self._fp8_ignore_list(model)}
             lora_kwargs = {}
             if self.share_weights and is_peft_model(model):
                 config = model.peft_config[model.active_adapters[0]]
@@ -510,6 +506,24 @@ class VLLMGeneration:
         # desynchronization and seems to lead to DeepSpeed hanging during initialization. To prevent this, we
         # synchronize all processes after vLLM has been fully initialized.
         accelerator.wait_for_everyone()
+
+    def _fp8_ignore_list(self, model: nn.Module) -> list[str]:
+        """Layers vLLM keeps in high precision to quantize the same layers as the trainer."""
+        ignored = [
+            name for name, module in model.named_modules() if isinstance(module, nn.Linear) and "lora_" not in name
+        ]
+        fused_fp8 = {fused_layer_name(name) for name, module in model.named_modules() if isinstance(module, FP8Linear)}
+        for name in ignored:
+            if fused_layer_name(name) in fused_fp8:
+                raise ValueError(
+                    f"vLLM quantizes `{name}` together with the projections it fuses it with: keep all of them in "
+                    "high precision with `fp8_skip_modules`, or none."
+                )
+        # vLLM's fused MoE experts have no trainer counterpart
+        return ["*.experts"] + [
+            self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", ""))
+            for name in ignored
+        ]
 
     @torch.no_grad()
     def _share_weights(self) -> list[tuple[str, torch.Tensor]]:

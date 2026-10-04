@@ -14,6 +14,7 @@
 
 import copy
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -188,7 +189,7 @@ def test_lora_is_merged_for_generation_only(vllm_generation):
 
 
 def fp8_vllm_model(weights):
-    """vLLM model that loaded `weights` of q, k (fused, transposed by the kernel) and o projections in per-channel FP8."""
+    """vLLM model that loaded `weights` of q, k (fused, transposed by the kernel) and o projections in FP8."""
 
     def fp8_layer(out_features, transposed):
         layer = torch.nn.Module()
@@ -300,3 +301,17 @@ def test_fp8_sharing_rejects_skipping_part_of_a_fused_projection(vllm_generation
 
     with pytest.raises(ValueError, match="`k_proj`"):
         init_vllm(vllm_generation)
+
+
+def test_fp8_server_must_keep_the_trainer_layers_in_high_precision(vllm_generation, monkeypatch):
+    client = Mock()
+    client.get_model_config.return_value = {"quantization": "fp8_per_channel", "quantization_config": {"ignore": []}}
+    monkeypatch.setattr(vllm_generation_module, "VLLMClient", lambda **kwargs: client)
+    monkeypatch.setattr(vllm_generation_module, "is_vllm_available", lambda min_version=None: True)
+    model = torch.nn.ModuleDict({"q_proj": FP8Linear(torch.nn.Linear(16, 16)), "lm_head": torch.nn.Linear(16, 16)})
+    vllm_generation.model, vllm_generation.mode = model, "server"
+
+    with pytest.raises(ValueError, match="--quantization-config"):
+        init_vllm(vllm_generation)
+    client.get_model_config.return_value["quantization_config"]["ignore"] = ["lm_head", "*.experts"]
+    init_vllm(vllm_generation)

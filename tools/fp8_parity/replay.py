@@ -116,7 +116,7 @@ def kl_divergence(ref_logps: torch.Tensor, cand_logps: torch.Tensor, batch, rows
 
 def sensitivity(trainer, batch, recipe: str, rows: int, target_kl: float) -> dict:
     """Rank the linear layers by the policy KL each one causes alone in FP8, then keep the worst in high precision
-    until the KL of the whole model is below `target_kl`. Projections vLLM fuses (q/k/v, gate/up) count as one layer."""
+    until the KL of the whole model is below `target_kl`. Projections vLLM fuses (q/k/v, gate/up) count as one."""
     model = trainer.model
     fp8_model = copy.deepcopy(model)
     convert_to_fp8_training(fp8_model, recipe)
