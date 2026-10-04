@@ -5191,3 +5191,31 @@ def test_token_level_loss_extrapolates_across_generation_batches(tiny_llama, tmp
     assert any(accumulation_steps < 4 for _, _, accumulation_steps in seen)
     for num_items_in_batch, num_items, _ in seen:
         torch.testing.assert_close(num_items_in_batch, num_items)
+
+
+def test_scoring_uses_its_own_batch_size(tiny_llama, tmp_path):
+    model, tokenizer = tiny_llama
+    trainer = GRPOTrainer(
+        model=model,
+        processing_class=tokenizer,
+        reward_funcs=lambda completion_ids, **kwargs: [float(len(ids)) for ids in completion_ids],
+        args=GRPOConfig(
+            output_dir=str(tmp_path),
+            report_to="none",
+            bf16=False,
+            per_device_train_batch_size=2,
+            per_device_scoring_batch_size=1,
+            steps_per_generation=2,  # more steps than accumulation steps, so old log-probs are scored
+            num_generations=2,
+            max_completion_length=4,
+            max_steps=1,
+        ),
+        train_dataset=Dataset.from_dict({"prompt": ["a", "a a"]}),
+    )
+    with patch.object(
+        trainer, "_get_per_token_logps_and_entropies", wraps=trainer._get_per_token_logps_and_entropies
+    ) as spy:
+        trainer.train()
+
+    scoring_calls = [call for call in spy.call_args_list if "batch_size" in call.kwargs]
+    assert scoring_calls and all(call.kwargs["batch_size"] == 1 for call in scoring_calls)

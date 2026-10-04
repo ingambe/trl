@@ -751,9 +751,8 @@ class RLOOTrainer(_BaseTrainer):
                 tensor_parallel_size=args.vllm_tensor_parallel_size,
                 gpu_memory_utilization=args.vllm_gpu_memory_utilization,
                 max_model_length=args.vllm_max_model_length,
-                max_num_seqs=args.per_device_train_batch_size
-                * args.vllm_tensor_parallel_size
-                * args.steps_per_generation,
+                max_num_seqs=args.vllm_max_num_seqs
+                or args.per_device_train_batch_size * args.vllm_tensor_parallel_size * args.steps_per_generation,
                 max_num_batched_tokens=args.vllm_max_num_batched_tokens,
                 enable_sleep_mode=args.vllm_enable_sleep_mode,
                 share_weights=args.vllm_share_weights,
@@ -1518,7 +1517,10 @@ class RLOOTrainer(_BaseTrainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
 
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
-        batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
+        if mode == "train":
+            batch_size = self.args.per_device_scoring_batch_size or self.args.per_device_train_batch_size
+        else:
+            batch_size = self.args.per_device_eval_batch_size
 
         num_images = [len(img_list) if img_list else 0 for img_list in images] if images is not None else None
 
