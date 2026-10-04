@@ -14,6 +14,7 @@
 
 import asyncio
 import atexit
+import contextlib
 import copy
 import importlib.resources as pkg_resources
 import inspect
@@ -36,6 +37,7 @@ import torch.utils.data
 import transformers
 from accelerate.logging import get_logger
 from accelerate.utils import gather, gather_object, is_peft_model, send_to_device, set_seed
+from accelerate.utils.memory import clear_device_cache
 from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict
 from huggingface_hub import CommitScheduler, DatasetCard, DatasetCardData, create_repo
 from packaging.version import Version
@@ -1139,6 +1141,17 @@ class GRPOTrainer(_BaseTrainer):
         self.model_accepts_loss_kwargs = False
         self._dist = DistributedBackend(self.accelerator)
 
+        if args.max_tokens_per_microbatch is not None and (
+            self.is_deepspeed_enabled
+            or args.optim in ["lomo", "adalomo"]
+            or args.optim.endswith("layerwise")
+            or self.aux_loss_enabled
+        ):
+            raise ValueError(
+                "`max_tokens_per_microbatch` isn't supported with DeepSpeed, LOMO or layer-wise optimizers, or a "
+                "router auxiliary loss."
+            )
+
         # Add tags to the model
         self.model.add_model_tags(self._tag_names)
 
@@ -1472,7 +1485,30 @@ class GRPOTrainer(_BaseTrainer):
 
     def training_step(self, model, inputs, num_items_in_batch):
         time_before = time.perf_counter()
-        output = super().training_step(model, inputs, num_items_in_batch)
+        if self.args.max_tokens_per_microbatch is None:
+            output = super().training_step(model, inputs, num_items_in_batch)
+        else:
+            # One call runs a whole optimizer step
+            model.train()
+            if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+                self.optimizer.train()
+            micro_batches = self._prepare_inputs(inputs)
+            if self.args.torch_empty_cache_steps and self.state.global_step % self.args.torch_empty_cache_steps == 0:
+                clear_device_cache()
+            self.current_gradient_accumulation_steps = len(micro_batches)
+            sync_each_batch = self.accelerator.gradient_state.plugin_kwargs.get("sync_each_batch", False)
+            output = 0.0
+            for i, micro_batch in enumerate(micro_batches):
+                sync_gradients = i == len(micro_batches) - 1
+                self.accelerator.gradient_state._set_sync_gradients(sync_gradients)
+                with (
+                    contextlib.nullcontext() if sync_gradients or sync_each_batch else self.accelerator.no_sync(model)
+                ):
+                    with self.compute_loss_context_manager():
+                        loss = self.compute_loss(model, micro_batch)
+                    self.accelerator.backward(loss)
+                output += loss.detach()
+            self.current_gradient_accumulation_steps = 1
         self._step += 1
         time_after = time.perf_counter()
         self._current_train_step_time += time_after - time_before
@@ -1512,6 +1548,8 @@ class GRPOTrainer(_BaseTrainer):
                 self._buffered_num_items = (
                     self.accelerator.gather(torch.stack(num_items)).view(-1, len(num_items)).sum(0)
                 )
+                if self.args.max_tokens_per_microbatch is not None:
+                    generation_batches, self._buffered_steps = self._split_by_token_budget(generation_batches)
                 if self.skip_zero_advantages:
                     # Skip rows with zero advantage, but keep one so every process still runs forward and backward.
                     # The loss still averages over every row.
@@ -1552,13 +1590,55 @@ class GRPOTrainer(_BaseTrainer):
             start = index - index % accumulation_steps
             num_items = self._buffered_num_items[start : start + accumulation_steps]
             num_items_in_batch = num_items.sum() * accumulation_steps / len(num_items)
-            inputs = send_to_device(self._buffered_inputs[index], self.accelerator.device)
-            inputs["num_items_in_batch"] = num_items_in_batch
+            if self.args.max_tokens_per_microbatch is None:
+                inputs = send_to_device(self._buffered_inputs[index], self.accelerator.device)
+                inputs["num_items_in_batch"] = num_items_in_batch
+            else:
+                start, end = self._buffered_steps[index : index + 2]
+                inputs = send_to_device(self._buffered_inputs[start:end], self.accelerator.device)
+                for batch in inputs:
+                    batch["num_items_in_batch"] = num_items_in_batch
         else:
             # In evaluation, there is neither batch grouping for generation, nor multiple iterations, hence
             # local generation batch == local eval batch
             inputs = self._generate_and_score_completions(generation_batch)
         return inputs
+
+    def _split_by_token_budget(self, step_batches: list[dict]) -> tuple[list[dict], list[int]]:
+        """
+        Splits the rows of each optimizer step into micro-batches of at most `max_tokens_per_microbatch` padded tokens,
+        with the same number of micro-batches per step on every process.
+
+        Returns:
+            `tuple` of the micro-batches of every step, in order, and the index of each step's first micro-batch
+            followed by the total count.
+        """
+        budget = self.args.max_tokens_per_microbatch
+        plans = []
+        for batch in step_batches:
+            lengths = batch["completion_lengths"].clamp(min=1)
+            if self.pad_to_multiple_of is not None:
+                lengths = -(-lengths // self.pad_to_multiple_of) * self.pad_to_multiple_of
+            lengths = (batch["prompt_ids"].size(1) + lengths).tolist()
+            # Longest first, so each micro-batch pads to its first row
+            plan = []
+            for i in sorted(range(len(lengths)), key=lambda i: -lengths[i]):
+                if plan and (len(plan[-1]) + 1) * lengths[plan[-1][0]] <= budget:
+                    plan[-1].append(i)
+                else:
+                    plan.append([i])
+            plans.append(plan)
+        # Same number of forwards on every process
+        counts = torch.tensor([len(plan) for plan in plans], device=self.accelerator.device)
+        counts = self.accelerator.gather(counts).view(-1, len(plans)).max(0).values.tolist()
+        micro_batches, starts = [], [0]
+        for batch, plan, count in zip(step_batches, plans, counts, strict=True):
+            while len(plan) < count:
+                rows = plan.pop(max(range(len(plan)), key=lambda i: len(plan[i])))
+                plan += [rows[: len(rows) // 2], rows[len(rows) // 2 :]]
+            micro_batches += [select_sequence_dict(batch, rows) for rows in plan]
+            starts.append(len(micro_batches))
+        return micro_batches, starts
 
     def _log_completion_extra(self, column: str, values: list):
         """

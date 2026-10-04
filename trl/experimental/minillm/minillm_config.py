@@ -134,6 +134,9 @@ class MiniLLMConfig(GRPOConfig):
                 f"({self.gradient_accumulation_steps}) must be multiples of one another when loss_type='{self.loss_type}'."
             )
 
+        if self.max_tokens_per_microbatch is not None:
+            raise ValueError("MiniLLM doesn't support `max_tokens_per_microbatch`.")
+
         if self.do_eval and self.eval_strategy != "no":
             # Determine the number of generations to use for evaluation
             num_generations = self.num_generations_eval or self.num_generations
