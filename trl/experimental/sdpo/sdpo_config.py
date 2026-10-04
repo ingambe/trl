@@ -235,6 +235,10 @@ class SDPOConfig(_BaseConfig):
             Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in fewer steps
             but use more activation memory. If you are using `vllm_mode="server"`, pass `--max-num-batched-tokens` when
             launching the vLLM server instead.
+        vllm_max_num_seqs (`int`, *optional*):
+            Maximum number of sequences vLLM schedules at once per engine. Defaults to the number of completions each
+            engine generates per generation batch. If you are using `vllm_mode="server"`, pass `--max-num-seqs` when
+            launching the vLLM server instead.
 
         > Parameters that control the training
 
@@ -476,6 +480,14 @@ class SDPOConfig(_BaseConfig):
             "help": "Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in "
             "fewer steps but use more activation memory. If you are using `vllm_mode='server'`, pass "
             "`--max-num-batched-tokens` when launching the vLLM server instead."
+        },
+    )
+    vllm_max_num_seqs: int | None = field(
+        default=None,
+        metadata={
+            "help": "Maximum number of sequences vLLM schedules at once per engine. Defaults to the number of "
+            "completions each engine generates per generation batch. If you are using `vllm_mode='server'`, pass "
+            "`--max-num-seqs` when launching the vLLM server instead."
         },
     )
     num_iterations: int = field(
