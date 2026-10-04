@@ -148,6 +148,10 @@ class IWOPDConfig(_BaseConfig):
             Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in fewer steps
             but use more activation memory. If you are using `vllm_mode="server"`, pass `--max-num-batched-tokens` when
             launching the vLLM server instead.
+        vllm_max_num_seqs (`int`, *optional*):
+            Maximum number of sequences vLLM schedules at once per engine. Defaults to the number of completions each
+            engine generates per generation batch. If you are using `vllm_mode="server"`, pass `--max-num-seqs` when
+            launching the vLLM server instead.
         vllm_model_impl (`str`, *optional*, defaults to `"vllm"`):
             Model implementation backend for vLLM. Use `"vllm"` or `"transformers"`.
         vllm_structured_outputs_regex (`str` or `None`, *optional*):
@@ -393,6 +397,14 @@ class IWOPDConfig(_BaseConfig):
             "help": "Maximum number of tokens vLLM processes per engine step. Higher values prefill long prompts in "
             "fewer steps but use more activation memory. If you are using `vllm_mode='server'`, pass "
             "`--max-num-batched-tokens` when launching the vLLM server instead."
+        },
+    )
+    vllm_max_num_seqs: int | None = field(
+        default=None,
+        metadata={
+            "help": "Maximum number of sequences vLLM schedules at once per engine. Defaults to the number of "
+            "completions each engine generates per generation batch. If you are using `vllm_mode='server'`, pass "
+            "`--max-num-seqs` when launching the vLLM server instead."
         },
     )
     vllm_model_impl: str = field(
