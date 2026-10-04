@@ -30,7 +30,7 @@ from typing import Any
 import datasets
 import torch
 from accelerate.logging import get_logger
-from accelerate.utils import is_peft_model, set_seed
+from accelerate.utils import is_peft_model, send_to_device, set_seed
 from datasets import Dataset, IterableDataset
 from torch import nn
 from torch.utils.data import DataLoader, Sampler
@@ -354,8 +354,13 @@ class SSDTrainer(_BaseTrainer):
             generate_every = self.args.steps_per_generation * self.num_iterations
             if self._step % generate_every == 0 or self._buffered_inputs is None:
                 generation_batch = self._build_buffered_batch(generation_batch)
-                self._buffered_inputs = split_tensor_dict(generation_batch, self.args.steps_per_generation)
-            return self._buffered_inputs[self._step % self.args.steps_per_generation]
+                self._buffered_inputs = [
+                    send_to_device(batch, "cpu")
+                    for batch in split_tensor_dict(generation_batch, self.args.steps_per_generation)
+                ]
+            return send_to_device(
+                self._buffered_inputs[self._step % self.args.steps_per_generation], self.accelerator.device
+            )
         return self._build_buffered_batch(generation_batch)
 
     # ------------------------------------------------------------------
