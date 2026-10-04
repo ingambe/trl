@@ -838,7 +838,8 @@ class DistillationTrainer(_BaseTrainer):
                 tensor_parallel_size=args.vllm_tensor_parallel_size,
                 gpu_memory_utilization=args.vllm_gpu_memory_utilization,
                 max_model_length=args.vllm_max_model_length,
-                max_num_seqs=args.per_device_train_batch_size
+                max_num_seqs=args.vllm_max_num_seqs
+                or args.per_device_train_batch_size
                 * args.vllm_tensor_parallel_size
                 * args.gradient_accumulation_steps,
                 max_num_batched_tokens=args.vllm_max_num_batched_tokens,
