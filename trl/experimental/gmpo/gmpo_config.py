@@ -36,6 +36,8 @@ class GMPOConfig(GRPOConfig):
         epsilon_high (`float`, *optional*):
             Upper-bound clipping value, expressed in log space. If `None`, it defaults to the value of `epsilon`. The
             upper bound of the per-token importance ratio is `exp(epsilon_high)`.
+        loss_type (`str`, *optional*, defaults to `"grpo"`):
+            Unused: GMPO's own objective averages over sequences, as `"grpo"` does.
     """
 
     epsilon: float = field(
@@ -44,4 +46,8 @@ class GMPOConfig(GRPOConfig):
             "help": "Lower-bound clipping value, expressed in log space. The lower bound of the per-token importance "
             "ratio is exp(-epsilon). GMPO recommends 0.4."
         },
+    )
+    loss_type: str = field(
+        default="grpo",
+        metadata={"help": "Unused: GMPO's own objective averages over sequences, as 'grpo' does."},
     )
