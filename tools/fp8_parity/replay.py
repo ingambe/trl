@@ -38,7 +38,7 @@ from transformers import set_seed
 from transformers.utils import is_peft_available
 
 from trl import GRPOConfig, GRPOTrainer
-from trl.models.fp8 import convert_to_fp8_training
+from trl.models.fp8 import convert_to_fp8_training, fused_layer_name
 
 
 if is_peft_available():
@@ -116,7 +116,7 @@ def kl_divergence(ref_logps: torch.Tensor, cand_logps: torch.Tensor, batch, rows
 
 def sensitivity(trainer, batch, recipe: str, rows: int, target_kl: float) -> dict:
     """Rank the linear layers by the policy KL each one causes alone in FP8, then keep the worst in high precision
-    until the KL of the whole model is below `target_kl`."""
+    until the KL of the whole model is below `target_kl`. Projections vLLM fuses (q/k/v, gate/up) count as one layer."""
     model = trainer.model
     fp8_model = copy.deepcopy(model)
     convert_to_fp8_training(fp8_model, recipe)
@@ -126,10 +126,14 @@ def sensitivity(trainer, batch, recipe: str, rows: int, target_kl: float) -> dic
         for name, m in fp8_model.named_modules()
         if isinstance(modules.get(name), torch.nn.Linear) and type(m) is not type(modules[name])
     }
+    groups = defaultdict(list)
+    for name in fp8_modules:
+        groups[fused_layer_name(name.removeprefix("base_model.model."))].append(name)
 
-    def swap(name, module):
-        parent, _, child = name.rpartition(".")
-        setattr(model.get_submodule(parent), child, module)
+    def swap(group, fp8):
+        for name in groups[group]:
+            parent, _, child = name.rpartition(".")
+            setattr(model.get_submodule(parent), child, fp8_modules[name] if fp8 else modules[name])
 
     # Output error of each layer in FP8 on its high-precision input
     local_error = {}
@@ -144,27 +148,31 @@ def sensitivity(trainer, batch, recipe: str, rows: int, target_kl: float) -> dic
         handle.remove()
 
     kl = {}
-    for name, fp8_module in fp8_modules.items():
-        swap(name, fp8_module)
-        kl[name] = kl_divergence(ref_logps, next_token_logps(trainer, batch, rows), batch, rows)
-        swap(name, modules[name])
+    for group in groups:
+        swap(group, fp8=True)
+        kl[group] = kl_divergence(ref_logps, next_token_logps(trainer, batch, rows), batch, rows)
+        swap(group, fp8=False)
 
     # Greedy fallback: all layers in FP8, then the most sensitive ones back to high precision
-    for name, fp8_module in fp8_modules.items():
-        swap(name, fp8_module)
+    for group in groups:
+        swap(group, fp8=True)
     skip, ranked = [], sorted(kl, key=kl.get, reverse=True)
     model_kl = kl_divergence(ref_logps, next_token_logps(trainer, batch, rows), batch, rows)
     while model_kl > target_kl and ranked:
         skip.append(ranked.pop(0))
-        swap(skip[-1], modules[skip[-1]])
+        swap(skip[-1], fp8=False)
         model_kl = kl_divergence(ref_logps, next_token_logps(trainer, batch, rows), batch, rows)
-    for name in fp8_modules:
-        swap(name, modules[name])
+    for group in groups:
+        swap(group, fp8=False)
     return {
         "kl": kl,
         "local_error": local_error,
         "model_kl": model_kl,
-        "fp8_skip_modules": [name.removeprefix("base_model.model.").replace(".base_layer", "") for name in skip],
+        "fp8_skip_modules": [
+            name.removeprefix("base_model.model.").replace(".base_layer", "")
+            for group in skip
+            for name in groups[group]
+        ],
     }
 
 

@@ -36,6 +36,15 @@ if is_torchao_available("0.18.0"):
             return out[: len(tokens)].view(*x.shape[:-1], -1)
 
 
+def fused_layer_name(name: str) -> str:
+    """Name of the vLLM layer that fuses the projection `name` with its siblings (q/k/v, gate/up), else `name`."""
+    prefix, _, child = name.replace(".base_layer", "").rpartition(".")
+    for group in (("q_proj", "k_proj", "v_proj"), ("gate_proj", "up_proj")):
+        if child in group:
+            return f"{prefix}.{'_'.join(group)}"
+    return name.replace(".base_layer", "")
+
+
 def quantize_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize each row of `x` to float8_e4m3fn with a float32 scale, as vLLM's per-channel FP8 does."""
     fp8_max = torch.finfo(torch.float8_e4m3fn).max

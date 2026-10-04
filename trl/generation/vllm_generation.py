@@ -40,7 +40,7 @@ from transformers.utils import (
 from ..distributed import DistributedBackend
 from ..extras.profiling import ProfilingContext
 from ..import_utils import is_vllm_available
-from ..models.fp8 import FP8Linear
+from ..models.fp8 import FP8Linear, fused_layer_name
 from ..trainer.utils import ensure_master_addr_port
 from .vllm_client import VLLMClient
 
@@ -412,12 +412,25 @@ class VLLMGeneration:
                 # vLLM quantizes the same layers as the trainer, whose FP8 weights it then shares. Its fused MoE
                 # experts have no trainer counterpart.
                 quantization = "fp8_per_channel"
+                ignored = [
+                    name
+                    for name, module in model.named_modules()
+                    if isinstance(module, nn.Linear) and "lora_" not in name
+                ]
+                fused_fp8 = {
+                    fused_layer_name(name) for name, module in model.named_modules() if isinstance(module, FP8Linear)
+                }
+                for name in ignored:
+                    if fused_layer_name(name) in fused_fp8:
+                        raise ValueError(
+                            f"vLLM quantizes `{name}` together with the projections it fuses it with: keep all of them "
+                            "in high precision with `fp8_skip_modules`, or none."
+                        )
                 fp8_kwargs["quantization_config"] = {
                     "ignore": ["*.experts"]
                     + [
                         self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", ""))
-                        for name, module in model.named_modules()
-                        if isinstance(module, nn.Linear) and "lora_" not in name
+                        for name in ignored
                     ]
                 }
             lora_kwargs = {}

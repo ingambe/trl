@@ -30,6 +30,9 @@ from .testing_utils import require_peft
 if is_peft_available():
     from peft import LoraConfig, get_peft_model
 
+# The `vllm_generation` fixture stubs it out
+init_vllm = vllm_generation_module.VLLMGeneration._init_vllm
+
 
 def load_by_name(model):
     """Weight loader that resolves names like vLLM's, e.g. `Qwen2ForCausalLM.load_weights`."""
@@ -285,3 +288,15 @@ def test_fp8_sharing_rejects_a_vllm_loader_that_reorders_rows(vllm_generation):
 
     with pytest.raises(ValueError, match="layout of `q_proj`"):
         vllm_generation._share_weights()
+
+
+def test_fp8_sharing_rejects_skipping_part_of_a_fused_projection(vllm_generation, monkeypatch):
+    for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"):
+        monkeypatch.setenv(name, "0")  # restored after the test
+    monkeypatch.setattr(vllm_generation_module, "is_vllm_available", lambda min_version=None: True)
+    # q_proj and k_proj are one layer in vLLM
+    model = torch.nn.ModuleDict({"q_proj": FP8Linear(torch.nn.Linear(16, 16)), "k_proj": torch.nn.Linear(16, 16)})
+    vllm_generation.model, vllm_generation.mode, vllm_generation.share_weights = model, "colocate", True
+
+    with pytest.raises(ValueError, match="`k_proj`"):
+        init_vllm(vllm_generation)
