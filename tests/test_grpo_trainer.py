@@ -5086,7 +5086,7 @@ def test_fp8_recipe_trains_lora_over_an_immutable_fp8_base(tiny_llama, tmp_path)
             fp8_recipe="rowwise_with_gw_hp",
         ),
         train_dataset=Dataset.from_dict({"prompt": ["a", "a a"]}),
-        peft_config=LoraConfig(r=2, target_modules="all-linear"),
+        peft_config=LoraConfig(r=2, target_modules=["q_proj"]),
     )
     bases = {name: m for name, m in trainer.model.named_modules() if isinstance(m, FP8Linear)}
     previous = {name: param.detach().clone() for name, param in trainer.model.named_parameters()}
@@ -5094,9 +5094,9 @@ def test_fp8_recipe_trains_lora_over_an_immutable_fp8_base(tiny_llama, tmp_path)
 
     trainer.train()
 
-    # Every adapted layer but the LM head runs on an FP8 base without a high-precision copy
-    assert len(bases) == 7 and all(name.endswith(".base_layer") for name in bases)
-    assert not any(name.endswith("base_layer.weight") for name in previous)
+    # Every linear layer but the LM head, adapted or not, runs on an FP8 base without a high-precision copy
+    assert len(bases) == 7
+    assert not any(f"{name}.weight" in previous for name in bases)
     for name, module in bases.items():
         assert torch.equal(module.weight_fp8, base_weights[name])
     # The input gradients flow through the FP8 bases down to the first layer's adapters

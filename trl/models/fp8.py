@@ -16,6 +16,7 @@ import dataclasses
 from fnmatch import fnmatch
 
 import torch
+from accelerate.utils import is_peft_model
 from packaging.version import Version
 from torch import nn
 from transformers.utils import is_torchao_available
@@ -205,7 +206,7 @@ def convert_to_fp8_training(
             )
             fp8_module.weight, fp8_module.bias = module.weight, module.bias
         # Only a PEFT base, which checkpoints never include, can drop its high-precision weight
-        elif recipe in ("rowwise_with_gw_hp", "rowwise") and ".base_layer" in name and not module.weight.requires_grad:
+        elif recipe in ("rowwise_with_gw_hp", "rowwise") and is_peft_model(model) and not module.weight.requires_grad:
             fp8_module = FP8Linear(module, fast_accum)
         elif recipe == "rowwise_with_gw_hp" and module.weight.requires_grad:
             fp8_module = FP8Linear(module, fast_accum)

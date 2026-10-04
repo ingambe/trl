@@ -258,6 +258,8 @@ def main():
     # Freeze the rollouts, with the reference policy as the behavior policy
     if ref.beta != 0.0:
         raise ValueError("The replay compares updates without a KL term: set `beta=0.0`.")
+    if ref.args.gradient_accumulation_steps != 1:
+        raise ValueError("The replay steps the optimizer after every batch: set `gradient_accumulation_steps=1`.")
     # Each prompt repeated `num_generations` times, as the trainer's sampler lays out a group
     prompts = [row for row in ref.train_dataset.to_list() for _ in range(args.num_generations)]
     batches = []
