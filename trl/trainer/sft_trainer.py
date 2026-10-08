@@ -115,8 +115,10 @@ def _chunk(h, w, b, lbl, logit_scale, final_logit_softcapping):
     # A chunk's tail may be `-100` padding: `ignore_index` zeroes their loss; `valid` does the same for accuracy/entropy.
     chunk_loss = F.nll_loss(log_p, lbl, ignore_index=-100, reduction="sum")
     valid = lbl != -100
-    chunk_correct = ((logits.argmax(dim=-1) == lbl) & valid).sum().float()
-    chunk_entropy = (-(log_p.exp() * log_p).sum(dim=-1) * valid).sum()
+    # Without grad, the checkpoint recomputation in backward stops before these metrics
+    with torch.no_grad():
+        chunk_correct = ((logits.argmax(dim=-1) == lbl) & valid).sum().float()
+        chunk_entropy = (-(log_p.exp() * log_p).sum(dim=-1) * valid).sum()
     return chunk_loss, chunk_correct, chunk_entropy
 
 
