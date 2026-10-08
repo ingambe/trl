@@ -194,12 +194,6 @@ def _chunked_cross_entropy_loss(
     correct = hidden.new_zeros((), dtype=torch.float32)
     entropy_sum = hidden.new_zeros((), dtype=torch.float32)
 
-    # Pack valid tokens to the front so masked positions form whole trailing chunks. `argsort` on the boolean mask is
-    # a static-shape op (unlike `hidden[valid]`, whose output shape is data-dependent and poisons XLA compilation).
-    order = valid.to(torch.int8).argsort(descending=True, stable=True)
-    hidden = hidden[order]
-    labels = labels[order]
-
     # Process only the whole chunks covering the valid prefix: bounds XLA recompiles and drops fully-masked chunks on
     # GPU. At least one chunk always runs: under context parallelism a rank can hold only masked positions, and its
     # zero loss still has to reach every trainable parameter for `.backward()` and gradient sync to work.
@@ -207,6 +201,13 @@ def _chunked_cross_entropy_loss(
     # Under ZeRO-3 each chunk all-gathers the `lm_head`, so every rank must run the same number of chunks
     if is_deepspeed_zero3_enabled():
         torch.distributed.all_reduce(n_padded, op=torch.distributed.ReduceOp.MAX)
+
+    # Pack valid tokens to the front so masked positions form whole trailing chunks, and keep only those chunks.
+    # `argsort` on the boolean mask is a static-shape op (unlike `hidden[valid]`, whose output shape is data-dependent
+    # and poisons XLA compilation).
+    order = valid.to(torch.int8).argsort(descending=True, stable=True)[:n_padded]
+    hidden = hidden[order]
+    labels = labels[order]
 
     loss = hidden.new_zeros((), dtype=torch.float32)
 
