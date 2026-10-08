@@ -75,7 +75,6 @@ from ...trainer.utils import (
 from ..utils import (
     DataCollatorForChatML,
     DataCollatorForVisionLanguageChatML,
-    empty_cache,
     encode_with_byte_offsets,
     pad_byte_offsets,
     piece_byte_len,
@@ -2579,8 +2578,6 @@ class GOLDTrainer(SFTTrainer):
                 self._unmatched_sum += unmatched_val
                 self._matched_step_eq += step_eq
                 self._unmatched_step_eq += step_eq
-
-        empty_cache()
 
         return (loss, outputs_student) if return_outputs else loss
 
