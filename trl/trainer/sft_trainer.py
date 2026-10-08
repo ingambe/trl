@@ -100,13 +100,12 @@ class _ChunkedCELMHeadOutput(CausalLMOutputWithPast):
 
 
 def _chunk(h, w, b, lbl, logit_scale, final_logit_softcapping):
-    with maybe_gather_lm_head_ctx(w, b):
-        # Project in the compute dtype and upcast only for the softmax, like `"nll"` and
-        # `transformers`' own `ForCausalLMLoss` do. Matching the weight to the hidden-states dtype keeps the
-        # matmul in that dtype, which is what `lm_head`'s own forward computes in.
-        logits = (h @ w.to(h.dtype).t()).float()
-        if b is not None:
-            logits = logits + b.float()
+    # Project in the compute dtype and upcast only for the softmax, like `"nll"` and
+    # `transformers`' own `ForCausalLMLoss` do. Matching the weight to the hidden-states dtype keeps the
+    # matmul in that dtype, which is what `lm_head`'s own forward computes in.
+    logits = (h @ w.to(h.dtype).t()).float()
+    if b is not None:
+        logits = logits + b.float()
     if logit_scale != 1.0:
         logits = logits * logit_scale
     if final_logit_softcapping is not None:
@@ -118,6 +117,51 @@ def _chunk(h, w, b, lbl, logit_scale, final_logit_softcapping):
     chunk_correct = ((logits.argmax(dim=-1) == lbl) & valid).sum().float()
     chunk_entropy = (-(log_p.exp() * log_p).sum(dim=-1) * valid).sum()
     return chunk_loss, chunk_correct, chunk_entropy
+
+
+class _ChunkedCrossEntropy(torch.autograd.Function):
+    """
+    Summed cross-entropy over chunks of `hidden`. Each chunk's gradients are computed right after its logits in the
+    forward pass, so backward only scales them instead of projecting through the `lm_head` again.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden, weight, bias, labels, chunk_size, logit_scale, final_logit_softcapping):
+        needs_hidden, needs_weight, needs_bias = ctx.needs_input_grad[:3]
+        grad_hidden = torch.zeros_like(hidden) if needs_hidden else None
+        grad_weight = torch.zeros_like(weight) if needs_weight else None
+        grad_bias = torch.zeros_like(bias) if needs_bias else None
+        loss = hidden.new_zeros((), dtype=torch.float32)
+        correct = hidden.new_zeros((), dtype=torch.float32)
+        entropy_sum = hidden.new_zeros((), dtype=torch.float32)
+        for start in range(0, hidden.size(0), chunk_size):
+            chunk = slice(start, start + chunk_size)
+            h = hidden[chunk].detach().requires_grad_(needs_hidden)
+            w = weight.detach().requires_grad_(needs_weight)
+            b = bias.detach().requires_grad_(needs_bias) if bias is not None else None
+            with torch.enable_grad():
+                chunk_loss, chunk_correct, chunk_entropy = _chunk(
+                    h, w, b, labels[chunk], logit_scale, final_logit_softcapping
+                )
+            leaves = [t for t in (h, w, b) if t is not None and t.requires_grad]
+            chunk_grads = iter(torch.autograd.grad(chunk_loss, leaves) if leaves else ())
+            if needs_hidden:
+                grad_hidden[chunk] = next(chunk_grads)
+            if needs_weight:
+                grad_weight += next(chunk_grads)
+            if needs_bias:
+                grad_bias += next(chunk_grads)
+            loss += chunk_loss.detach()
+            correct += chunk_correct
+            entropy_sum += chunk_entropy.detach()
+        ctx.save_for_backward(grad_hidden, grad_weight, grad_bias)
+        ctx.mark_non_differentiable(correct, entropy_sum)
+        return loss, correct, entropy_sum
+
+    @staticmethod
+    def backward(ctx, grad_loss, grad_correct, grad_entropy):
+        grads = [None if g is None else g * grad_loss.to(g.dtype) for g in ctx.saved_tensors]
+        return *grads, *[None] * 4
 
 
 def _chunked_cross_entropy_loss(
@@ -136,10 +180,10 @@ def _chunked_cross_entropy_loss(
 
     The full `lm_head` projection is never materialized. Valid (non-`-100`) tokens are packed to the front (via
     `argsort` on the label mask, a static-shape op) and processed in chunks of `chunk_size`, rounding the count up to a
-    whole chunk so masked positions land in a skippable tail. Each chunk's `[chunk_size, vocab_size]` logits are kept
-    alive only during its own forward/backward via gradient checkpointing, so peak logits memory is `chunk_size *
-    vocab_size` instead of `batch_size * seq_len * vocab_size`. Quantizing the chunk count to a multiple of
-    `chunk_size` bounds recompilation to `total / chunk_size` traced shapes. The trip count is read on the host, so
+    whole chunk so masked positions land in a skippable tail. Each chunk's gradients are computed right after its
+    `[chunk_size, vocab_size]` logits in the forward pass (see [`_ChunkedCrossEntropy`]), so peak logits memory is
+    `chunk_size * vocab_size` instead of `batch_size * seq_len * vocab_size`. Quantizing the chunk count to a multiple
+    of `chunk_size` bounds recompilation to `total / chunk_size` traced shapes. The trip count is read on the host, so
     each call costs one device-to-host synchronization (one graph execution under XLA).
 
     At least one of `labels` or `shift_labels` must be provided. `labels` triggers the internal `labels[..., 1:]` /
@@ -191,9 +235,6 @@ def _chunked_cross_entropy_loss(
     valid = labels != -100
     n_valid_tensor = valid.sum()
 
-    correct = hidden.new_zeros((), dtype=torch.float32)
-    entropy_sum = hidden.new_zeros((), dtype=torch.float32)
-
     # Pack valid tokens to the front so masked positions form whole trailing chunks. `argsort` on the boolean mask is
     # a static-shape op (unlike `hidden[valid]`, whose output shape is data-dependent and poisons XLA compilation).
     order = valid.to(torch.int8).argsort(descending=True, stable=True)
@@ -208,24 +249,17 @@ def _chunked_cross_entropy_loss(
     if is_deepspeed_zero3_enabled():
         torch.distributed.all_reduce(n_padded, op=torch.distributed.ReduceOp.MAX)
 
-    loss = hidden.new_zeros((), dtype=torch.float32)
-
-    for start in range(0, n_padded, chunk_size):
-        h_chunk = hidden[start : start + chunk_size]
-        lbl_chunk = labels[start : start + chunk_size]
-        chunk_loss, chunk_correct, chunk_entropy = torch.utils.checkpoint.checkpoint(
-            _chunk,
-            h_chunk,
+    # ZeRO-3 shards the `lm_head`: gather it once for all chunks, whose gradients are computed within this context.
+    with maybe_gather_lm_head_ctx(lm_head_weight, lm_head_bias):
+        loss, correct, entropy_sum = _ChunkedCrossEntropy.apply(
+            hidden[:n_padded],
             lm_head_weight,
             lm_head_bias,
-            lbl_chunk,
+            labels[:n_padded],
+            chunk_size,
             logit_scale,
             final_logit_softcapping,
-            use_reentrant=False,
         )
-        loss = loss + chunk_loss
-        correct = correct + chunk_correct
-        entropy_sum = entropy_sum + chunk_entropy
 
     if num_items_in_batch is None:
         # Clamped for the same reason: a fully-masked rank reduces to a finite zero rather than `0 / 0`.
@@ -322,10 +356,8 @@ def _patch_chunked_ce_lm_head(model: torch.nn.Module, chunk_size: int, is_vlm: b
 
         lm_head_weight = lm_head.weight
         lm_head_bias = lm_head.bias
-        # Under FSDP2, lm_head.weight is a DTensor (Shard(0) or Replicate). Passing it directly
-        # into the gradient-checkpointed chunk loop causes FSDP2 to re-gather it once per chunk
-        # during backward recomputation. full_tensor() converts it to a plain tensor once; all
-        # chunks reference that tensor, so only one all-gather occurs (in full_tensor()'s backward).
+        # Under FSDP2, lm_head.weight is a DTensor (Shard(0) or Replicate). full_tensor() converts it to a plain
+        # tensor once; all chunks reference that tensor, so only one all-gather occurs (in full_tensor()'s backward).
         # `_chunk` casts the weight to the hidden-states dtype per chunk.
         if isinstance(lm_head_weight, torch.distributed.tensor.DTensor):
             lm_head_weight = lm_head_weight.full_tensor()
