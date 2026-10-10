@@ -395,9 +395,9 @@ class VLLMGeneration:
                     or config.use_dora
                     or config.bias != "none"
                     or config.modules_to_save
-                    # Added in PEFT 0.14.0, 0.17.0 and 0.18.0
-                    or (Version(peft.__version__) >= Version("0.14.0") and config.lora_bias)
-                    or (Version(peft.__version__) >= Version("0.17.0") and config.target_parameters)
+                    or config.lora_bias
+                    or config.target_parameters
+                    # Added in PEFT 0.18.0
                     or (Version(peft.__version__) >= Version("0.18.0") and config.alora_invocation_tokens)
                     or config.rank_pattern
                     or config.alpha_pattern
