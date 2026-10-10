@@ -1725,8 +1725,8 @@ class RLOOTrainer(_BaseTrainer):
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
         # Log prompts and completions
-        self._logs["prompt"].extend(gather_object(prompts))
-        self._logs["completion"].extend(gather_object(completions))
+        self._logs["prompt"].extend(gather_object([strip_images_from_messages(prompt) for prompt in prompts]))
+        self._logs["completion"].extend(gather_object([strip_images_from_messages(c) for c in completions]))
         for i, name in enumerate(self.reward_func_names):
             self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
         self._logs["advantages"].extend(all_process_advantages.tolist())
@@ -1931,8 +1931,8 @@ class RLOOTrainer(_BaseTrainer):
 
             table = {
                 "step": [self.state.global_step] * len(self._logs["prompt"]),
-                "prompt": [strip_images_from_messages(messages) for messages in self._logs["prompt"]],
-                "completion": [strip_images_from_messages(messages) for messages in self._logs["completion"]],
+                "prompt": self._logs["prompt"],
+                "completion": self._logs["completion"],
                 **self._logs["rewards"],
                 **self._logs["extra"],
                 "advantage": self._logs["advantages"],

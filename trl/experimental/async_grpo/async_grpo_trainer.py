@@ -34,6 +34,7 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import broadcast_object_list, is_peft_model, set_seed
 from datasets import Dataset, IterableDataset
+from packaging.version import Version
 from torch.distributed._tensor import DTensor
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase, TrainerCallback
@@ -63,6 +64,7 @@ from .weight_transfer import WeightTransferClient
 logger = get_logger(__name__)
 
 if is_peft_available():
+    import peft
     from peft import LoraConfig, PeftConfig, PeftModel, get_peft_model
     from peft.tuners.tuners_utils import BaseTunerLayer
 
@@ -764,7 +766,8 @@ def validate_lora_for_vllm_sync(model: "PeftModel") -> "LoraConfig":
             f"`bias='{peft_config.bias}'` trains bias terms, which are not part of a LoRA adapter and would be "
             f"dropped on the way to vLLM. Use `bias='none'`, or sync merged weights instead."
         )
-    if peft_config.target_parameters:
+    # Added in PEFT 0.17.0
+    if Version(peft.__version__) >= Version("0.17.0") and peft_config.target_parameters:
         raise ValueError(
             f"`target_parameters={peft_config.target_parameters}` (fused-MoE parameter LoRA) needs the adapter to be "
             f"declared with `is_3d_lora_weight=True` against a server started with "
