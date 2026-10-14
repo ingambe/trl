@@ -51,6 +51,7 @@ from transformers.utils import (
 )
 
 from ...data_utils import (
+    get_dataset_column_names,
     is_conversational,
     maybe_convert_to_chatml,
     pack_dataset,
@@ -2036,9 +2037,10 @@ class GOLDTrainer(SFTTrainer):
                     map_kwargs["desc"] = f"Applying formatting function to {dataset_name} dataset"
 
                 def _func(example):
-                    return {"text": formatting_func(example)}
+                    return {args.dataset_text_field: formatting_func(example)}
 
-                dataset = dataset.map(_func, batched=False, **map_kwargs)
+                column_names = get_dataset_column_names(dataset)
+                dataset = dataset.map(_func, batched=False, remove_columns=column_names, **map_kwargs)
 
             # Convert the dataset to ChatML if needed
             if isinstance(dataset, Dataset):  # `IterableDataset.map` does not support `desc`
