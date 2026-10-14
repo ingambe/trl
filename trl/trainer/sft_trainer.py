@@ -445,7 +445,9 @@ class DataCollatorForVisionLanguageModeling(DataCollatorMixin):
             for example in examples:
                 example["prompt"] = prepare_multimodal_messages(example["prompt"], images=example["images"])
                 example["completion"] = prepare_multimodal_messages(example["completion"])
-            examples = [apply_chat_template(example, self.processor) for example in examples]
+                tools = example.get("tools")
+                example["tools"] = json.loads(tools) if isinstance(tools, str) else tools
+            examples = [apply_chat_template(example, self.processor, example["tools"]) for example in examples]
 
         prompts = [example["prompt"] for example in examples]
         completions = [example["completion"] for example in examples]
@@ -1515,6 +1517,8 @@ class SFTTrainer(_BaseTrainer):
                     "completion",
                     "image",
                     "images",
+                    "tools",
+                    "chat_template_kwargs",
                 ]
             else:
                 self._signature_columns = ["input_ids", "labels", "seq_lengths"]
