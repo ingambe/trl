@@ -308,12 +308,20 @@ class DataCollatorForVisionPreference(DataCollatorMixin):
         # Transformers requires at least one image in the batch, otherwise it throws an error
         if all(img_list == [] for img_list in images):
             images = None
-        if is_conversational(examples[0]):  # conversational case
+        conversational = is_conversational(examples[0])
+        if conversational:  # conversational case
             for example in examples:
                 example["prompt"] = prepare_multimodal_messages(example["prompt"], images=example["images"])
                 example["chosen"] = prepare_multimodal_messages(example["chosen"])
                 example["rejected"] = prepare_multimodal_messages(example["rejected"])
             examples = [apply_chat_template(example, self.processor) for example in examples]
+        else:  # standard case
+            eos_token = self.processor.tokenizer.eos_token
+            for example in examples:
+                if not example["chosen"].endswith(eos_token):
+                    example["chosen"] = example["chosen"] + eos_token
+                if not example["rejected"].endswith(eos_token):
+                    example["rejected"] = example["rejected"] + eos_token
 
         prompts = [example["prompt"] for example in examples] * 2  # repeat for chosen and rejected
         chosens = [example["chosen"] for example in examples]
@@ -325,7 +333,7 @@ class DataCollatorForVisionPreference(DataCollatorMixin):
             padding=True,
             padding_side="left",
             return_tensors=self.return_tensors,
-            add_special_tokens=False,  # to avoid adding the BOS twice, see https://huggingface.co/blog/qgallouedec/gotchas-in-tokenizer-behavior#7-chat-template-and-tokenization-dont-compose-due-to-special-tokens
+            add_special_tokens=not conversational,  # the chat template already adds the BOS, see https://huggingface.co/blog/qgallouedec/gotchas-in-tokenizer-behavior#7-chat-template-and-tokenization-dont-compose-due-to-special-tokens
         )
         processed_chosens = self.processor(
             text=chosens,
