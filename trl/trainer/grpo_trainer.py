@@ -1765,8 +1765,13 @@ class GRPOTrainer(_BaseTrainer):
             # batched unpadded input (transformers#44514).
             # Fixed in transformers 5.4.0 (transformers#44563).
             needs_padding_workaround = Version("5.3.0") <= Version(transformers.__version__) < Version("5.4.0")
+            # Prompts are repeated `num_generations` times: for text-only models, template and tokenize each distinct
+            # prompt once. Processors may return fields flattened over images/videos, so they keep one row per prompt.
+            is_text_only = isinstance(self.processing_class, PreTrainedTokenizerBase)
+            keys = [json.dumps(prompt) for prompt in prompts] if is_text_only else range(len(prompts))
+            unique_prompts = dict(zip(keys, prompts, strict=True))
             tokenized = self.processing_class.apply_chat_template(
-                conversation=prompts,
+                conversation=list(unique_prompts.values()),
                 tools=self.tools or None,  # `or None`: Llama bug: it renders tool boilerplate for tools=[]
                 chat_template=self.chat_template,
                 add_generation_prompt=True,
@@ -1785,8 +1790,14 @@ class GRPOTrainer(_BaseTrainer):
                 prompt_ids = tokenized["input_ids"]
             # For VLMs, the processor returns extra multimodal fields (pixel_values, image_grid_thw, etc.)
             multimodal_fields = {k: v for k, v in tokenized.items() if k not in ("input_ids", "attention_mask")}
+            if is_text_only:
+                index = {key: i for i, key in enumerate(unique_prompts)}
+                prompt_ids = [prompt_ids[index[key]] for key in keys]
+                multimodal_fields = {k: [v[index[key]] for key in keys] for k, v in multimodal_fields.items()}
         else:
-            prompt_ids = self.processing_class(text=prompts)["input_ids"]
+            index = {prompt: i for i, prompt in enumerate(dict.fromkeys(prompts))}
+            prompt_ids = self.processing_class(text=list(index))["input_ids"]
+            prompt_ids = [prompt_ids[index[prompt]] for prompt in prompts]
             images = None
             multimodal_fields = {}
         return prompt_ids, images, multimodal_fields
