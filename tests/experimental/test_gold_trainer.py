@@ -2329,22 +2329,6 @@ def test_on_policy_vlm_vllm_does_not_duplicate_repeated_sampler_batch(monkeypatc
                 "attention_mask": [[1, 1, 1, 1, 1] for _ in conversation],
             }
 
-        @staticmethod
-        def batch_decode(ids, skip_special_tokens):
-            return [f"prompt_{i}" for i in range(len(ids))]
-
-        @staticmethod
-        def decode(ids, skip_special_tokens, clean_up_tokenization_spaces):
-            tokens = []
-            for token_id in ids:
-                if token_id == 9:
-                    if skip_special_tokens:
-                        continue
-                    tokens.append("<eos>")
-                else:
-                    tokens.append(f"comp_{token_id}")
-            return "".join(tokens)
-
     trainer.processing_class = StubProcessor
 
     received = {}
@@ -2367,15 +2351,8 @@ def test_on_policy_vlm_vllm_does_not_duplicate_repeated_sampler_batch(monkeypatc
 
     collated_per_call = []
 
-    def stub_collator(synthetic_examples):
-        collated_per_call.append(list(synthetic_examples))
-        return {
-            "input_ids": torch.zeros(len(synthetic_examples), 1, dtype=torch.long),
-            "original_prompt_text": [example["prompt"][0]["content"] for example in synthetic_examples],
-            "original_completion_text": [
-                example["completion"][0]["content"][0]["text"] for example in synthetic_examples
-            ],
-        }
+    def stub_collator(examples):
+        collated_per_call.append(list(examples))
 
     trainer._vlm_collator = stub_collator
 
@@ -2415,22 +2392,15 @@ def test_on_policy_vlm_vllm_does_not_duplicate_repeated_sampler_batch(monkeypatc
     assert received["n_images"] == total_sampled_prompts
     assert all(prompt == [1, 2, 3, 4, 5] for prompt in received["prompts"])
 
-    # Synthetic VLM examples are stored lazily and are not collated until their slice is consumed.
+    # Sampled completion ids are stored lazily with their raw examples and are not collated until consumed.
     assert len(collated_per_call) == 0
 
     # Buffers populated for every on-policy slice without IndexError.
     for slice_idx in on_policy_indices:
-        assert slice_idx in trainer._buffered_inputs
-        _, completion_texts = trainer._buffered_text_logs[slice_idx]
-        assert len(completion_texts) == unique_prompts_per_slice * num_generations
-
-    first_slice = trainer._materialize_vlm_slice(trainer._buffered_inputs[0])
-    assert first_slice["input_ids"].shape[0] == unique_prompts_per_slice * num_generations
-    assert first_slice["original_prompt_text"] == [example["prompt"][0]["content"] for example in collated_per_call[0]]
-    assert all(completion.endswith("<eos>") for completion in first_slice["original_completion_text"])
-    assert all("<" not in prompt for prompt in first_slice["original_prompt_text"])
-    assert len(collated_per_call) == 1
-    assert len(collated_per_call[0]) == unique_prompts_per_slice * num_generations
+        pending_slice = trainer._buffered_inputs[slice_idx]
+        assert len(pending_slice["_gold_vlm_on_policy_raw_examples"]) == unique_prompts_per_slice * num_generations
+        assert len(pending_slice["_gold_vlm_completion_ids"]) == unique_prompts_per_slice * num_generations
+    assert trainer._buffered_inputs[0]["_gold_vlm_completion_ids"][0] == [100, 9]
 
 
 def test_vlm_uld_custom_collator_missing_raw_fields_raises_clear_error():
