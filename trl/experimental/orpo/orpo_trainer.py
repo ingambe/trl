@@ -70,7 +70,8 @@ from .orpo_config import ORPOConfig
 
 
 if is_peft_available():
-    from peft import PeftConfig, get_peft_model, prepare_model_for_kbit_training
+    import peft
+    from peft import PeftConfig, PrefixTuningConfig, get_peft_model, prepare_model_for_kbit_training
 
 
 if is_torch_xla_available():
@@ -258,6 +259,18 @@ class ORPOTrainer(_BaseTrainer):
             get_peft_model_kwargs = {}
             if args.deepspeed_plugin is not None and args.deepspeed_plugin.zero_stage == 3 and not _is_quantized_model:
                 get_peft_model_kwargs["autocast_adapter_dtype"] = False
+            # Prefix tuning moves the cache onto the model's device map, which reads `Cache.key_cache`, removed
+            # from transformers. Fixed in PEFT 0.18.0 (peft#2821).
+            if (
+                isinstance(peft_config, PrefixTuningConfig)
+                and Version(peft.__version__) <= Version("0.17.1")
+                and hasattr(model, "hf_device_map")
+            ):
+                raise ValueError(
+                    "Prefix tuning requires `peft>=0.18.0` when the model is loaded with a device map. Upgrade "
+                    "peft, or load the model with `device_map=None`. See "
+                    "https://github.com/huggingface/peft/issues/2821."
+                )
             model = get_peft_model(model, peft_config, **get_peft_model_kwargs)
             if args.bf16 and getattr(model, "is_loaded_in_4bit", False):
                 peft_module_casting_to_bf16(model)
