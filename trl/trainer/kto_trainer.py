@@ -320,7 +320,9 @@ class DataCollatorForVisionUnpairedPreference(DataCollatorMixin):
             for example in examples:
                 example["prompt"] = prepare_multimodal_messages(example["prompt"], images=example["images"])
                 example["completion"] = prepare_multimodal_messages(example["completion"])
-            examples = [apply_chat_template(example, self.processor) for example in examples]
+                tools = example.get("tools")
+                example["tools"] = json.loads(tools) if isinstance(tools, str) else tools
+            examples = [apply_chat_template(example, self.processor, example["tools"]) for example in examples]
         else:  # standard case
             eos_token = self.processor.tokenizer.eos_token
             for example in examples:
