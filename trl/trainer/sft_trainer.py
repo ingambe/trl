@@ -1037,6 +1037,12 @@ class SFTTrainer(_BaseTrainer):
                     "completion-only loss. To resolve this, apply your formatting function before passing the "
                     "dataset, or disable `completion_only_loss` in `SFTConfig`."
                 )
+            if args.assistant_only_loss and formatting_func:
+                raise ValueError(
+                    "A formatting function was provided while `assistant_only_loss=True`, which is incompatible. "
+                    "Using a formatter converts the dataset to a language modeling type, so assistant masks cannot "
+                    "be computed. Either remove the `formatting_func` or disable `assistant_only_loss` in `SFTConfig`."
+                )
             train_dataset = self._prepare_dataset(
                 train_dataset, processing_class, args, args.packing, formatting_func, "train"
             )
@@ -1285,9 +1291,9 @@ class SFTTrainer(_BaseTrainer):
                     map_kwargs["desc"] = f"Applying formatting function to {dataset_name} dataset"
 
                 def _func(example):
-                    return {"text": formatting_func(example)}
+                    return {args.dataset_text_field: formatting_func(example)}
 
-                dataset = dataset.map(_func, batched=False, **map_kwargs)
+                dataset = dataset.map(_func, batched=False, remove_columns=column_names, **map_kwargs)
 
             if not is_processed:
                 # Convert the dataset to ChatML if needed
@@ -1320,7 +1326,6 @@ class SFTTrainer(_BaseTrainer):
                             "eos_token": self._tokenizer.eos_token,
                             "dataset_text_field": args.dataset_text_field,
                         },
-                        remove_columns="messages" if "messages" in column_names else None,  # renamed to "text"
                         **map_kwargs,
                     )
 
