@@ -35,8 +35,8 @@ _CHAT_TEMPLATES_DIR = Path(__file__).parent / "chat_templates"
 _SUPPORTS_RESPONSE_TEMPLATE = Version(transformers.__version__) >= Version("5.13.0.dev0")
 
 # `parse_response(..., tools=...)`, which types the tool-call arguments with the calling tool's JSON schema, landed in
-# transformers 5.15.0 (huggingface/transformers#47529).
-_SUPPORTS_PARSE_RESPONSE_TOOLS = Version(transformers.__version__) >= Version("5.15.0")
+# transformers 5.15.0 (huggingface/transformers#47529). Gated on `5.15.0.dev0` for transformers `main`.
+_SUPPORTS_PARSE_RESPONSE_TOOLS = Version(transformers.__version__) >= Version("5.15.0.dev0")
 
 
 def has_generation_markers(chat_template: str | dict[str, str]) -> bool:
