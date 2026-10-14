@@ -2563,7 +2563,9 @@ class GRPOTrainer(_BaseTrainer):
                 )["prompt"]
                 for prompt, tools in zip(prompts, per_prompt_tools, strict=True)
             ]
-            prompt_inputs = self.processing_class(images=images, text=prompts_text, padding=True, return_tensors="pt")
+            prompt_inputs = self.processing_class(
+                images=images, text=prompts_text, padding=True, padding_side="left", return_tensors="pt"
+            )
             prompt_inputs = super()._prepare_inputs(prompt_inputs)
             forward_kwargs = {k: v for k, v in prompt_inputs.items() if k not in ["input_ids", "attention_mask"]}
         else:
