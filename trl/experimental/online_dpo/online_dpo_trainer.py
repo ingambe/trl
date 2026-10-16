@@ -539,6 +539,9 @@ class OnlineDPOTrainer(_BaseTrainer):
                 "max_tokens": args.max_new_tokens,
                 "detokenize": False,  # to avoid vllm to decode (we don't need it)
             }
+            if isinstance(processing_class, ProcessorMixin):
+                # A sampled image token would mismatch the image features
+                generation_kwargs["logit_bias"] = {model.config.image_token_id: -100}
             if args.generation_kwargs is not None:
                 generation_kwargs.update(args.generation_kwargs)
             if self.structured_outputs_regex is not None:
@@ -698,6 +701,10 @@ class OnlineDPOTrainer(_BaseTrainer):
             ]
             all_messages = gather_object(messages)
 
+        generation_kwargs = self.args.generation_kwargs or {}
+        if isinstance(self.processing_class, ProcessorMixin):
+            # A sampled image token would mismatch the image features
+            generation_kwargs = {"logit_bias": {self.model.config.image_token_id: -100}, **generation_kwargs}
         if self.accelerator.is_main_process:
             sampling_kwargs = {
                 "n": self.num_generations,
@@ -710,7 +717,7 @@ class OnlineDPOTrainer(_BaseTrainer):
                 "structured_outputs_regex": self.structured_outputs_regex
                 if hasattr(self, "structured_outputs_regex")
                 else None,
-                "generation_kwargs": self.args.generation_kwargs,
+                "generation_kwargs": generation_kwargs,
             }
             if has_images:
                 completion_ids = self.vllm_client.chat(messages=all_messages, **sampling_kwargs)["completion_ids"]
@@ -781,6 +788,7 @@ class OnlineDPOTrainer(_BaseTrainer):
         completion_ids = [list(output.outputs[i].token_ids) for i in range(2) for output in outputs]
         prompt_ids = [list(output.prompt_token_ids) for _ in range(2) for output in outputs]
         if self.args.vllm_enable_sleep_mode:
+            self.llm.reset_mm_cache()
             self.llm.sleep(level=2)
 
         return completion_ids, prompt_ids
