@@ -1055,6 +1055,9 @@ class GOLDTrainer(SFTTrainer):
             "top_k": args.top_k,
             "pad_token_id": self.pad_token_id,
         }
+        if self._is_vlm:
+            # A sampled image token would mismatch the image features
+            generation_kwargs["suppress_tokens"] = [self.model.config.image_token_id]
         self.generation_config = GenerationConfig(**generation_kwargs)
         # Keep training-specific generation kwargs to overwrite model's original generation config
         self.generation_kwargs = generation_kwargs
@@ -1088,6 +1091,10 @@ class GOLDTrainer(SFTTrainer):
                     "vLLM is not available and use_vllm is set to True. Please install vLLM with "
                     "`pip install vllm` to use it."
                 )
+            vllm_generation_kwargs = {}
+            if self._is_vlm:
+                # A sampled image token would mismatch the image features
+                vllm_generation_kwargs["logit_bias"] = {self.model.config.image_token_id: -100}
             self.vllm_generation = VLLMGeneration(
                 model=self.model,
                 accelerator=self.accelerator,
@@ -1117,6 +1124,7 @@ class GOLDTrainer(SFTTrainer):
                 min_p=getattr(args, "min_p", 0.0),
                 max_completion_length=args.max_completion_length,
                 logprobs=None,
+                generation_kwargs=vllm_generation_kwargs,
             )
             self.vllm_sync_frequency = args.vllm_sync_frequency
             self._last_vllm_sync_step = -self.vllm_sync_frequency
