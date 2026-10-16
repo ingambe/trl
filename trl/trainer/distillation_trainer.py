@@ -783,6 +783,10 @@ class DistillationTrainer(_BaseTrainer):
                     "vLLM is not available and `use_vllm` is set to True. Please install vLLM with "
                     "`pip install trl[vllm]` to use it."
                 )
+            vllm_generation_kwargs = args.generation_kwargs or {}
+            if isinstance(processing_class, ProcessorMixin):
+                # A sampled image token would mismatch the image features
+                vllm_generation_kwargs = {"logit_bias": {model.config.image_token_id: -100}, **vllm_generation_kwargs}
             self.vllm_generation = VLLMGeneration(
                 model=self.model,
                 accelerator=self.accelerator,
@@ -818,7 +822,7 @@ class DistillationTrainer(_BaseTrainer):
                 min_p=self.min_p,
                 max_completion_length=self.max_completion_length,
                 logprobs=None,  # distillation trains on the teacher distribution, not sampled logprobs
-                generation_kwargs=args.generation_kwargs,
+                generation_kwargs=vllm_generation_kwargs,
             )
             self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
 

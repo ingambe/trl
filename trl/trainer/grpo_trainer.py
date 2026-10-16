@@ -1124,6 +1124,10 @@ class GRPOTrainer(_BaseTrainer):
 
         if self.use_vllm:
             # Initialize vLLM generation backend
+            vllm_generation_kwargs = args.generation_kwargs or {}
+            if isinstance(processing_class, ProcessorMixin):
+                # A sampled image token would mismatch the image features
+                vllm_generation_kwargs = {"logit_bias": {model.config.image_token_id: -100}, **vllm_generation_kwargs}
             self.vllm_generation = VLLMGeneration(
                 model=self.model,
                 accelerator=self.accelerator,
@@ -1158,7 +1162,7 @@ class GRPOTrainer(_BaseTrainer):
                 min_p=self.min_p,
                 max_completion_length=self.max_completion_length,
                 logprobs=0,  # we only need the generated token logprobs for the importance sampling correction
-                generation_kwargs=args.generation_kwargs,
+                generation_kwargs=vllm_generation_kwargs,
             )
             self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
             # The importance sampling correction needs logprobs after temperature scaling and logit processing.

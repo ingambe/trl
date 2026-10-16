@@ -758,6 +758,10 @@ class RLOOTrainer(_BaseTrainer):
 
         if self.use_vllm:
             # Initialize vLLM generation backend
+            vllm_generation_kwargs = args.generation_kwargs or {}
+            if isinstance(processing_class, ProcessorMixin):
+                # A sampled image token would mismatch the image features
+                vllm_generation_kwargs = {"logit_bias": {model.config.image_token_id: -100}, **vllm_generation_kwargs}
             self.vllm_generation = VLLMGeneration(
                 model=self.model,
                 accelerator=self.accelerator,
@@ -791,7 +795,7 @@ class RLOOTrainer(_BaseTrainer):
                 min_p=self.min_p,
                 max_completion_length=self.max_completion_length,
                 logprobs=None,  # we don't need logprobs from vLLM in RLOO
-                generation_kwargs=args.generation_kwargs,
+                generation_kwargs=vllm_generation_kwargs,
             )
             self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
         else:
