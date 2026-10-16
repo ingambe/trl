@@ -24,6 +24,7 @@ import pyarrow as pa
 import pyarrow.types
 import torch
 from accelerate.utils import is_peft_model
+from packaging.version import Version
 from pyarrow import compute as pc
 from tokenizers.models import BPE
 from torch import nn
@@ -51,7 +52,8 @@ from ..trainer.utils import flush_left, pad
 
 
 if is_peft_available():
-    from peft import PeftConfig, PeftModel, get_peft_model
+    import peft
+    from peft import PeftConfig, PeftModel, PrefixTuningConfig, get_peft_model
 
 
 @dataclass
@@ -920,6 +922,18 @@ def prepare_peft_model(
 
     # Create PEFT model
     if peft_config is not None:
+        # Prefix tuning moves the cache onto the model's device map, which reads `Cache.key_cache`, removed
+        # from transformers. Fixed in PEFT 0.18.0 (peft#2821).
+        if (
+            isinstance(peft_config, PrefixTuningConfig)
+            and Version(peft.__version__) <= Version("0.17.1")
+            and hasattr(model, "hf_device_map")
+        ):
+            raise ValueError(
+                "Prefix tuning requires `peft>=0.18.0` when the model is loaded with a device map. Upgrade "
+                "peft, or load the model with `device_map=None`. See "
+                "https://github.com/huggingface/peft/issues/2821."
+            )
         if getattr(model, "is_loaded_in_4bit", False) and is_sharded_qlora:
             model = get_peft_model(model, peft_config, autocast_adapter_dtype=False)
         else:
