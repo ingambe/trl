@@ -1246,7 +1246,7 @@ class GOLDTrainer(SFTTrainer):
     def _generate_on_policy_vlm_slice(
         self, pending_slice: dict[str, Any]
     ) -> tuple[dict[str, torch.Tensor | Any], tuple[list[str], list[str]]]:
-        """Generate and collate one non-vLLM on-policy VLM slice immediately before it is consumed."""
+        """Collate one on-policy VLM slice and generate it (or attach its vLLM completion ids) before it is consumed."""
         raw_examples = pending_slice["_gold_vlm_on_policy_raw_examples"]
         generation_examples = []
         for example in raw_examples:
@@ -1263,23 +1263,53 @@ class GOLDTrainer(SFTTrainer):
             k: (v.to(self.accelerator.device) if isinstance(v, torch.Tensor) else v) for k, v in collated.items()
         }
 
-        with unwrap_model_for_generation(
-            self.model,
-            self.accelerator,
-            generation_kwargs=self.generation_kwargs,
-            gradient_checkpointing_kwargs=self.args.gradient_checkpointing_kwargs,
-        ) as unwrapped_model:
-            (
-                new_input_ids,
-                new_attention_mask,
-                new_labels,
-                prompt_texts,
-                completion_texts,
-            ) = self.generate_on_policy_outputs(
-                unwrapped_model,
-                collated,
-                self.generation_config,
+        if "_gold_vlm_completion_ids" in pending_slice:
+            # Train on the vLLM-sampled ids directly; decoding and re-tokenizing them is not lossless.
+            device = self.accelerator.device
+            completion_ids = [
+                torch.tensor(ids, device=device, dtype=torch.long) for ids in pending_slice["_gold_vlm_completion_ids"]
+            ]
+            completion_attention_mask = [torch.ones_like(ids) for ids in completion_ids]
+            pad_token_id = self.pad_token_id if self.pad_token_id is not None else 0
+            new_input_ids = torch.cat([collated["prompts"], pad(completion_ids, padding_value=pad_token_id)], dim=1)
+            new_attention_mask = torch.cat(
+                [collated["prompt_attention_mask"], pad(completion_attention_mask, padding_value=0)], dim=1
             )
+            prompt_lengths = torch.full((new_input_ids.shape[0],), collated["prompts"].shape[1], device=device)
+            new_attention_mask, new_labels = self._build_sequence_batch(
+                new_input_ids, prompt_lengths, attention_mask=new_attention_mask
+            )
+            prompt_texts = self.processing_class.batch_decode(
+                [
+                    prompt[mask.bool()]
+                    for prompt, mask in zip(collated["prompts"], collated["prompt_attention_mask"], strict=True)
+                ],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+            completion_texts = self.processing_class.batch_decode(
+                pending_slice["_gold_vlm_completion_ids"],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        else:
+            with unwrap_model_for_generation(
+                self.model,
+                self.accelerator,
+                generation_kwargs=self.generation_kwargs,
+                gradient_checkpointing_kwargs=self.args.gradient_checkpointing_kwargs,
+            ) as unwrapped_model:
+                (
+                    new_input_ids,
+                    new_attention_mask,
+                    new_labels,
+                    prompt_texts,
+                    completion_texts,
+                ) = self.generate_on_policy_outputs(
+                    unwrapped_model,
+                    collated,
+                    self.generation_config,
+                )
 
         updated_slice = dict(collated)
         updated_slice["input_ids"] = new_input_ids
@@ -1786,7 +1816,6 @@ class GOLDTrainer(SFTTrainer):
                 self._buffered_inputs[slice_idx] = pending_slice
             return
 
-        all_prompts_text = self.processing_class.batch_decode(all_prompt_ids, skip_special_tokens=True)
         if (
             self.state.global_step != self._last_vllm_sync_step
             and self.state.global_step >= self._last_vllm_sync_step + self.vllm_sync_frequency
@@ -1805,65 +1834,33 @@ class GOLDTrainer(SFTTrainer):
         )
         self.vllm_generation.sleep()
 
-        all_completion_texts = []
-        for comp_ids in completion_ids:
-            if len(comp_ids) > max_completion_length:
-                comp_ids = comp_ids[:max_completion_length]
-            all_completion_texts.append(
-                self.processing_class.decode(
-                    comp_ids,
-                    skip_special_tokens=False,
-                    clean_up_tokenization_spaces=False,
-                )
-            )
-
         # Redistribute completions to slices. The RepeatSampler has already duplicated examples
         # `num_generations` times, so completions align 1:1 with the sampled input entries.
-        slice_completions = {idx: [] for idx in on_policy_indices}
+        slice_completion_ids = {idx: [] for idx in on_policy_indices}
         slice_raw = {idx: [] for idx in on_policy_indices}
         slice_images = {idx: [] for idx in on_policy_indices}
         slice_prompts = {idx: [] for idx in on_policy_indices}
-        slice_prompts_text = {idx: [] for idx in on_policy_indices}
 
         for i, slice_idx in enumerate(local_slice_indices):
-            slice_completions[slice_idx].append(all_completion_texts[i])
+            slice_completion_ids[slice_idx].append(completion_ids[i][:max_completion_length])
             slice_raw[slice_idx].append(all_raw_examples[i])
             slice_images[slice_idx].append(all_images[i])
             slice_prompts[slice_idx].append(all_prompts[i])
-            slice_prompts_text[slice_idx].append(all_prompts_text[i])
 
         for slice_idx in on_policy_indices:
-            completion_texts = slice_completions[slice_idx]
             raw_for_slice = slice_raw[slice_idx]
             images_for_slice = slice_images[slice_idx]
             prompts_for_slice = slice_prompts[slice_idx]
 
-            # Build synthetic examples: original prompt + generated completion
-            synthetic_examples = []
-            for i, example in enumerate(raw_for_slice):
-                synthetic = dict(example)
-                # Wrap as content blocks so VLM chat templates (e.g. SmolVLM) that index
-                # `message.content[0]` can render the synthetic assistant turn.
-                synthetic["completion"] = [
-                    {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": completion_texts[i]}],
-                    }
-                ]
-                synthetic_examples.append(synthetic)
-
             has_images = any(img is not None for img in images_for_slice)
             pending_slice = {
-                "_gold_vlm_lazy_examples": synthetic_examples,
+                "_gold_vlm_on_policy_raw_examples": raw_for_slice,
+                "_gold_vlm_completion_ids": slice_completion_ids[slice_idx],
             }
             if self._teacher_processor is not None:
                 pending_slice["_gold_vlm_raw_images"] = images_for_slice if has_images else None
                 pending_slice["_gold_vlm_raw_prompts"] = prompts_for_slice
             self._buffered_inputs[slice_idx] = pending_slice
-            self._buffered_text_logs[slice_idx] = (
-                slice_prompts_text[slice_idx],
-                completion_texts,
-            )
 
     def _process_completions_to_buffer(
         self,
