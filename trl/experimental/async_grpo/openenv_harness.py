@@ -113,7 +113,7 @@ class _HarnessRolloutLoop(_AsyncRolloutLoop):
         **loop_kwargs,
     ):
         # Fork rewritten captures so reconciliation preserves eligible sampled tokens.
-        if harness_adapter is None and lossless_capture:
+        if lossless_capture:
             loop_kwargs["fork_threshold_tokens"] = 0
         super().__init__(**loop_kwargs)
         # An adapter lets TRL sample each turn; otherwise the agent owns the loop.
