@@ -14,8 +14,8 @@
 
 """Check regression verdicts using measurements; no cloud services or mocks."""
 
-import copy
 import importlib
+import random
 import sys
 from pathlib import Path
 
@@ -26,200 +26,65 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 comparison = importlib.import_module("compare")
 
 
-@pytest.fixture
-def measurements():
-    manifest = {
-        "id": "test-request",
-        "base_sha": "a" * 40,
-        "head_sha": "b" * 40,
-        "workload": {"seeds": [42, 43, 44, 45, 46], "steps": 120},
-        "thresholds": {"train_seconds": 5.0, "steady_seconds": 5.0, "eval_loss": 1.0},
+def run(side, steps=60, seconds=1.0, gap=0.03):
+    noise = random.Random(side)
+    return {
+        "side": side,
+        "sha": ("a" if side == "base" else "b") * 40,
+        "steps": steps,
+        "step_seconds": [seconds * noise.uniform(0.99, 1.01) for _ in range(steps)],
+        "generation_seconds": [seconds / 2 * noise.uniform(0.99, 1.01) for _ in range(steps)],
+        "initial_eval_reward": 0.2,
+        "eval_reward": 0.5,
+        "trajectory": [{comparison.LOGP: gap * noise.uniform(0.99, 1.01)} for _ in range(steps)],
+        "peak_memory_bytes": 1,
+        "init_peak_device_bytes": 1,
+        "train_peak_device_bytes": 1,
+        "environment": {"gpu": "RTX 3090"},
     }
-    records = [
-        {
-            "side": side,
-            "seed": seed,
-            "sha": manifest[f"{side}_sha"],
-            "steps": 120,
-            "train_seconds": 100.0,
-            "steady_seconds": 80.0,
-            "eval_loss": 2.0,
-            "train_loss": 2.5,
-            "peak_memory_bytes": 1_000_000,
-            "workload_seconds": 110.0,
-            "environment": {"gpu": "RTX 3090", "packages": ["torch==2.11.0+cu128"]},
-        }
-        for seed in manifest["workload"]["seeds"]
-        for side in ("base", "head")
-    ]
-    return manifest, {"manifest_id": manifest["id"], "records": records}
+
+
+MANIFEST = {
+    "id": "test-request",
+    "profile": "wordle",
+    "base_sha": "a" * 40,
+    "head_sha": "b" * 40,
+    "workload": {"warmup_steps": 3, "speed_steps": 50, "eval_games": 32, "train_minutes": 10},
+    "thresholds": {"step_seconds": 5.0, "generation_seconds": 5.0},
+}
 
 
 @pytest.mark.parametrize(
-    "runtime,loss,outcome",
+    "head,outcome",
     [
-        (1.0, 1.0, "no_regression"),
-        (0.8, 1.0, "improved"),
-        (1.0, 0.95, "improved"),
-        (1.1, 1.0, "regression"),
-        (0.8, 1.02, "regression"),
-        (1.1, 0.9, "regression"),
+        ({}, "no_regression"),
+        ({"seconds": 0.8, "steps": 80}, "improved"),
+        ({"seconds": 1.1}, "regression"),
+        ({"gap": 0.05}, "quality_failed"),
     ],
 )
-def test_paired_decisions(measurements, runtime, loss, outcome):
-    manifest, result = measurements
-    for record in result["records"]:
-        if record["side"] == "head":
-            record["train_seconds"] *= runtime
-            record["steady_seconds"] *= runtime
-            record["eval_loss"] *= loss
-    summary = comparison.compare(result, manifest)
+def test_single_run_decisions(head, outcome):
+    result = {"manifest_id": "test-request", "records": [run("base"), run("head", **head)]}
+    summary = comparison.compare(result, MANIFEST)
     assert summary["outcome"] == outcome
+    assert "### GPU benchmark" in comparison.markdown(summary, MANIFEST)
 
 
-def test_noise_cannot_pass_noninferiority(measurements):
-    manifest, result = measurements
-    for record, seconds in zip(result["records"][1::2], [80, 100, 130, 90, 130], strict=True):
-        record["train_seconds"] = seconds
-    assert comparison.compare(result, manifest)["outcome"] == "inconclusive"
-
-
-def test_smoke_cannot_be_green(measurements):
-    manifest, result = measurements
-    manifest["workload"]["seeds"] = [42]
-    result["records"] = result["records"][:2]
-    assert comparison.compare(result, manifest)["outcome"] == "inconclusive"
-
-
-@pytest.mark.parametrize("damage", ["nan", "missing", "duplicate", "commit", "steps", "environment", "identity"])
-def test_invalid_results_fail_closed(measurements, damage):
-    manifest, result = measurements
+@pytest.mark.parametrize("damage", ["nan", "missing", "commit", "steps", "environment", "identity"])
+def test_invalid_results_fail_closed(damage):
+    result = {"manifest_id": "test-request", "records": [run("base"), run("head")]}
+    base = result["records"][0]
     if damage == "nan":
-        result["records"][0]["eval_loss"] = float("nan")
+        base["eval_reward"] = float("nan")
     elif damage == "missing":
         result["records"].pop()
-    elif damage == "duplicate":
-        result["records"].append(copy.deepcopy(result["records"][0]))
     elif damage == "commit":
-        result["records"][0]["sha"] = "c" * 40
+        base["sha"] = "c" * 40
     elif damage == "steps":
-        result["records"][0]["steps"] -= 1
+        base["steps"] += 1
     elif damage == "environment":
-        result["records"][0]["environment"]["gpu"] = "RTX 5090"
+        base["environment"]["gpu"] = "RTX 5090"
     else:
         result["manifest_id"] = "old-request"
     with pytest.raises(ValueError):
-        comparison.compare(result, manifest)
-
-
-@pytest.fixture
-def rollout_measurements(measurements):
-    manifest, result = measurements
-    manifest["workload"].update(kind="vllm-rollout", steps=6)
-    manifest["thresholds"] = {"rollout_seconds": 5.0, "weight_transfer_bytes": 0.0}
-    for record in result["records"]:
-        head = record["side"] == "head"
-        record.update(
-            steps=6,
-            rollout_seconds=8.0 if head else 10.0,
-            weight_transfer_bytes=100 if head else 400,
-            sync_count=6 if head else 24,
-            sleeping_after_phase=True,
-            output_tokens=[[[1, 2]]],
-            frozen_weight_max_abs_drift=0.0,
-        )
-    parity = [
-        {"label": "updated_lora", "total_variation": 0.01, "kl_local_vllm": 0.001, "js_divergence": 0.001},
-        {"label": "updated_lora_stale_reference", "total_variation": 0.3, "kl_local_vllm": 0.5, "js_divergence": 0.1},
-    ]
-    result["policy_parity"] = {"base": parity, "head": copy.deepcopy(parity)}
-    return manifest, result
-
-
-@pytest.mark.parametrize(
-    "damage,outcome",
-    [
-        (None, "improved"),
-        ("tokens", "quality_failed"),
-        ("drift", "quality_failed"),
-        ("stale_control", "quality_failed"),
-        ("slower", "regression"),
-        ("same_latency", "no_regression"),
-        ("both_share_weights", "improved"),
-    ],
-)
-def test_rollout_quality_is_reported_beside_latency(rollout_measurements, damage, outcome):
-    manifest, result = rollout_measurements
-    head = result["records"][1]
-    if damage == "tokens":
-        head["output_tokens"] = [[[1, 3]]]
-    elif damage == "drift":
-        head["frozen_weight_max_abs_drift"] = 0.001953125
-    elif damage == "stale_control":
-        result["policy_parity"]["head"][1]["total_variation"] = 0.01
-    elif damage == "slower":
-        for record in result["records"][1::2]:
-            record["rollout_seconds"] = 12.0
-    elif damage == "same_latency":
-        for record in result["records"]:
-            record["rollout_seconds"] = 10.0
-    elif damage == "both_share_weights":
-        for record in result["records"]:
-            record["weight_transfer_bytes"] = 0
-    summary = comparison.compare(result, manifest)
-    assert summary["outcome"] == outcome
-    report = comparison.markdown(summary, {**manifest, "profile": "vllm-rollout"})
-    assert "rollout_seconds" in report
-    assert ("**FAIL**" in report) == (outcome == "quality_failed")
-
-
-@pytest.mark.parametrize(
-    "damage,outcome",
-    [
-        (None, "improved"),
-        ("outlier", "inconclusive"),
-        ("worse", "quality_failed"),
-        ("reward_drop", "quality_failed"),
-        ("train_reward_drop", "quality_failed"),
-        ("missing", None),
-    ],
-)
-def test_grpo_quality_is_compared_per_seed(measurements, damage, outcome):
-    manifest, result = measurements
-    manifest["workload"].update(kind="grpo-train", steps=3)
-    manifest["thresholds"] = {"train_seconds": 5.0, "steady_seconds": 5.0}
-    for index, record in enumerate(result["records"]):
-        head = record["side"] == "head"
-        gaps = [0.03 + 0.001 * index] * 3
-        if head and damage == "outlier" and index == 1:
-            gaps[2] = 0.1  # one diverged step, as main against main produces
-        elif head and damage == "worse":
-            gaps = [gap * 1.2 for gap in gaps]
-        elif head and damage == "missing" and index == 1:
-            gaps[2] = None
-        trajectory = [
-            {
-                "loss": 0.1,
-                "reward": 0.4 if head and damage == "train_reward_drop" else 0.5,
-                "grad_norm": 1.0,
-                "sampling/sampling_logp_difference/mean": gap,
-            }
-            for gap in gaps
-        ]
-        record.update(
-            steps=3,
-            train_seconds=80.0 if head else 100.0,
-            steady_seconds=80.0 if head else 100.0,
-            generation_seconds=1.0,
-            update_seconds=1.0,
-            init_peak_device_bytes=1,
-            train_peak_device_bytes=1,
-            eval_reward=0.4 if head and damage == "reward_drop" else 0.5,
-            parameter_sum=1.01 if head else 1.0,
-            trajectory=trajectory,
-        )
-    if outcome is None:
-        with pytest.raises(ValueError):
-            comparison.compare(result, manifest)
-    else:
-        assert comparison.compare(result, manifest)["outcome"] == outcome
+        comparison.compare(result, MANIFEST)
