@@ -22,7 +22,7 @@ import shutil
 import textwrap
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from multiprocessing.queues import Queue as MPQueue
@@ -532,11 +532,11 @@ class _TrainBeginCallback(TrainerCallback):
 class _EpochStopCallback(TrainerCallback):
     """Stop after `num_train_epochs` full passes over the prompt dataset.
 
-    An epoch is counted in distinct prompts actually trained (accumulated in the collator, which runs on the main
-    process just before the model forward). Where [`~trl.experimental.async_grpo.async_grpo_trainer`] counts
-    prompt-groups, one prompt here yields exactly one training sample, so a prompt and a group are the same thing. Only
-    the main process collates (`dispatch_batches=True`), so the stop decision is reduced across ranks to keep
-    data-parallel workers in lockstep.
+    An epoch is counted in distinct prompts actually trained (recorded by the collator on the main process and counted
+    once their micro-batch is trained). Where [`~trl.experimental.async_grpo.async_grpo_trainer`] counts prompt-groups,
+    one prompt here yields exactly one training sample, so a prompt and a group are the same thing. Only the main
+    process collates (`dispatch_batches=True`), so the stop decision is reduced across ranks to keep data-parallel
+    workers in lockstep.
     """
 
     def __init__(self, trainer: "AsyncDistillationTrainer", target_prompts: int):
@@ -737,9 +737,9 @@ class DataCollatorForRollout(DataCollatorMixin):
             Maps each configured `teacher_server_urls` key to a stable integer index, packed per-position (like every
             other per-token field) as `teacher_id_idx` so `compute_loss` can break `jsd`/`entropy`/ `teacher_entropy`
             down per teacher (MOPD). `None` when there's only one teacher (no breakdown needed).
-        prompts_trained (`set[int]`, *optional*):
-            The trainer's set of distinct prompt ids trained so far, shared by reference and updated with this
-            micro-batch's prompts; read by [`_EpochStopCallback`] to decide when an epoch target is met.
+        pending_prompts (`deque[list[int]]`, *optional*):
+            The prompt ids of each collated micro-batch, shared by reference with the trainer, which counts them as
+            trained once it trains on that micro-batch.
         metrics (`dict[str, list]`, *optional*):
             The trainer's metric sink, appended to with this micro-batch's sample and packing metrics.
         token_budget (`int`, *optional*, defaults to `0`):
@@ -750,9 +750,9 @@ class DataCollatorForRollout(DataCollatorMixin):
     num_processes: int = 1
     teacher_id_to_idx: dict[str, int] | None = None
     return_tensors: str = "pt"
-    # Distinct prompts trained so far, shared by reference with the trainer.
-    prompts_trained: set[int] = field(default_factory=set)
-    # The trainer's metric sink, shared by reference (like `prompts_trained`).
+    # Prompt ids of each collated micro-batch, shared by reference with the trainer.
+    pending_prompts: deque[list[int]] = field(default_factory=deque)
+    # The trainer's metric sink, shared by reference (like `pending_prompts`).
     metrics: dict[str, list] = field(default_factory=lambda: defaultdict(list))
     # Per-row token cap of the planner,
     token_budget: int = 0
@@ -803,7 +803,7 @@ class DataCollatorForRollout(DataCollatorMixin):
         teacher_topk_logprobs = pad(teacher_topk_logprobs, padding_value=float("-inf"))
 
         all_examples = [example for group in groups for example in group]
-        self.prompts_trained.update(example["prompt_id"] for example in all_examples)
+        self.pending_prompts.append([example["prompt_id"] for example in all_examples])
 
         # Total valid completion tokens across the micro-batch. Repeated per rank so that DataLoaderDispatcher
         # (dispatch_batches=True) slices correctly on dim=0.
@@ -1335,6 +1335,7 @@ class AsyncDistillationTrainer(_BaseTrainer):
         # prompts trained. Unlike AsyncGRPOTrainer there is no num_generations multiplier and no forking: each dataset
         # row yields exactly one training sample, not a group of them.
         self._trained_prompts: set[int] = set()
+        self._pending_prompts: deque[list[int]] = deque()
         # Tracks restart to match `num_train_epochs`
         self._prompts_before_resume = 0
         self._epoch_stop_prompts: int | None = None
@@ -1558,7 +1559,7 @@ class AsyncDistillationTrainer(_BaseTrainer):
                     self.processing_class.pad_token_id,
                     num_processes,
                     self._teacher_id_to_idx if len(self._teacher_ids) > 1 else None,
-                    prompts_trained=self._trained_prompts,
+                    pending_prompts=self._pending_prompts,
                     metrics=self._metrics["train"],
                     # `or 0` because only rank 0 fills an unset budget from the vLLM server above; the other ranks
                     # construct the collator (and never use it) while `token_budget` is still `None`.
@@ -1801,6 +1802,9 @@ class AsyncDistillationTrainer(_BaseTrainer):
     def training_step(self, model, inputs, num_items_in_batch):
         time_before = time.perf_counter()
         output = super().training_step(model, inputs, num_items_in_batch)
+        # The dataloader collates ahead of training, so a micro-batch's prompts count as trained only here
+        if self.accelerator.is_main_process:
+            self._trained_prompts.update(self._pending_prompts.popleft())
         self._step_microbatches += 1
         self._current_train_step_time += time.perf_counter() - time_before
         return output
@@ -2067,6 +2071,7 @@ class AsyncDistillationTrainer(_BaseTrainer):
         # cleared whatever the worker, since the collator fills them regardless and the worker's `prompt_id` restarts
         # at 0, so leftovers from an earlier run would collide with this one's.
         self._trained_prompts.clear()
+        self._pending_prompts.clear()
         if isinstance(self.rollout_worker, AsyncRolloutWorker):
             self.rollout_worker._loop_kwargs["dataset_start_index"] = 0
             self._prompts_before_resume = 0
