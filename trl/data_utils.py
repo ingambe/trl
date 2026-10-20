@@ -625,9 +625,11 @@ def extract_prompt(example: dict[str, Sequence]) -> dict[str, Sequence]:
     """
     for idx in range(min(len(example["chosen"]), len(example["rejected"]))):
         if example["chosen"][idx] != example["rejected"][idx]:
-            if example["chosen"][idx - 1] == " ":  # remove space before the prompt
-                idx -= 1
             break
+    else:  # one is a prefix of the other
+        idx = min(len(example["chosen"]), len(example["rejected"]))
+    if idx > 0 and example["chosen"][idx - 1] == " ":  # remove space before the prompt
+        idx -= 1
     return {
         "prompt": example["chosen"][:idx],
         "chosen": example["chosen"][idx:],
