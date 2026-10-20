@@ -396,7 +396,10 @@ def _tokenize(
             input, tokenize=True, return_dict=True, **apply_chat_template_kwargs
         )
     else:  # non-conversational: plain text string
-        result = processing_class(text=input)
+        # Text rendered with a chat template already starts with BOS
+        tokenizer = processing_class.tokenizer if is_vlm else processing_class
+        bos_token = tokenizer.bos_token
+        result = processing_class(text=input, add_special_tokens=bos_token is None or not input.startswith(bos_token))
     # VLMs emit a batch dimension even for single examples; unwrap it
     if is_vlm:
         return {k: v[0] for k, v in result.items()}
