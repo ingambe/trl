@@ -808,6 +808,8 @@ class DistillationTrainer(_BaseTrainer):
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         # Token-weighted metrics are logged as sums, divided by their token count in `log`
         self._metric_num_tokens = {"train": defaultdict(int), "eval": defaultdict(int)}
+        # Loss metrics per micro-batch, reduced across processes in `log`
+        self._pending_loss_metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._total_train_tokens = 0
         self._current_train_step_time = 0.0
         self.log_completions = args.log_completions
@@ -1897,16 +1899,9 @@ class DistillationTrainer(_BaseTrainer):
             model, unwrapped_student, self._compute_loss, unwrapped_student, inputs, num_items_in_batch
         )
 
-        # Log the mean per-token student entropy (in nats). The reduction runs here, after `_forward_redirection`
-        # returns, so the `gather_for_metrics` collective does not run inside the DDP/FSDP-wrapped forward (a hang/
-        # ordering risk). Mirrors `SFTTrainer.compute_loss`.
+        # Log the mean per-token student entropy (in nats), reduced across processes in `log`
         mode = "train" if self.model.training else "eval"
-        num_valid_tokens = self.accelerator.gather_for_metrics(num_valid_tokens).sum()
-        entropy_sum = self.accelerator.gather_for_metrics(entropy_sum).sum().item()
-        # Drop a NaN entropy with its tokens, as `log` drops NaN values of the other metrics
-        if not math.isnan(entropy_sum):
-            self._metrics[mode]["entropy"].append(entropy_sum)
-            self._metric_num_tokens[mode]["entropy"] += num_valid_tokens.item()
+        self._pending_loss_metrics[mode]["entropy"].append(torch.stack([entropy_sum, num_valid_tokens]).detach())
 
         return (loss, None) if return_outputs else loss
 
@@ -2039,6 +2034,14 @@ class DistillationTrainer(_BaseTrainer):
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         mode = "train" if self.model.training else "eval"
+        for key, values in self._pending_loss_metrics[mode].items():
+            gathered = self.accelerator.gather(torch.stack(values))
+            # Drop NaN entropies with their tokens, as NaN values of the other metrics are dropped below
+            gathered = gathered[~gathered[:, 0].isnan()]
+            self._metrics[mode][key].append(gathered[..., 0].sum().item())
+            self._metric_num_tokens[mode][key] += gathered[..., 1].sum().item()
+        self._pending_loss_metrics[mode].clear()
+
         # Average the metrics
         metrics = {}
         for key, val in self._metrics[mode].items():
