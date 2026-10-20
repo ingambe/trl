@@ -1093,11 +1093,19 @@ class OnlineDPOTrainer(_BaseTrainer):
                     messages = [{"messages": p + c} for p, c in zip(prompts, completions, strict=True)]
                     texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
                 else:
-                    texts = [p + c for p, c in zip(prompts, completions, strict=True)]
+                    # Like `RewardTrainer` on standard text: append EOS and let the tokenizer add special tokens
+                    texts = [
+                        p + c + (reward_processing_class.eos_token or "")
+                        for p, c in zip(prompts, completions, strict=True)
+                    ]
 
                 # Tokenize and get reward scores
                 reward_inputs = reward_processing_class(
-                    text=texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                    text=texts,
+                    return_tensors="pt",
+                    padding=True,
+                    padding_side="right",
+                    add_special_tokens=not is_conversational({"prompt": prompts[0]}),
                 )
                 reward_inputs = {k: v.to(device) for k, v in reward_inputs.items()}
 
