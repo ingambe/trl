@@ -362,6 +362,7 @@ def main():
         "--profile",
         choices=[
             "sft-3090",
+            "sft-long",
             "smoke",
             "vllm-rollout",
             "vllm-rollout-dense",
