@@ -806,6 +806,8 @@ class DistillationTrainer(_BaseTrainer):
 
         # Metrics & Logging
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
+        # Token-weighted metrics are logged as sums, divided by their token count in `log`
+        self._metric_num_tokens = {"train": defaultdict(int), "eval": defaultdict(int)}
         self._total_train_tokens = 0
         self._current_train_step_time = 0.0
         self.log_completions = args.log_completions
@@ -1900,9 +1902,11 @@ class DistillationTrainer(_BaseTrainer):
         # ordering risk). Mirrors `SFTTrainer.compute_loss`.
         mode = "train" if self.model.training else "eval"
         num_valid_tokens = self.accelerator.gather_for_metrics(num_valid_tokens).sum()
-        entropy_sum = self.accelerator.gather_for_metrics(entropy_sum).sum()
-        entropy = (entropy_sum / num_valid_tokens).item() if num_valid_tokens > 0 else 0.0
-        self._metrics[mode]["entropy"].append(entropy)
+        entropy_sum = self.accelerator.gather_for_metrics(entropy_sum).sum().item()
+        # Drop a NaN entropy with its tokens, as `log` drops NaN values of the other metrics
+        if not math.isnan(entropy_sum):
+            self._metrics[mode]["entropy"].append(entropy_sum)
+            self._metric_num_tokens[mode]["entropy"] += num_valid_tokens.item()
 
         return (loss, None) if return_outputs else loss
 
@@ -2038,11 +2042,15 @@ class DistillationTrainer(_BaseTrainer):
         # Average the metrics
         metrics = {}
         for key, val in self._metrics[mode].items():
-            # Filter out NaN values before averaging. With logging_steps > 1, a naive sum()/len() would let a single
-            # NaN contaminate valid data from other batches. Only return None when no valid values remain (e.g. JSON
-            # loggers crash on float NaN).
-            valid = [v for v in val if not math.isnan(v)]
-            metrics[key] = sum(valid) / len(valid) if valid else None
+            if key in self._metric_num_tokens[mode]:
+                num_tokens = self._metric_num_tokens[mode][key]
+                metrics[key] = sum(val) / num_tokens if num_tokens > 0 else 0.0
+            else:
+                # Filter out NaN values before averaging. With logging_steps > 1, a naive sum()/len() would let a
+                # single NaN contaminate valid data from other batches. Only return None when no valid values remain
+                # (e.g. JSON loggers crash on float NaN).
+                valid = [v for v in val if not math.isnan(v)]
+                metrics[key] = sum(valid) / len(valid) if valid else None
 
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
@@ -2052,6 +2060,7 @@ class DistillationTrainer(_BaseTrainer):
         logs.update(metrics)
         super().log(logs, start_time)
         self._metrics[mode].clear()
+        self._metric_num_tokens[mode].clear()
 
         if self.accelerator.is_main_process and self.log_completions:
             if is_rich_available():
