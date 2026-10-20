@@ -530,11 +530,17 @@ class DataCollatorForVisionLanguageChatML(DataCollatorMixin):
         raw_completion_texts = [_raw_text_from_messages(example["completion"]) for example in examples]
 
         # Apply chat template for conversational data
-        if is_conversational(examples[0]):
+        conversational = is_conversational(examples[0])
+        if conversational:  # conversational case
             for example in examples:
                 example["prompt"] = prepare_multimodal_messages(example["prompt"], images=example["images"])
                 example["completion"] = prepare_multimodal_messages(example["completion"])
             examples = [apply_chat_template(example, self.processor) for example in examples]
+        else:  # standard case
+            eos_token = self.processor.tokenizer.eos_token
+            for example in examples:
+                if not example["completion"].endswith(eos_token):
+                    example["completion"] = example["completion"] + eos_token
 
         prompts = [example["prompt"] for example in examples]
         completions = [example["completion"] for example in examples]
@@ -546,7 +552,7 @@ class DataCollatorForVisionLanguageChatML(DataCollatorMixin):
             padding=True,
             padding_side="left",
             return_tensors=self.return_tensors,
-            add_special_tokens=False,
+            add_special_tokens=not conversational,  # the chat template already adds the BOS, see https://huggingface.co/blog/qgallouedec/gotchas-in-tokenizer-behavior#7-chat-template-and-tokenization-dont-compose-due-to-special-tokens
         )
         processed_completions = self.processor(
             text=completions,
