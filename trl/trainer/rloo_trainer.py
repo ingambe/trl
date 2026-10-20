@@ -1240,9 +1240,17 @@ class RLOOTrainer(_BaseTrainer):
                             for x in messages
                         ]
                     else:
-                        texts = [p + c for p, c in zip(prompts, completions, strict=True)]
+                        # Like `RewardTrainer` on standard text: append EOS and let the tokenizer add special tokens
+                        texts = [
+                            p + c + (reward_processing_class.eos_token or "")
+                            for p, c in zip(prompts, completions, strict=True)
+                        ]
                     reward_inputs = reward_processing_class(
-                        text=texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                        text=texts,
+                        return_tensors="pt",
+                        padding=True,
+                        padding_side="right",
+                        add_special_tokens=not is_conversational({"prompt": prompts[0]}),
                     )
                     reward_inputs = super()._prepare_inputs(reward_inputs)
                     with torch.inference_mode():
