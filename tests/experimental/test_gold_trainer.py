@@ -2150,17 +2150,13 @@ def test_on_policy_vlm_vllm_does_not_duplicate_repeated_sampler_batch(monkeypatc
     for i, prompt in enumerate(received["prompts"]):
         assert prompt == received["prompts"][i - i % num_generations]
 
-    # Buffers populated for every on-policy slice; the synthetic examples are collated only when consumed
+    # Sampled completion ids are stored lazily with their raw examples and are not collated until consumed
     for slice_idx in on_policy_indices:
-        assert "_gold_vlm_lazy_examples" in trainer._buffered_inputs[slice_idx]
-        _, completion_texts = trainer._buffered_text_logs[slice_idx]
-        assert len(completion_texts) == num_generations
-
-    first_slice = trainer._materialize_vlm_slice(trainer._buffered_inputs[0])
-    eos_token = trainer.processing_class.tokenizer.eos_token
-    assert first_slice["input_ids"].shape[0] == num_generations
-    assert first_slice["original_prompt_text"] == [unique_examples[0]["prompt"][0]["content"]] * num_generations
-    assert all(completion.endswith(eos_token) for completion in first_slice["original_completion_text"])
+        pending_slice = trainer._buffered_inputs[slice_idx]
+        assert len(pending_slice["_gold_vlm_on_policy_raw_examples"]) == num_generations
+        assert len(pending_slice["_gold_vlm_completion_ids"]) == num_generations
+    eos_token_id = trainer.processing_class.tokenizer.eos_token_id
+    assert trainer._buffered_inputs[0]["_gold_vlm_completion_ids"][0] == [100, eos_token_id]
 
 
 def test_vlm_uld_custom_collator_missing_raw_fields_raises_clear_error(tmp_path, vlm_dataset):
