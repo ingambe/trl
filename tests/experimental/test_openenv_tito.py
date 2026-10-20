@@ -88,9 +88,9 @@ def test_consumer_rejects_invalid_full_masks(mask):
 
 
 @pytest.mark.parametrize(
-    "adapter,lossless,threshold", [(None, True, 0), (None, False, 1024), (SimpleNamespace(), True, 1024)]
+    "adapter,lossless,threshold", [(None, True, 0), (None, False, 1024), (SimpleNamespace(), True, 0)]
 )
-def test_loop_owning_capture_defaults_to_lossless_reconciliation(monkeypatch, adapter, lossless, threshold):
+def test_capture_defaults_to_lossless_reconciliation(monkeypatch, adapter, lossless, threshold):
     def init(self, **kwargs):
         self._fork_threshold_tokens = kwargs.get("fork_threshold_tokens", 1024)
         self.max_tool_calling_iterations = 8
