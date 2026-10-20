@@ -1101,7 +1101,7 @@ class KTOTrainer(_BaseTrainer):
                     map_kwargs["desc"] = f"Adding EOS to {dataset_name} dataset"
 
                 def add_eos(example, eos_token):
-                    if not example["completion"].endswith(eos_token):
+                    if not example["completion"].rstrip().endswith(eos_token):
                         example["completion"] = example["completion"] + eos_token
                     return example
 
