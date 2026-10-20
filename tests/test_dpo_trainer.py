@@ -1423,11 +1423,12 @@ class TestDPOTrainer(TrlTestCase):
         chosen_logits, rejected_logits = logits.chunk(2)
         chosen_mask, rejected_mask = mask.chunk(2)
         chosen_labels, _ = inputs["input_ids"][:, 1:].chunk(2)
-        metrics = trainer._metrics["eval"]
-        assert metrics["logits/chosen"][-1] == pytest.approx(chosen_logits[chosen_mask].mean().item(), rel=1e-4)
-        assert metrics["logits/rejected"][-1] == pytest.approx(rejected_logits[rejected_mask].mean().item(), rel=1e-4)
+        trainer.log({})
+        metrics = trainer.state.log_history[-1]
+        assert metrics["eval_logits/chosen"] == pytest.approx(chosen_logits[chosen_mask].mean().item(), rel=1e-4)
+        assert metrics["eval_logits/rejected"] == pytest.approx(rejected_logits[rejected_mask].mean().item(), rel=1e-4)
         accuracy = (chosen_logits.argmax(-1) == chosen_labels)[chosen_mask].float().mean().item()
-        assert metrics["mean_token_accuracy"][-1] == pytest.approx(accuracy)
+        assert metrics["eval_mean_token_accuracy"] == pytest.approx(accuracy)
 
     # In practice, this test is the same as `test_train`, since gradient checkpointing is enabled by default in
     # `DPOTrainer`. We keep it as a regression guard: if the default ever changes, we still explicitly test gradient
