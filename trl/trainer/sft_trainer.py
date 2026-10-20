@@ -1342,7 +1342,7 @@ class SFTTrainer(_BaseTrainer):
 
                     def add_eos(example, eos_token, dataset_text_field):
                         text_field = "completion" if "prompt" in example else dataset_text_field
-                        if not example[text_field].endswith(eos_token):
+                        if not example[text_field].rstrip().endswith(eos_token):
                             example[text_field] = example[text_field] + eos_token
                         return example
 
