@@ -735,10 +735,11 @@ def add_bos_token_if_needed(
 def add_eos_token_if_needed(
     eos_token_id: int, chosen_tokens: dict[str, list[int]], rejected_tokens: dict[str, list[int]]
 ):
-    if len(chosen_tokens["input_ids"]) == 0 or eos_token_id != chosen_tokens["input_ids"][-1]:
+    # A chat template may end the turn with EOS followed by a newline
+    if eos_token_id not in chosen_tokens["input_ids"][-2:]:
         chosen_tokens["input_ids"].append(eos_token_id)
         chosen_tokens["attention_mask"].append(1)
-    if len(rejected_tokens["input_ids"]) == 0 or eos_token_id != rejected_tokens["input_ids"][-1]:
+    if eos_token_id not in rejected_tokens["input_ids"][-2:]:
         rejected_tokens["input_ids"].append(eos_token_id)
         rejected_tokens["attention_mask"].append(1)
     return chosen_tokens, rejected_tokens
