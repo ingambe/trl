@@ -31,10 +31,7 @@ def compute_divergence(
         kl = F.kl_div(teacher_log_probs, student_log_probs, reduction="none", log_target=True)
     else:
         alpha_t = torch.tensor(alpha, dtype=student_log_probs.dtype, device=student_log_probs.device)
-        mixture = torch.logsumexp(
-            torch.stack([student_log_probs + torch.log(1 - alpha_t), teacher_log_probs + torch.log(alpha_t)]),
-            dim=0,
-        )
+        mixture = torch.logaddexp(student_log_probs + torch.log(1 - alpha_t), teacher_log_probs + torch.log(alpha_t))
         kl_teacher = F.kl_div(mixture, teacher_log_probs, reduction="none", log_target=True)
         kl_student = F.kl_div(mixture, student_log_probs, reduction="none", log_target=True)
         kl = torch.lerp(kl_student, kl_teacher, alpha)
