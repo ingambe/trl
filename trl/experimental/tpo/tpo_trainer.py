@@ -495,8 +495,9 @@ class TPOTrainer(_BaseTrainer):
         """
         if isinstance(input, list):  # conversational: list of message dicts
             return processing_class.apply_chat_template(input, tokenize=True, return_dict=True, **kwargs)
-        # non-conversational: plain text string
-        return processing_class(text=input)
+        # non-conversational: plain text string. Text rendered with a chat template already starts with BOS
+        bos_token = processing_class.bos_token
+        return processing_class(text=input, add_special_tokens=bos_token is None or not input.startswith(bos_token))
 
     def _prepare_dataset(
         self,
@@ -539,11 +540,11 @@ class TPOTrainer(_BaseTrainer):
                     map_kwargs["desc"] = f"Adding EOS to {dataset_name} dataset"
 
                 def add_eos(example, eos_token):
-                    if not example["chosen"].endswith(eos_token):
+                    if not example["chosen"].rstrip().endswith(eos_token):
                         example["chosen"] = example["chosen"] + eos_token
-                    if not example["rejected"].endswith(eos_token):
+                    if not example["rejected"].rstrip().endswith(eos_token):
                         example["rejected"] = example["rejected"] + eos_token
-                    if not example["reference"].endswith(eos_token):
+                    if not example["reference"].rstrip().endswith(eos_token):
                         example["reference"] = example["reference"] + eos_token
                     return example
 
