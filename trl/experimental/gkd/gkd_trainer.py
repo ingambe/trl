@@ -41,7 +41,7 @@ from ...models import prepare_deepspeed
 from ...models.utils import unwrap_model_for_generation
 from ...trainer.sft_trainer import SFTTrainer
 from ...trainer.utils import disable_dropout_in_model
-from ..utils import DataCollatorForChatML, empty_cache
+from ..utils import DataCollatorForChatML
 from .gkd_config import GKDConfig
 
 
@@ -358,9 +358,6 @@ class GKDTrainer(SFTTrainer):
         # Undo DDP gradient averaging for the global token count.
         if self.args.average_tokens_across_devices and num_items_in_batch is not None:
             loss *= self.accelerator.num_processes
-
-        # empty cache
-        empty_cache()
 
         # Return loss
         return (loss, student_outputs) if return_outputs else loss

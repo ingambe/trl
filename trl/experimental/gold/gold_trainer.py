@@ -77,7 +77,6 @@ from ...trainer.utils import (
 from ..utils import (
     DataCollatorForChatML,
     DataCollatorForVisionLanguageChatML,
-    empty_cache,
     encode_with_byte_offsets,
     is_byte_level_tokenizer,
     pad_byte_offsets,
@@ -3173,8 +3172,6 @@ class GOLDTrainer(SFTTrainer):
                     self._metrics[mode]["xtoken/proj_accuracy"].append(
                         (proj_num / proj_den).item() if proj_den > 0 else 0.0
                     )
-
-        empty_cache()
 
         return (loss, outputs_student) if return_outputs else loss
 
