@@ -15,10 +15,8 @@
 """Provider-independent GPU job entry point; the controller uploads only trusted harness files."""
 
 import argparse
-import hashlib
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -32,32 +30,10 @@ ROOT = Path(__file__).resolve().parent
 
 
 def run(environment):
-    from datasets import load_from_disk
-    from transformers import AutoTokenizer
-
     manifest = json.loads((ROOT / "manifest.json").read_text())
     config = manifest["workload"]
     work = Path(tempfile.mkdtemp(prefix="trl-benchmark-"))
     validate_environment(environment, manifest)
-    tokenizer = AutoTokenizer.from_pretrained(environment / "model", trust_remote_code=False, local_files_only=True)
-    count = config["train_examples"] + config["eval_examples"]
-    dataset = load_from_disk(str(environment / "dataset")).shuffle(seed=917, keep_in_memory=True).select(range(count))
-    encoded = [
-        tokenizer.apply_chat_template(
-            row["messages"],
-            tokenize=True,
-            return_dict=False,
-            truncation=True,
-            max_length=config["max_length"],
-        )
-        for row in dataset
-    ]
-    if any(len(ids) < 2 for ids in encoded):
-        raise ValueError("The fixed dataset contains an empty training/evaluation example")
-    data = work / "data.json"
-    data.write_text(
-        json.dumps({"train": encoded[: config["train_examples"]], "eval": encoded[config["train_examples"] :]})
-    )
     for side in ("base", "head"):
         checkout = work / side
         subprocess.run(["git", "init", "--quiet", str(checkout)], check=True)
@@ -88,83 +64,57 @@ def run(environment):
             "NCCL_SHM_DISABLE": "1",
         }
     )
-    rollout = config.get("kind") == "vllm-rollout"
     # One data-parallel process per GPU, each with its own colocated vLLM engine
     launcher = [sys.executable]
     if config.get("gpus", 1) > 1:
         launcher += ["-m", "torch.distributed.run", "--standalone", f"--nproc-per-node={config['gpus']}"]
-    script = {"vllm-rollout": "rollout_workload.py", "grpo-train": "grpo_workload.py"}.get(
-        config.get("kind"), "workload.py"
-    )
 
-    def run_child(side, stem, *extra):
-        output = work / f"{stem}.json"
-        with (ROOT / f"{stem}.log").open("w") as log:
+    # Heat the GPUs first, so the base run does not get the boost clocks of a cold card
+    burn = "import time, torch\nx = torch.randn(8192, 8192, device='cuda')\nend = time.time() + 180\nwhile time.time() < end: x @ x"
+    burners = [
+        subprocess.Popen([sys.executable, "-c", burn], env={**env, "CUDA_VISIBLE_DEVICES": str(index)})
+        for index in range(config.get("gpus", 1))
+    ]
+    if any(burner.wait() for burner in burners):
+        raise RuntimeError("GPU warm-up failed")
+
+    records = []
+    started = time.perf_counter()
+    for side in ("base", "head"):
+        output = work / f"{side}.json"
+        # Separate compile caches, so the head run does not reuse kernels built by the base run
+        home = work / f"{side}-home"
+        side_env = {**env, "HOME": str(home), "TORCHINDUCTOR_CACHE_DIR": str(home / "inductor")}
+        with (ROOT / f"{side}.log").open("w") as log:
             subprocess.run(
                 [
                     *launcher,
-                    str(ROOT / script),
+                    str(ROOT / "grpo_workload.py"),
                     "--model-path",
                     str(environment / "model"),
                     "--checkout",
                     str(work / side),
                     "--manifest",
                     str(ROOT / "manifest.json"),
-                    "--data",
-                    str(data),
                     "--side",
                     side,
                     "--output",
                     str(output),
-                    *extra,
                 ],
                 cwd=work,
-                env=env,
+                env=side_env,
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 check=True,
             )
-        return json.loads(output.read_text())
-
-    records = []
-    started = time.perf_counter()
-    if rollout:
-        # One process per side runs every seed, so vLLM starts once per side instead of once per seed
-        for side in ("base", "head"):
-            records += run_child(side, side, "--seeds", *map(str, config["seeds"]))
-            print(f"Completed {side}", flush=True)  # noqa: T201
-    else:
-        for index, seed in enumerate(config["seeds"]):
-            # Alternate order to reduce drift caused by temperature or competing workloads.
-            for side in ("base", "head") if index % 2 == 0 else ("head", "base"):
-                before = time.perf_counter()
-                record = run_child(side, f"{side}-{seed}", "--seed", str(seed))
-                record["workload_seconds"] = time.perf_counter() - before
-                records.append(record)
-                print(f"Completed {side}, seed {seed}", flush=True)  # noqa: T201
+        records.append(json.loads(output.read_text()))
+        print(f"Completed {side}", flush=True)  # noqa: T201
     result = {
         "manifest_id": manifest["id"],
         "records": records,
-        "data_sha256": hashlib.sha256(data.read_bytes()).hexdigest(),
         "comparison_seconds": time.perf_counter() - started,
     }
     (ROOT / "result.json").write_text(json.dumps(result, indent=2, allow_nan=False))
-    if rollout:
-        # Profiled runs come after timing, which is saved first so a failed capture cannot lose it
-        result["profiles"], result["policy_parity"] = {}, {}
-        seed = config["seeds"][0]
-        for side in ("base", "head"):
-            directory = ROOT / f"{side}-profile"
-            (record,) = run_child(
-                side, f"{side}-{seed}-profile", "--seeds", str(seed), "--profile-dir", str(directory)
-            )
-            result["policy_parity"][side] = record["policy_parity"]
-            archive = Path(shutil.make_archive(str(directory), "zip", directory))
-            result["profiles"][side] = {
-                "bytes": archive.stat().st_size,
-                "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
-            }
-        (ROOT / "result.json").write_text(json.dumps(result, indent=2, allow_nan=False))
 
 
 if __name__ == "__main__":
