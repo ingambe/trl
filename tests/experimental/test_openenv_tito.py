@@ -97,9 +97,9 @@ def test_consumer_rejects_invalid_full_masks(mask):
 
 
 @pytest.mark.parametrize(
-    "adapter,lossless,threshold", [(None, True, 0), (None, False, 1024), (MCPHarnessAdapter(), True, 1024)]
+    "adapter,lossless,threshold", [(None, True, 0), (None, False, 1024), (MCPHarnessAdapter(), True, 0)]
 )
-def test_loop_owning_capture_defaults_to_lossless_reconciliation(make_loop, adapter, lossless, threshold):
+def test_capture_defaults_to_lossless_reconciliation(make_loop, adapter, lossless, threshold):
     factory_calls = []
     loop = make_loop(
         factory_builder=lambda **kwargs: factory_calls.append(kwargs),
