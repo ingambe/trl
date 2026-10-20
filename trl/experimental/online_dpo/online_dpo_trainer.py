@@ -690,8 +690,10 @@ class OnlineDPOTrainer(_BaseTrainer):
             prompts_text = [apply_chat_template({"prompt": p}, self.processing_class)["prompt"] for p in prompts]
         else:
             prompts_text = prompts
+        # Send token IDs so the server samples from exactly the prompt that is trained on
+        prompt_ids = self.processing_class(text=prompts_text, add_special_tokens=False)["input_ids"]
         # Gather all prompts to main process
-        all_prompts = gather_object(prompts_text)
+        all_prompt_ids = gather_object(prompt_ids)
         if has_images:
             # The server can't take images alongside text prompts, so multimodal prompts are sent as messages, with
             # the images inlined in place of their placeholders.
@@ -722,9 +724,9 @@ class OnlineDPOTrainer(_BaseTrainer):
             if has_images:
                 completion_ids = self.vllm_client.chat(messages=all_messages, **sampling_kwargs)["completion_ids"]
             else:
-                completion_ids = self.vllm_client.generate(prompts=all_prompts, **sampling_kwargs)["completion_ids"]
+                completion_ids = self.vllm_client.generate(prompts=all_prompt_ids, **sampling_kwargs)["completion_ids"]
         else:
-            completion_ids = [None] * (len(all_prompts) * 2)
+            completion_ids = [None] * (len(all_prompt_ids) * 2)
 
         # Broadcast completions to all processes
         completion_ids = broadcast_object_list(completion_ids, from_process=0)
@@ -738,18 +740,7 @@ class OnlineDPOTrainer(_BaseTrainer):
         # Reorder to block layout ([p0c0, p1c0, ..., p0c1, p1c1, ...]) to match the colocate and transformers
         # generation paths, which is what the loss expects (`rewards.split(batch_size)`).
         completion_ids = completion_ids[0::2] + completion_ids[1::2]
-
-        # Create prompt_ids by tokenizing locally, in the same block layout (2 copies per prompt)
-        prompt_inputs = self.processing_class(
-            text=prompts_text,
-            return_tensors="pt",
-            padding=True,
-            padding_side="left",
-            add_special_tokens=False,
-        )
-        prompt_ids = [prompt_tokens.tolist() for prompt_tokens in prompt_inputs["input_ids"]]
-        prompt_ids = prompt_ids + prompt_ids  # 2 copies for 2 completions
-        return completion_ids, prompt_ids
+        return completion_ids, prompt_ids + prompt_ids  # same block layout: 2 copies for 2 completions
 
     def _generate_vllm_colocate(self, prompts, images=None):
         """Generate completions using vLLM colocate mode"""
@@ -778,7 +769,8 @@ class OnlineDPOTrainer(_BaseTrainer):
                 else:
                     vllm_inputs.append(prompt)
         else:
-            vllm_inputs = prompts_text
+            prompt_ids = self.processing_class(text=prompts_text, add_special_tokens=False)["input_ids"]
+            vllm_inputs = [{"prompt_token_ids": ids} for ids in prompt_ids]
 
         if self.args.vllm_enable_sleep_mode:
             self.llm.wake_up(tags=["kv_cache"])
