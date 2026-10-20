@@ -1039,9 +1039,9 @@ class DPOTrainer(_BaseTrainer):
                     map_kwargs["desc"] = f"Adding EOS to {dataset_name} dataset"
 
                 def add_eos(example, eos_token):
-                    if not example["chosen"].endswith(eos_token):
+                    if not example["chosen"].rstrip().endswith(eos_token):
                         example["chosen"] = example["chosen"] + eos_token
-                    if not example["rejected"].endswith(eos_token):
+                    if not example["rejected"].rstrip().endswith(eos_token):
                         example["rejected"] = example["rejected"] + eos_token
                     return example
 
