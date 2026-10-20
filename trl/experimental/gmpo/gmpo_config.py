@@ -51,3 +51,8 @@ class GMPOConfig(GRPOConfig):
         default="grpo",
         metadata={"help": "Unused: GMPO's own objective averages over sequences, as 'grpo' does."},
     )
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.max_tokens_per_microbatch is not None:
+            raise ValueError("GMPO doesn't support `max_tokens_per_microbatch`.")
