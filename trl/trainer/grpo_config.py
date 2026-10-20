@@ -55,7 +55,7 @@ class GRPOConfig(_BaseConfig):
             the [ScaleRL](https://huggingface.co/papers/2510.13786) recipe. This flag is only supported when the model
             has untied word embedding and language modeling head layers i.e. `tie_word_embeddings` in the model config
             is False. Also applies to vLLM in colocate mode; in server mode, start the server with `--hf-overrides
-            '{"head_dtype": "float32"}'` (vLLM 0.26.0 or later).
+            '{"head_dtype": "float32"}'`.
 
         > Parameters that control the data preprocessing
 
@@ -499,7 +499,7 @@ class GRPOConfig(_BaseConfig):
             "As recommended by the [ScaleRL](https://huggingface.co/papers/2510.13786) recipe. This flag is only "
             "supported when the model has untied word embedding and language modeling head layers i.e. "
             "`tie_word_embeddings` in the model config is False. Also applies to vLLM in colocate mode; in server mode, "
-            'start the server with `--hf-overrides \'{"head_dtype": "float32"}\'` (vLLM 0.26.0 or later).'
+            'start the server with `--hf-overrides \'{"head_dtype": "float32"}\'`.'
         },
     )
 
