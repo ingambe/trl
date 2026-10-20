@@ -117,6 +117,9 @@ Next run the full `sft-3090` profile against itself to estimate measurement nois
 
 `--ref` accepts an exact commit SHA. Calibration pins that SHA for both sides and never posts PR statuses.
 
+`--profile sft-long` trains the same model on 2,048-token micro-batches of four, for SFT changes that only show on long
+sequences.
+
 ## Compare a PR or watch for changes
 
 ```bash
