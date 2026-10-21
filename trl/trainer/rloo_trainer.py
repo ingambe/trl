@@ -585,7 +585,8 @@ class RLOOTrainer(_BaseTrainer):
         self.num_generations = args.num_generations
         self.num_generations_eval = args.num_generations_eval or self.num_generations
         self.chat_template_kwargs = args.chat_template_kwargs or {}
-        self.temperature = args.temperature
+        # Scoring must use the sampling temperature, which `generation_kwargs` can override (except a greedy 0)
+        self.temperature = (args.generation_kwargs or {}).get("temperature") or args.temperature
         self.top_p = args.top_p
         self.top_k = args.top_k
         self.min_p = args.min_p
