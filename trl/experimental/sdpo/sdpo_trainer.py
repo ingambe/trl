@@ -1480,6 +1480,8 @@ class SDPOTrainer(_BaseTrainer):
             "attention_mask": attention_mask,
             "use_cache": False,
         }
+        if "position_ids" in self.model_kwarg_keys:
+            model_inputs["position_ids"] = (attention_mask.cumsum(-1) - 1).clamp(min=0)
         if "logits_to_keep" in self.model_kwarg_keys:
             model_inputs["logits_to_keep"] = logits_to_keep + 1
 

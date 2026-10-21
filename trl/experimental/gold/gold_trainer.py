@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import random
 import textwrap
 import warnings
@@ -1001,6 +1002,14 @@ class GOLDTrainer(SFTTrainer):
             optimizers=optimizers,
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
             peft_config=peft_config,
+        )
+
+        # Some models (e.g. Bloom, Mamba) don't accept `position_ids`. Inspect the forward method of the unwrapped
+        # model
+        self.model_kwarg_keys = (
+            inspect.signature(self.model.forward).parameters.keys()
+            if not hasattr(self.model, "get_base_model")
+            else inspect.signature(self.model.get_base_model().forward).parameters.keys()
         )
 
         if args.disable_dropout:
@@ -2464,6 +2473,8 @@ class GOLDTrainer(SFTTrainer):
         # Standard JSD reuses these for the teacher (same-family VLM); cross-tokenizer ULD rebuilds
         # teacher inputs separately below.
         student_forward_kwargs = self._get_model_forward_kwargs(inputs)
+        if not self._is_vlm and "position_ids" in self.model_kwarg_keys:
+            student_forward_kwargs["position_ids"] = (inputs["attention_mask"].cumsum(-1) - 1).clamp(min=0)
         if self.use_uld_loss and self.teacher_tokenizer is not None:
             # Both DataCollatorForChatML and the on-policy generation path attach these
             # fields, so cross-tokenizer ULD never has to round-trip through batch_decode.
