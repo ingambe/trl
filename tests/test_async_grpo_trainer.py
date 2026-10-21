@@ -1962,7 +1962,7 @@ class TestAsyncGRPOTrainer(TrlTestCase):
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
-    @pytest.mark.parametrize("sampling_kwargs", [{"top_p": 0.9}, {"min_p": 0.05}])
+    @pytest.mark.parametrize("sampling_kwargs", [{"top_p": 0.9}, {"top_p": 0.9, "top_k": -1}, {"min_p": 0.05}])
     def test_vllm_top_p_and_min_p_require_top_k(self, sampling_kwargs):
         with pytest.raises(ValueError, match="top_k"):
             AsyncGRPOConfig(output_dir=self.tmp_dir, report_to="none", **sampling_kwargs)
@@ -4981,7 +4981,6 @@ class TestGenerateOneTurn(TrlTestCase):
         loop = _rollout_loop()
         loop.session = None
         asyncio.run(loop._check_sampling_replay())
-
 
 
 @require_response_parsing

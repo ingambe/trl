@@ -274,7 +274,7 @@ class AsyncGRPOConfig(_BaseConfig):
         default=None,
         metadata={
             "help": "Minimum token probability, which will be scaled by the probability of the most likely token. It "
-            "must be a value between 0.0 and 1.0. Typical values are in the 0.01-0.2 range."
+            "must be a value between 0.0 and 1.0. Typical values are in the 0.01-0.2 range. Needs `top_k > 0`."
         },
     )
     chat_template_kwargs: dict | str | None = field(
@@ -411,7 +411,7 @@ class AsyncGRPOConfig(_BaseConfig):
         if self.score_centering and self.num_sampler_logprobs < 1:
             raise ValueError("`score_centering=True` needs `num_sampler_logprobs >= 1`.")
 
-        if (self.top_p < 1.0 or (self.min_p or 0.0) > 0.0) and self.top_k == 0:
+        if (self.top_p < 1.0 or (self.min_p or 0.0) > 0.0) and self.top_k <= 0:
             raise ValueError(
                 "`top_p < 1.0` or `min_p > 0.0` needs `top_k > 0`: vLLM bounds the candidate set it returns for each "
                 "sampled token with `top_k` (e.g. `top_k=512`)."
