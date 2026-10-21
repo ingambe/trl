@@ -322,7 +322,7 @@ def test_white_box_tool_metrics_reach_the_queue_per_tool(make_loop, monkeypatch)
     )
     loop.tokenizer.apply_chat_template = MagicMock(return_value=[1])
 
-    async def generate_one_turn(prompt_ids):
+    async def generate_one_turn(prompt_ids, max_tokens):
         return [2, 3], [-0.1, -0.2], None
 
     loop._generate_one_turn = generate_one_turn
