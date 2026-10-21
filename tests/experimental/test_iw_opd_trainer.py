@@ -130,18 +130,18 @@ def _variable_length_dataset():
 
 
 @pytest.mark.parametrize(
-    "iw_opd_loss_trainer, uses_global_count",
+    "iw_opd_loss_trainer",
     [
-        ((False, "jsd", 0, 0.5), True),
-        ((False, "jsd", 1, 0.5), True),
-        ((False, "iw_opd", 0, 0.5), True),
-        ((True, "iw_opd", 1, 0.5), True),
-        ((True, "jsd", 1, 0.5), False),
-        ((True, "jsd", 1, 0.0), False),
+        (False, "jsd", 0, 0.5),
+        (False, "jsd", 1, 0.5),
+        (False, "iw_opd", 0, 0.5),
+        (True, "iw_opd", 1, 0.5),
+        (True, "jsd", 1, 0.5),
+        (True, "jsd", 1, 0.0),
     ],
-    indirect=["iw_opd_loss_trainer"],
+    indirect=True,
 )
-def test_loss_undoes_ddp_averaging_only_for_global_token_counts(iw_opd_loss_trainer, uses_global_count):
+def test_loss_undoes_ddp_averaging_only_for_global_token_counts(iw_opd_loss_trainer):
     trainer, inputs = iw_opd_loss_trainer
     num_tokens = (inputs["labels"] != -100).sum()
     loss = trainer.compute_loss(trainer.model, inputs, num_items_in_batch=num_tokens)
@@ -159,7 +159,7 @@ def test_loss_undoes_ddp_averaging_only_for_global_token_counts(iw_opd_loss_trai
     torch.testing.assert_close(loss_no_count, loss)
     trainer.args.average_tokens_across_devices = False
     loss_local_count = trainer.compute_loss(trainer.model, inputs, num_items_in_batch=2 * num_tokens)
-    torch.testing.assert_close(loss_local_count, loss / 2 if uses_global_count else loss)
+    torch.testing.assert_close(loss_local_count, loss / 2)
 
 
 def test_distillation_config_rejects_invalid_reverse_kl_top_1_mode(tmp_path):
@@ -773,6 +773,50 @@ class TestIWOPDTrainer(TrlTestCase):
         assert math.isfinite(train_result.metrics["train_loss"])
         assert any("iw_opd/mean_weight" in record for record in trainer.state.log_history)
 
+    def test_iw_opd_train_with_prompt_only_dataset(self):
+        prompts = ["What's 2+2?", "Hi", "Name a color.", "Tell me a joke."]
+        dataset = Dataset.from_list([{"messages": [{"role": "user", "content": prompt}]} for prompt in prompts])
+        training_args = self._make_args(
+            distillation_objective="iw_opd",
+            lmbda=1.0,
+            max_completion_length=8,
+            gradient_accumulation_steps=2,
+            logging_steps=1,
+        )
+        trainer = IWOPDTrainer(
+            model=self.model_id,
+            teacher_model=self.model_id,
+            args=training_args,
+            train_dataset=dataset,
+            processing_class=self.tokenizer,
+        )
+        trainer.train()
+        assert math.isfinite(trainer.state.log_history[0]["grad_norm"])
+
+    def test_loss_matches_across_gradient_accumulation(self):
+        teacher = AutoModelForCausalLM.from_pretrained(self.model_id)
+        with torch.no_grad():
+            teacher.lm_head.weight.add_(torch.randn_like(teacher.lm_head.weight))
+        records = []
+        for batch_size, accumulation_steps in [(2, 1), (1, 2)]:
+            training_args = self._make_args(
+                per_device_train_batch_size=batch_size,
+                gradient_accumulation_steps=accumulation_steps,
+                logging_steps=1,
+                teacher_model_init_kwargs=None,
+            )
+            trainer = IWOPDTrainer(
+                model=self.model_id,
+                teacher_model=teacher,
+                args=training_args,
+                train_dataset=_variable_length_dataset(),
+                processing_class=self.tokenizer,
+            )
+            trainer.train()
+            records.append(trainer.state.log_history[0])
+        assert records[1]["loss"] == pytest.approx(records[0]["loss"])
+        assert records[1]["grad_norm"] == pytest.approx(records[0]["grad_norm"])
+
     def test_iw_opd_server_path_uses_actual_logprobs(self, monkeypatch):
         import trl.generation.vllm_client as vllm_client_module
 
@@ -871,6 +915,12 @@ class TestIWOPDTrainerServerPath(TrlTestCase):
         for record in records:
             assert math.isfinite(record["grad_norm"]), f"grad_norm={record['grad_norm']} leaked -inf into backward"
             assert math.isfinite(record["loss"])
+
+    def test_loss_matches_across_gradient_accumulation(self, monkeypatch):
+        whole = self._run_one_step(bs=2, ga=1, monkeypatch=monkeypatch)[0]
+        split = self._run_one_step(bs=1, ga=2, monkeypatch=monkeypatch)[0]
+        assert split["loss"] == pytest.approx(whole["loss"])
+        assert split["grad_norm"] == pytest.approx(whole["grad_norm"])
 
 
 def test_repeat_batch_dataloader_delegates_set_epoch_via_getattr():
