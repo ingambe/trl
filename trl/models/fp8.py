@@ -46,11 +46,14 @@ def fused_layer_name(name: str) -> str:
     return name.replace(".base_layer", "")
 
 
-def quantize_rowwise(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize each row of `x` to float8_e4m3fn with a float32 scale, as vLLM's per-channel FP8 does."""
+def quantize_rowwise(x: torch.Tensor, scale_dtype: torch.dtype = torch.float32) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize each row of `x` to float8_e4m3fn with a float32 scale, dividing in `scale_dtype`: float32 as vLLM's
+    per-channel FP8 does, the weight's dtype as llm-compressor does.
+    """
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    scale = (x.abs().amax(dim=-1, keepdim=True).float() / fp8_max).clamp(min=1 / (fp8_max * 512))
-    return (x.float() / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn), scale
+    scale = (x.abs().amax(dim=-1, keepdim=True).float() / fp8_max).clamp(min=1 / (fp8_max * 512)).to(scale_dtype)
+    return (x.to(scale_dtype) / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn), scale.float()
 
 
 def _quantize_tokens(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -129,7 +132,9 @@ class FP8Linear(nn.Module):
         self.fast_accum = fast_accum or []
         self.in_features, self.out_features = linear.in_features, linear.out_features
         self.weight = linear.weight if linear.weight.requires_grad else None
-        weight_fp8, weight_scale = quantize_rowwise(linear.weight.detach())
+        # A frozen base matches its llm-compressor checkpoint, a trainable layer vLLM's requantization of its updates
+        scale_dtype = linear.weight.dtype if self.weight is None else torch.float32
+        weight_fp8, weight_scale = quantize_rowwise(linear.weight.detach(), scale_dtype)
         self.register_buffer("weight_fp8", weight_fp8, persistent=self.weight is None)
         self.register_buffer("weight_scale", weight_scale, persistent=self.weight is None)
         self.bias = linear.bias
