@@ -1504,22 +1504,24 @@ class TestAddFusedLMHead:
 
     # CPU tensors stand in for an accelerator without Triton (e.g. Trainium): TRL does not target CPU training
     @pytest.mark.parametrize("device", [torch_device, "cpu"])
-    def test_support_ids_masked_labels(self, device):
+    @pytest.mark.parametrize("support_size", [4, 256])
+    def test_support_ids_masked_labels(self, device, support_size):
         """With `support_ids`, valid positions are normalized over their support, and masked ones stay zero."""
         torch.manual_seed(0)
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen3ForCausalLM").to(device)
         add_fused_lm_head(model)
         input_ids = torch.randint(0, model.config.vocab_size, (2, 16), device=device)
         labels = input_ids.masked_fill(torch.arange(16, device=device) < 8, -100)
-        support_ids = torch.randint(0, model.config.vocab_size, (2, 16, 4), device=device)
+        support_ids = torch.randint(0, model.config.vocab_size, (2, 16, support_size), device=device)
         support_ids[..., 0] = input_ids
-        support_ids[..., 3] = -1
+        support_ids[..., -1] = -1
 
         out = model(input_ids=input_ids, labels=labels, support_ids=support_ids, fused_lm_head=True)
         out["log_probs"].sum().backward()
 
         logits = model(input_ids=input_ids).logits[:, :-1].float()
-        keep = F.one_hot(support_ids[:, 1:] + 1, model.config.vocab_size + 1)[..., 1:].any(-2)
+        keep = torch.zeros(*logits.shape[:-1], logits.size(-1) + 1, dtype=torch.bool, device=device)
+        keep = keep.scatter_(-1, support_ids[:, 1:] + 1, True)[..., 1:]
         ref = logits.masked_fill(~keep, float("-inf")).log_softmax(-1).gather(-1, input_ids[:, 1:, None]).squeeze(-1)
         mask = labels[:, 1:] != -100
         torch.testing.assert_close(out["log_probs"][mask], ref[mask], atol=1e-4, rtol=1e-4)
