@@ -271,6 +271,9 @@ class VLLMClient:
             self.host = host
             self.server_port = server_port
             self.base_url = f"http://{self.host}:{self.server_port}"
+        # These requests block in NCCL collectives on the server, so a retry would wait for a peer that never comes
+        for path in ("init_weight_transfer_engine", "update_weights"):
+            self.session.mount(f"{self.base_url}/{path}", HTTPAdapter())
         self.group_port = group_port
         self.communicator = None
         self._updating_weights = False  # set while inside `weight_update`
