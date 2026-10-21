@@ -1229,12 +1229,6 @@ class SDPOTrainer(_BaseTrainer):
         When `distillation_is_clip` is set and `old_per_token_logps` are available, the loss is corrected by a clipped
         importance-sampling ratio between the current student and the student at rollout time.
         """
-        if distillation_logits.loss_mask.sum() == 0:
-            mode = "train" if model.training else "eval"
-            self._log_self_distillation_metric(mode, 0.0)
-            # Keep the zero loss attached to the student graph so backward produces zero gradients instead of stopping.
-            return distillation_logits.student_logits.sum() * 0.0
-
         if self.args.distillation_mode == "topk_logits":
             if self.args.distillation_topk is None:
                 raise ValueError("`distillation_mode='topk_logits'` requires `distillation_topk` to be set.")
