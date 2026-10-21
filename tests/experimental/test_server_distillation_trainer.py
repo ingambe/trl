@@ -285,6 +285,7 @@ class TestServerDistillationTrainerRaggedGrad(TrlTestCase):
             bf16=False,
         )
         model = AutoModelForCausalLM.from_pretrained(self.model_id, dtype=torch.float32).to(self.device)
+        model.generation_config.eos_token_id = list(range(10_000))  # stop early so completion lengths differ
         trainer = ServerDistillationTrainer(
             model=model,
             args=config,
@@ -302,3 +303,10 @@ class TestServerDistillationTrainerRaggedGrad(TrlTestCase):
         for record in records:
             assert math.isfinite(record["grad_norm"]), f"grad_norm={record['grad_norm']} leaked -inf into backward"
             assert math.isfinite(record["loss"])
+
+    def test_loss_matches_across_gradient_accumulation(self, monkeypatch):
+        whole = self._run_one_step(bs=2, ga=1, monkeypatch=monkeypatch)[0]
+        split = self._run_one_step(bs=1, ga=2, monkeypatch=monkeypatch)[0]
+        assert whole["completions/min_length"] < whole["completions/max_length"]
+        assert split["loss"] == pytest.approx(whole["loss"])
+        assert split["grad_norm"] == pytest.approx(whole["grad_norm"])
