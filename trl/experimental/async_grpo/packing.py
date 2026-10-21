@@ -37,18 +37,19 @@ class TreeRow:
     not raw ones, and it sends a sample to a row already holding its `group_id` ([`~TreeRow.groups`]), where its prompt
     is.
 
-    A node is keyed on its token *and* the next one, so samples share a token only when they also agree on what follows
-    it. The trie therefore forks one token before the samples diverge, and every node has a single next-token label: a
-    branch costs one extra token per extra branch, and the loss can go through plain per-position labels. A sample's
-    last token is keyed on `None`, which no other sample extends, so every sample ends on a leaf.
+    A node is keyed on its token *and* the next one, with the candidate set that next token was sampled from, so
+    samples share a token only when they also agree on what follows it. The trie therefore forks one token before the
+    samples diverge, and every node has a single next-token label and support: a branch costs one extra token per extra
+    branch, and the loss can go through plain per-position labels. A sample's last token is keyed on `None`, which no
+    other sample extends, so every sample ends on a leaf.
     """
 
     def __init__(self):
         self.samples: list[dict[str, Any]] = []
         self.sample_nodes: list[list[int]] = []  # sample -> trie node of each of its tokens
         self.tokens: list[int] = []  # node -> its token
-        self.children: list[dict[tuple[int, int | None], int]] = []  # node -> {(token, next token): child node}
-        self.roots: dict[tuple[int, int | None], int] = {}  # {(token, next token): root node}
+        self.children: list[dict[tuple, int]] = []  # node -> {(token, next token, its support): child node}
+        self.roots: dict[tuple, int] = {}  # {(token, next token, its support): root node}
         self.groups: set[Any] = set()
         self.trained = 0
         self.load = 0
@@ -56,8 +57,9 @@ class TreeRow:
     def fits(self, sample: dict[str, Any], budget: int) -> bool:
         """Whether the row stays within `budget` unique tokens and `budget` trained tokens with `sample` added."""
         input_ids = sample["input_ids"].tolist()
+        supports = [*map(tuple, sample["sampling_mask"][1:]), ()]
         children, shared = self.roots, 0
-        for key in zip(input_ids, [*input_ids[1:], None], strict=True):
+        for key in zip(input_ids, [*input_ids[1:], None], supports, strict=True):
             if key not in children:
                 break
             children = self.children[children[key]]
@@ -78,9 +80,10 @@ class TreeRow:
 
     def add(self, sample: dict[str, Any]) -> None:
         input_ids = sample["input_ids"].tolist()
+        supports = [*map(tuple, sample["sampling_mask"][1:]), ()]
         children = self.roots
         nodes = []
-        for depth, key in enumerate(zip(input_ids, [*input_ids[1:], None], strict=True)):
+        for depth, key in enumerate(zip(input_ids, [*input_ids[1:], None], supports, strict=True)):
             if key not in children:
                 children[key] = len(self.tokens)
                 self.tokens.append(key[0])
