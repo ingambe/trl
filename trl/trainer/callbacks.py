@@ -128,9 +128,8 @@ class SyncRefModelCallback(TrainerCallback):
 
     @staticmethod
     def _sync_target_model(model, target_model, alpha):
-        with torch.no_grad():
-            for target_param, copy_param in zip(target_model.parameters(), model.parameters(), strict=True):
-                target_param.mul_(1.0 - alpha).add_(copy_param, alpha=alpha)
+        for target_param, copy_param in zip(target_model.parameters(), model.parameters(), strict=True):
+            target_param.data.mul_(1.0 - alpha).add_(copy_param.data, alpha=alpha)
 
     @staticmethod
     def sync_target_model(model, target_model, alpha):

@@ -57,17 +57,12 @@ class GRPOConfig(_BaseConfig):
             is False. Also applies to vLLM in colocate mode; in server mode, start the server with `--hf-overrides
             '{"head_dtype": "float32"}'`.
         fp8_recipe (`str`, *optional*):
-            Recipe used to run the linear layers with FP8 GEMMs, keeping the parameters, the LM head, the norms, the
-            attention and the loss in their original precision. `"rowwise_with_gw_hp"` quantizes the weights per output
-            channel and the activations and their gradients per token, and computes the weight gradients in high
-            precision; the frozen base of a PEFT model is quantized once, without a high-precision copy. With
-            `vllm_share_weights=True` (and `vllm_native_lora=True` for PEFT), vLLM generates from these FP8 weights. In
-            server mode, a server started with `--quantization fp8_per_channel` requantizes the high-precision weights
-            it receives. `"mxfp8_with_gw_hp"` uses TorchAO's MXFP8 instead, with one power-of-two scale per block of 32
-            values, on Blackwell GPUs. TorchAO's `"rowwise"` and `"tensorwise"` recipes and `"mxfp8"` also quantize the
-            weight-gradient GEMM. A checkpoint quantized to FP8 in 128x128 blocks (e.g. `Qwen/Qwen3-8B-FP8`) keeps its
-            FP8 weights whatever the recipe, and only trains a PEFT adapter. Requires a GPU with FP8 support and
-            `torchao` for TorchAO's recipes and FP8 checkpoints.
+            Recipe used to run the linear layers (not the LM head) with FP8 GEMMs. `"rowwise_with_gw_hp"` scales the
+            weights per output channel and the activations per token, and computes the weight gradients in high
+            precision; with `vllm_share_weights=True` (and `vllm_native_lora=True` for PEFT), vLLM generates from these
+            FP8 weights. TorchAO's `"rowwise"`, `"tensorwise"` and MXFP8 (`"mxfp8"`, or `"mxfp8_with_gw_hp"`, on
+            Blackwell) recipes need `torchao`. A checkpoint quantized to FP8 in 128x128 blocks (e.g.
+            `Qwen/Qwen3-8B-FP8`) keeps its FP8 weights and only trains a PEFT adapter.
         fp8_skip_modules (`list[str]`, *optional*):
             Glob patterns of the linear layers kept in high precision with `fp8_recipe`, e.g. `"model.layers.0.*"`. The
             `tools/fp8_parity/replay.py --target-kl` sensitivity analysis produces such a list. vLLM quantizes the
@@ -531,18 +526,12 @@ class GRPOConfig(_BaseConfig):
     fp8_recipe: str | None = field(
         default=None,
         metadata={
-            "help": "Recipe used to run the linear layers with FP8 GEMMs, keeping the parameters, the LM head, the "
-            "norms, the attention and the loss in their original precision. `'rowwise_with_gw_hp'` quantizes the "
-            "weights per output channel and the activations and their gradients per token, and computes the weight "
-            "gradients in high precision; the frozen base of a PEFT model is quantized once, without a high-precision "
-            "copy. With `vllm_share_weights=True` (and `vllm_native_lora=True` for PEFT), vLLM generates from these "
-            "FP8 weights. In server mode, a server started with "
-            "`--quantization fp8_per_channel` requantizes the high-precision weights it receives. "
-            "`'mxfp8_with_gw_hp'` uses TorchAO's MXFP8 instead, with one power-of-two scale per block of 32 values, "
-            "on Blackwell GPUs. TorchAO's `'rowwise'` and `'tensorwise'` recipes and `'mxfp8'` also quantize the "
-            "weight-gradient GEMM. A checkpoint quantized to FP8 in 128x128 blocks (e.g. `Qwen/Qwen3-8B-FP8`) keeps "
-            "its FP8 weights whatever the recipe, and only trains a PEFT adapter. Requires a GPU with FP8 support and "
-            "`torchao` for TorchAO's recipes and FP8 checkpoints."
+            "help": "Recipe used to run the linear layers (not the LM head) with FP8 GEMMs. `'rowwise_with_gw_hp'` "
+            "scales the weights per output channel and the activations per token, and computes the weight gradients "
+            "in high precision; with `vllm_share_weights=True` (and `vllm_native_lora=True` for PEFT), vLLM generates "
+            "from these FP8 weights. TorchAO's `'rowwise'`, `'tensorwise'` and MXFP8 (`'mxfp8'`, or "
+            "`'mxfp8_with_gw_hp'`, on Blackwell) recipes need `torchao`. A checkpoint quantized to FP8 in 128x128 "
+            "blocks (e.g. `Qwen/Qwen3-8B-FP8`) keeps its FP8 weights and only trains a PEFT adapter."
         },
     )
     fp8_skip_modules: list[str] | None = field(

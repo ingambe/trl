@@ -22,7 +22,8 @@ from torch import nn
 from transformers.utils import is_torchao_available
 
 
-if is_torchao_available("0.18.0") and Version(torch.__version__) >= Version("2.9.0"):
+_torchao_available = is_torchao_available("0.18.0") and Version(torch.__version__) >= Version("2.9.0")
+if _torchao_available:
     from torchao.float8 import Float8GemmConfig, Float8LinearConfig, convert_to_float8_training
     from torchao.prototype.blockwise_fp8_training.kernels import triton_fp8_gemm_1x128_128x128
     from torchao.prototype.moe_training.mxfp8_linear import MXFP8Linear
@@ -154,8 +155,10 @@ def _block_scaled_mm(a, a_scale, b, b_scale):
 
 
 class _BlockFP8Matmul(torch.autograd.Function):
-    """`x @ weight.T` with FP8 GEMMs, for an FP8 `weight` scaled per 128x128 block and `x` and its gradient per 1x128
-    group."""
+    """
+    `x @ weight.T` with FP8 GEMMs, for an FP8 `weight` scaled per 128x128 block and `x` and its gradient per 1x128
+    group.
+    """
 
     @staticmethod
     def forward(ctx, x, weight_fp8, weight_scale):
@@ -282,8 +285,7 @@ def convert_to_fp8_training(
     """
     if recipe not in ("rowwise_with_gw_hp", "rowwise", "tensorwise", "mxfp8_with_gw_hp", "mxfp8"):
         raise ValueError(f"Unknown FP8 recipe: {recipe!r}.")
-    torchao_available = is_torchao_available("0.18.0") and Version(torch.__version__) >= Version("2.9.0")
-    if recipe != "rowwise_with_gw_hp" and not torchao_available:
+    if recipe != "rowwise_with_gw_hp" and not _torchao_available:
         raise ImportError(f"The {recipe!r} FP8 recipe requires torchao 0.18.0 or later and PyTorch 2.9.0 or later.")
     if recipe == "rowwise_with_gw_hp" and Version(torch.__version__) < Version("2.5.0"):
         raise ImportError("The 'rowwise_with_gw_hp' FP8 recipe requires PyTorch 2.5.0 or later.")
@@ -296,7 +298,7 @@ def convert_to_fp8_training(
         if isinstance(module, nn.Linear) and module.weight.dtype == torch.float8_e4m3fn
     ]
     if prequantized:
-        if not torchao_available:
+        if not _torchao_available:
             raise ImportError(
                 "Training over an FP8 checkpoint requires torchao 0.18.0 or later and PyTorch 2.9.0 or later."
             )

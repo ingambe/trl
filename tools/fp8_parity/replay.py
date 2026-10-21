@@ -78,11 +78,8 @@ def compare_logps(
     """Log-prob error and disagreement of the GRPO clipping decision between two policies."""
     mask = mask.bool()
     diff = (cand - ref)[mask]
-    clipped = [
-        ((ratio < 1 - epsilon_low) | (ratio > 1 + epsilon_high))[mask]
-        for ratio in (torch.exp(ref - old), torch.exp(cand - old))
-    ]
-    ratio = torch.exp(cand - old)[mask]
+    ref_ratio, ratio = torch.exp(ref - old)[mask], torch.exp(cand - old)[mask]
+    clipped = [(r < 1 - epsilon_low) | (r > 1 + epsilon_high) for r in (ref_ratio, ratio)]
     return {
         "logp_rms": diff.pow(2).mean().sqrt().item(),
         "logp_max": diff.abs().max().item(),
