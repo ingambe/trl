@@ -49,6 +49,20 @@ def test_fp8_linear_matches_its_dequantized_weight_forward_and_backward(trainabl
         torch.testing.assert_close(linear.weight.grad.float(), expected_weight_grad, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.parametrize("trainable, code", [(False, 3.5), (True, 3.25)])
+def test_fp8_linear_rounds_a_frozen_base_like_llm_compressor(trainable, code):
+    linear = torch.nn.Linear(2, 1, bias=False, dtype=torch.bfloat16).requires_grad_(trainable)
+    with torch.no_grad():
+        linear.weight.copy_(torch.tensor([[1.0, 0.00750732421875]]))
+
+    layer = FP8Linear(linear)
+
+    scale = 1 / 448 if trainable else torch.tensor(1 / 448, dtype=torch.bfloat16).item()
+    assert layer.weight_scale.dtype == torch.float32
+    assert layer.weight_scale.item() == pytest.approx(scale, rel=1e-7)
+    assert layer.weight_fp8.float().tolist() == [[448.0, code]]
+
+
 @pytest.mark.parametrize("trainable", [False, True])
 def test_fp8_linear_does_not_flush_tiny_gradients_to_zero(trainable):
     linear = torch.nn.Linear(64, 64, bias=False, dtype=torch.bfloat16).requires_grad_(trainable)
