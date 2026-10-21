@@ -1413,7 +1413,6 @@ class IWOPDTrainer(_BaseTrainer):
             sequences=sequences,
             prompt_lengths=prompt_lengths,
             top_logprobs=requested_top_k,
-            temperature=self.temperature,
         )
         K = requested_top_k
 
@@ -1465,9 +1464,10 @@ class IWOPDTrainer(_BaseTrainer):
                     arr[i, offset : offset + vals.shape[0], :] = vals
             return torch.from_numpy(arr).to(device)
 
+        # vLLM scores at temperature 1; rescaling is exact once the loss renormalizes over the top-k
         return {
-            "actual_logprobs": _actual_to_tensor("actual_logprobs"),
-            "topk_logprobs": _topk_to_tensor("logprobs", K, np.float32, float("-inf")),
+            "actual_logprobs": _actual_to_tensor("actual_logprobs") / self.temperature,
+            "topk_logprobs": _topk_to_tensor("logprobs", K, np.float32, float("-inf")) / self.temperature,
             "topk_token_ids": _topk_to_tensor("logprob_token_ids", K, np.int64, 0),
         }
 

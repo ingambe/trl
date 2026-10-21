@@ -515,6 +515,15 @@ class SDPOTrainer(_BaseTrainer):
                     "vocabulary, so `full_logits` is unavailable. Note `topk_logits` distills over the teacher's own "
                     "top-k support (the server cannot score the student's top-k indices)."
                 )
+            if self.temperature != 1.0 and (
+                args.distillation_mode == "sampled_token" or args.distillation_add_tail or args.distillation_topk == 1
+            ):
+                raise ValueError(
+                    "vLLM scores the teacher's tokens at temperature 1, and only a distribution renormalized over at "
+                    "least two returned tokens can be rescaled to another temperature exactly. Use `distillation_mode="
+                    "'topk_logits'` with `distillation_add_tail=False` and `distillation_topk > 1`, or "
+                    "`temperature=1.0`."
+                )
         super().__init__(
             model=model,
             args=args,
@@ -1407,7 +1416,6 @@ class SDPOTrainer(_BaseTrainer):
             sequences=sequences,
             prompt_lengths=prompt_lengths,
             top_logprobs=top_logprobs,
-            temperature=self.temperature,
         )
 
         actual = np.full((batch_size, logits_to_keep), float("-inf"), dtype=np.float32)
@@ -1420,9 +1428,10 @@ class SDPOTrainer(_BaseTrainer):
                 actual[i, :n] = np.array(seq_actual, dtype=np.float32)[:n, 0]
                 topk[i, :n] = np.array(result["logprobs"][i], dtype=np.float32)[:n]
                 topk_ids[i, :n] = np.array(result["logprob_token_ids"][i], dtype=np.int64)[:n]
+        # vLLM scores at temperature 1; rescaling is exact once the loss renormalizes over the top-k
         return {
             "actual_logprobs": torch.from_numpy(actual).to(device),
-            "topk_logprobs": torch.from_numpy(topk).to(device),
+            "topk_logprobs": torch.from_numpy(topk).to(device) / self.temperature,
             "topk_token_ids": torch.from_numpy(topk_ids).to(device),
         }
 

@@ -215,7 +215,6 @@ class _AsyncRolloutLoop:
         lora_name: str | None = None,
         teacher_server_urls: dict[str, str] | None = None,
         teacher_top_k: int = 8,
-        teacher_temperature: float = 1.0,
         max_tokens: int = 32,
         temperature: float = 1.0,
         top_p: float = 1.0,
@@ -268,7 +267,6 @@ class _AsyncRolloutLoop:
         teacher_server_urls = teacher_server_urls or {"default": "http://localhost:8001"}
         self.teacher_server_urls = {k: v.rstrip("/") for k, v in teacher_server_urls.items()}
         self.teacher_top_k = teacher_top_k
-        self.teacher_temperature = teacher_temperature
 
         # Served model id per teacher, resolved from each teacher server's `/v1/models` in `_run_loops`, since
         # `/v1/completions` names the model it is addressing and a teacher serves a different one than the student.
@@ -610,15 +608,13 @@ class _AsyncRolloutLoop:
         position back to exactly `top_logprobs` entries and reports the realized token in separate fields, whereas the
         loss here wants one rank-sorted list per position (see `_parse_teacher_logprobs_at_position`).
 
-        `temperature` reaches the reported logprobs only on a server started with `--logprobs-mode processed_logprobs`,
-        and a `teacher_top_k` above vLLM's default cap of 20 additionally needs `--max-logprobs -1`; see
+        A `teacher_top_k` above vLLM's default cap of 20 needs `--max-logprobs -1`; see
         `AsyncDistillationConfig.teacher_server_urls` for the full `vllm serve` command.
         """
         payload = {
             "model": teacher_model_name,
             "prompt": prompt_ids + completion_ids,
             "max_tokens": 1,
-            "temperature": self.teacher_temperature,
             "prompt_logprobs": self.teacher_top_k,
         }
         output = await self._retry(
