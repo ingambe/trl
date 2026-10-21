@@ -678,6 +678,19 @@ class SDPOConfig(_BaseConfig):
                 f"generation_batch_size ({self.generation_batch_size}) must be divisible by num_generations ({self.num_generations})."
             )
 
+        # Token-level losses normalize by the tokens of each optimizer step, so a step and a generation batch must
+        # not straddle each other's boundaries
+        if (
+            self.loss_type == "dapo"
+            and self.distillation_weight < 1.0
+            and self.steps_per_generation % self.gradient_accumulation_steps != 0
+            and self.gradient_accumulation_steps % self.steps_per_generation != 0
+        ):
+            raise ValueError(
+                f"steps_per_generation ({self.steps_per_generation}) and gradient_accumulation_steps "
+                f"({self.gradient_accumulation_steps}) must be multiples of one another when loss_type='{self.loss_type}'."
+            )
+
         if self.do_eval and self.eval_strategy != "no":
             num_generations_eval = self.num_generations_eval or self.num_generations
             if (self.per_device_eval_batch_size * num_processes) % num_generations_eval != 0:
