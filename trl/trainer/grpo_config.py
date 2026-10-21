@@ -70,8 +70,7 @@ class GRPOConfig(_BaseConfig):
             save computation. If `None`, uses the value of `num_generations`.
         max_completion_length (`int` or `None`, *optional*, defaults to `512`):
             Maximum length of the generated completion. With `tools` or `environment_factory`, it caps the whole
-            multi-turn completion after the prompt (all model turns plus tool results), unlike [`AsyncGRPOConfig`],
-            where it caps each turn.
+            multi-turn completion after the prompt (all model turns plus tool results).
         ds3_gather_for_generation (`bool`, *optional*, defaults to `True`):
             This setting applies to DeepSpeed ZeRO-3. If enabled, the policy model weights are gathered for generation,
             improving generation speed. However, disabling this option allows training models that exceed the VRAM
@@ -542,8 +541,7 @@ class GRPOConfig(_BaseConfig):
         default=512,
         metadata={
             "help": "Maximum length of the generated completion. With `tools` or `environment_factory`, it caps the "
-            "whole multi-turn completion after the prompt (all model turns plus tool results), unlike "
-            "`AsyncGRPOConfig`, where it caps each turn."
+            "whole multi-turn completion after the prompt (all model turns plus tool results)."
         },
     )
     ds3_gather_for_generation: bool = field(
