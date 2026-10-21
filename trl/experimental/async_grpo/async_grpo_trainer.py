@@ -24,7 +24,7 @@ import shutil
 import textwrap
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from multiprocessing.queues import Queue as MPQueue
@@ -243,11 +243,11 @@ class _TrainBeginCallback(TrainerCallback):
 class _EpochStopCallback(TrainerCallback):
     """Stop after `num_train_epochs` full passes over the prompt dataset.
 
-    An epoch is counted in distinct prompt-groups consumed: trained (accumulated in the collator, which runs on the
-    main process just before the model forward) or dropped for zero advantage. This is fork-independent: all
-    generations of a prompt and all forked rows of a conversation share one `group_id`, so a conversation forking into
-    many rows still counts once. Only the main process collates (`dispatch_batches=True`), so the stop decision is
-    reduced across ranks to keep data-parallel workers in lockstep.
+    An epoch is counted in distinct prompt-groups consumed: trained (recorded by the collator on the main process and
+    counted once their micro-batch is trained) or dropped for zero advantage. This is fork-independent: all generations
+    of a prompt and all forked rows of a conversation share one `group_id`, so a conversation forking into many rows
+    still counts once. Only the main process collates (`dispatch_batches=True`), so the stop decision is reduced across
+    ranks to keep data-parallel workers in lockstep.
     """
 
     def __init__(self, trainer: "AsyncGRPOTrainer", target_groups: int):
@@ -600,9 +600,9 @@ class DataCollatorForRollout(DataCollatorMixin):
     pad_token_id: int
     num_processes: int = 1
     return_tensors: str = "pt"
-    # Distinct prompt-group ids, it counts exactly the prompt-groups that get trained
-    groups_trained: set[int] = field(default_factory=set)
-    # The trainer's metric sink, shared by reference (like `groups_trained`).
+    # Prompt-group ids of each collated micro-batch, which the trainer counts as trained once it trains on them
+    pending_groups: deque[list[int]] = field(default_factory=deque)
+    # The trainer's metric sink, shared by reference (like `pending_groups`).
     metrics: dict[str, list] = field(default_factory=lambda: defaultdict(list))
     # Per-row token cap of the planner,
     token_budget: int = 0
@@ -625,7 +625,7 @@ class DataCollatorForRollout(DataCollatorMixin):
         batch["attention_mask"] = pad([torch.ones_like(p["input_ids"]) for p in packed], padding_value=0)
 
         all_examples = [example for row in rows for example in row.samples]
-        self.groups_trained.update(example["group_id"] for example in all_examples)
+        self.pending_groups.append([example["group_id"] for example in all_examples])
 
         # Repeated per rank so that DataLoaderDispatcher (dispatch_batches=True) slices correctly on dim=0
         n_trained_tokens = sum(p["token_index"].numel() for p in packed)
@@ -1284,6 +1284,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
         # prompt-groups trained (fork-independent).
         self._trained_groups: set[int] = set()
         self._dropped_groups: set[int] = set()
+        self._pending_groups: deque[list[int]] = deque()
         # Tracks restart to match `num_train_epochs`
         self._groups_before_resume = 0
         self._epoch_stop_groups: int | None = None
@@ -1508,7 +1509,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 collate_fn=DataCollatorForRollout(
                     self.processing_class.pad_token_id,
                     num_processes,
-                    groups_trained=self._trained_groups,
+                    pending_groups=self._pending_groups,
                     metrics=self._metrics["train"],
                     # `or 0` because only rank 0 fills an unset budget from the vLLM server above; the other ranks
                     # construct the collator (and never use it) while `token_budget` is still `None`.
@@ -1717,6 +1718,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
     def training_step(self, model, inputs, num_items_in_batch):
         time_before = time.perf_counter()
         output = super().training_step(model, inputs, num_items_in_batch)
+        # The dataloader collates ahead of training, so a micro-batch's groups count as trained only here
+        if self.accelerator.is_main_process:
+            self._trained_groups.update(self._pending_groups.popleft())
         self._step_microbatches += 1
         self._current_train_step_time += time.perf_counter() - time_before
         return output
@@ -1997,6 +2001,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
         # When resuming, pass the saved prompt position to the worker before _StartRolloutWorkerCallback fires.
         # Skipped for IterableDataset since len() isn't available on streaming datasets.
         # Always reset first so a stale value from a prior train() call is never carried over.
+        self._pending_groups.clear()
         if isinstance(self.rollout_worker, AsyncRolloutWorker):
             self.rollout_worker._loop_kwargs["dataset_start_index"] = 0
             self._groups_before_resume = 0
