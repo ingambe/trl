@@ -1836,15 +1836,21 @@ def compute_flops_per_token(config: PretrainedConfig, seq_len: int) -> int:
         mlp_flops = 2 * 3 * h * config.intermediate_size
         total_layer_flops = L * (attn_flops + mlp_flops)
     else:
-        # Routed experts (gate + up + down, 3 matmuls each) + router.
-        if Version(transformers.__version__) >= Version("5.1.0"):
-            num_experts = config.num_local_experts
+        # Routed experts (gate + up + down, 3 matmuls each) + router. Mixtral, GPT-OSS and OLMoE size experts with
+        # `intermediate_size` and have no dense layers.
+        if config.model_type in ("mixtral", "gpt_oss"):
+            num_experts, moe_intermediate_size, sparse_step = config.num_local_experts, config.intermediate_size, 1
+        elif config.model_type == "olmoe":
+            num_experts, moe_intermediate_size, sparse_step = config.num_experts, config.intermediate_size, 1
         else:
-            num_experts = config.num_experts
-        moe_mlp_flops = num_experts_per_tok * 2 * 3 * h * config.moe_intermediate_size
+            if config.model_type == "qwen3_moe" and Version(transformers.__version__) >= Version("5.1.0"):
+                num_experts = config.num_local_experts
+            else:
+                num_experts = config.num_experts
+            moe_intermediate_size, sparse_step = config.moe_intermediate_size, config.decoder_sparse_step
+        moe_mlp_flops = num_experts_per_tok * 2 * 3 * h * moe_intermediate_size
         moe_mlp_flops += 2 * h * num_experts
         dense_mlp_flops = 2 * 3 * h * config.intermediate_size  # interspersed dense layers
-        sparse_step = config.decoder_sparse_step
         total_layer_flops = sum(
             attn_flops + (moe_mlp_flops if layer_idx % sparse_step == 0 else dense_mlp_flops) for layer_idx in range(L)
         )

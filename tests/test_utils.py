@@ -2198,6 +2198,10 @@ class TestComputeFlopsPerToken(TrlTestCase):
         cfg.head_dim = cfg.hidden_size // cfg.num_attention_heads
         assert compute_flops_per_token(cfg, 16384) == derived
 
+    @pytest.mark.parametrize("model_type", ["mixtral", "olmoe", "gpt_oss", "qwen2_moe"])
+    def test_moe_config_field_names(self, model_type):
+        assert compute_flops_per_token(AutoConfig.for_model(model_type), 16384) > 0
+
 
 class TestGetPeakFlops:
     @pytest.mark.parametrize(
