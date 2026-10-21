@@ -77,9 +77,8 @@ class AsyncGRPOConfig(_BaseConfig):
             value between 0.0 and 1.0. Typical values are in the 0.01-0.2 range. Above `0.0`, `top_k` must be set too,
             with the server flags described under `top_p`.
         repetition_penalty (`float`, *optional*, defaults to `1.0`):
-            Float that penalizes new tokens based on whether they appear in the prompt and the generated text so far.
-            Values > 1.0 encourage the model to use new tokens, while values < 1.0 encourage the model to repeat
-            tokens.
+            Must be `1.0`: the trainer cannot replay a penalty on its log-probabilities, so every importance ratio
+            would be biased.
         chat_template_kwargs (`dict[str, Any]`, *optional*):
             Additional keyword arguments to pass to the `apply_chat_template` function when generating completions.
         max_tool_calling_iterations (`int`, *optional*):
@@ -287,16 +286,12 @@ class AsyncGRPOConfig(_BaseConfig):
         default=None,
         metadata={
             "help": "Minimum token probability, which will be scaled by the probability of the most likely token. It "
-            "must be a value between 0.0 and 1.0. Typical values are in the 0.01-0.2 range."
+            "must be a value between 0.0 and 1.0. Typical values are in the 0.01-0.2 range. Needs `top_k > 0`."
         },
     )
     repetition_penalty: float = field(
         default=1.0,
-        metadata={
-            "help": "Float that penalizes new tokens based on whether they appear in the prompt and the generated "
-            "text so far. Values > 1.0 encourage the model to use new tokens, while values < 1.0 encourage the model "
-            "to repeat tokens."
-        },
+        metadata={"help": "Must be 1.0: the trainer cannot replay a penalty on its log-probabilities."},
     )
     chat_template_kwargs: dict | str | None = field(
         default=None,
@@ -452,10 +447,16 @@ class AsyncGRPOConfig(_BaseConfig):
         if self.score_centering and self.num_sampler_logprobs < 1:
             raise ValueError("`score_centering=True` needs `num_sampler_logprobs >= 1`.")
 
-        if (self.top_p < 1.0 or (self.min_p or 0.0) > 0.0) and self.top_k == 0:
+        if (self.top_p < 1.0 or (self.min_p or 0.0) > 0.0) and self.top_k <= 0:
             raise ValueError(
                 "`top_p < 1.0` or `min_p > 0.0` needs `top_k > 0`: vLLM bounds the candidate set it returns for each "
                 "sampled token with `top_k` (e.g. `top_k=512`)."
+            )
+
+        if self.repetition_penalty != 1.0:
+            raise ValueError(
+                f"`repetition_penalty={self.repetition_penalty}` is not supported: the trainer cannot replay the "
+                "penalty on its log-probabilities, so every importance ratio would be biased."
             )
 
         if self.num_generations < 2:
