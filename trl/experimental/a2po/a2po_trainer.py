@@ -123,7 +123,11 @@ class A2POTrainer(_BaseTrainer):
 
         # Some models (e.g. SmolVLM/Idefics3) don't support the `logits_to_keep` argument and error out if we pass it.
         # Inspect the forward method so Stage 2 can pass the argument only when it is supported.
-        self.model_kwarg_keys = inspect.signature(model.forward).parameters.keys()
+        self.model_kwarg_keys = (
+            inspect.signature(model.forward).parameters.keys()
+            if not hasattr(model, "get_base_model")
+            else inspect.signature(model.get_base_model().forward).parameters.keys()
+        )
 
         # Reference model: a frozen copy of the initial policy. Stage 1 samples from it and Stage 2 regularizes to it.
         self.ref_model = create_reference_model(model)
@@ -207,6 +211,8 @@ class A2POTrainer(_BaseTrainer):
 
     def _get_sequence_logps(self, model, input_ids, attention_mask, logits_to_keep):
         model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
+        if "position_ids" in self.model_kwarg_keys:
+            model_inputs["position_ids"] = (attention_mask.cumsum(-1) - 1).clamp(min=0)
         # Only pass `logits_to_keep` when the model supports it (some models and VLMs don't).
         if "logits_to_keep" in self.model_kwarg_keys:
             # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded

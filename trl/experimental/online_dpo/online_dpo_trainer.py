@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 import re
 import textwrap
@@ -303,6 +304,14 @@ class OnlineDPOTrainer(_BaseTrainer):
                 )
         self.is_encoder_decoder = model.config.is_encoder_decoder
         self.is_vision_model = model.config.model_type in MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES.keys()
+
+        # Some models (e.g. Bloom, Mamba) don't accept `position_ids`. Inspect the forward method before we wrap the
+        # model with PEFT
+        self.model_kwarg_keys = (
+            inspect.signature(model.forward).parameters.keys()
+            if not hasattr(model, "get_base_model")
+            else inspect.signature(model.get_base_model().forward).parameters.keys()
+        )
 
         # PEFT
         if peft_config is not None:
@@ -1163,6 +1172,8 @@ class OnlineDPOTrainer(_BaseTrainer):
                 model_kwargs["image_sizes"] = vision_inputs["image_sizes"]
             if "image_grid_thw" in vision_inputs:
                 model_kwargs["image_grid_thw"] = vision_inputs["image_grid_thw"]
+        if not self.is_vision_model and "position_ids" in self.model_kwarg_keys:
+            model_kwargs["position_ids"] = (prompt_completion_mask.cumsum(-1) - 1).clamp(min=0)
 
         # Get the logprobs of the completions from the model
         output = model(prompt_completion_ids, **model_kwargs)

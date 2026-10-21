@@ -250,6 +250,33 @@ class TestGRPOTrainer(TrlTestCase):
             train_dataset=dataset,
         )
 
+    def test_compute_loss_ignores_left_padding(self):
+        # GPT-2 has absolute position embeddings, so shifted positions would change the log-probabilities
+        trainer = GRPOTrainer(
+            model="trl-internal-testing/tiny-GPT2LMHeadModel",
+            reward_funcs="trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5",
+            args=GRPOConfig(output_dir=self.tmp_dir, report_to="none"),
+            train_dataset=load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train"),
+        )
+        trainer.model.eval()  # disable dropout
+        device = trainer.accelerator.device
+
+        grads = []
+        for num_pads in [0, 2]:
+            inputs = {
+                "prompt_ids": torch.tensor([[0] * num_pads + [11, 12, 13]], device=device),
+                "prompt_mask": torch.tensor([[0] * num_pads + [1, 1, 1]], device=device),
+                "completion_ids": torch.tensor([[14, 15, 16]], device=device),
+                "completion_mask": torch.ones(1, 3, dtype=torch.long, device=device),
+                "advantages": torch.tensor([1.0], device=device),
+                "num_items_in_batch": torch.tensor(3, device=device),
+            }
+            trainer.model.zero_grad()
+            trainer.compute_loss(trainer.model, inputs).backward()
+            grads.append(trainer.model.get_input_embeddings().weight.grad.clone())
+
+        torch.testing.assert_close(grads[0], grads[1])
+
     @pytest.mark.parametrize(
         "model_id",
         [
