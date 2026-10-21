@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from collections import defaultdict
 from copy import deepcopy
 from types import SimpleNamespace
@@ -38,6 +39,7 @@ def iw_opd_loss_trainer(request, tiny_llama):
     trainer.model.eval()
     teacher.eval()
     trainer.teacher_model = None if use_teacher_server else teacher
+    trainer.model_kwarg_keys = trainer.teacher_model_kwarg_keys = inspect.signature(teacher.forward).parameters.keys()
     trainer._local_teacher_tokenizer_matches_student = True
     trainer.use_teacher_server = use_teacher_server
     trainer.distillation_objective = objective

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import random
 import textwrap
 import warnings
@@ -442,6 +443,14 @@ class IWOPDTrainer(_BaseTrainer):
             model.config.get_text_config().pad_token_id = processing_class.pad_token_id
             model.generation_config.pad_token_id = processing_class.pad_token_id
 
+        # Some models (e.g. Bloom, Mamba) don't accept `position_ids`. Inspect the forward method before we wrap the
+        # model with PEFT
+        self.model_kwarg_keys = (
+            inspect.signature(model.forward).parameters.keys()
+            if not hasattr(model, "get_base_model")
+            else inspect.signature(model.get_base_model().forward).parameters.keys()
+        )
+
         # ── PEFT ──
         if peft_config is not None:
             if not is_peft_available():
@@ -565,6 +574,11 @@ class IWOPDTrainer(_BaseTrainer):
         if teacher_model is not None:
             if self._local_teacher_tokenizer_matches_student:
                 teacher_model.resize_token_embeddings(self.model.config.get_text_config().vocab_size)
+            self.teacher_model_kwarg_keys = (
+                inspect.signature(teacher_model.forward).parameters.keys()
+                if not hasattr(teacher_model, "get_base_model")
+                else inspect.signature(teacher_model.get_base_model().forward).parameters.keys()
+            )
             if self.is_deepspeed_enabled:
                 self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
             else:
@@ -1353,11 +1367,11 @@ class IWOPDTrainer(_BaseTrainer):
         """Get teacher logits — dispatches between local model and external server."""
         if self.teacher_model is not None:
             self.teacher_model.eval()
+            model_inputs = {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]}
+            if "position_ids" in self.teacher_model_kwarg_keys:
+                model_inputs["position_ids"] = (inputs["attention_mask"].cumsum(-1) - 1).clamp(min=0)
             with torch.no_grad():
-                return self.teacher_model(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                ).logits
+                return self.teacher_model(**model_inputs).logits
         elif self.use_teacher_server:
             raise NotImplementedError(
                 "Fetching full teacher logits with use_teacher_server=True is not supported. "
@@ -1568,10 +1582,10 @@ class IWOPDTrainer(_BaseTrainer):
         self._raise_if_local_teacher_tokenizer_mismatch()
 
         # Student forward pass
-        student_outputs = model(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-        )
+        model_inputs = {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]}
+        if "position_ids" in self.model_kwarg_keys:
+            model_inputs["position_ids"] = (inputs["attention_mask"].cumsum(-1) - 1).clamp(min=0)
+        student_outputs = model(**model_inputs)
         prompt_length = self._compute_prompt_length(inputs)
         labels = inputs["labels"][:, prompt_length:]
         completion_tokens = inputs["input_ids"][:, prompt_length:]

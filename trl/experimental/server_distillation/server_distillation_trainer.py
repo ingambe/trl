@@ -299,10 +299,10 @@ class ServerDistillationTrainer(DistillationTrainer):
         }
 
         # Student forward pass
-        student_outputs = model(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-        )
+        model_inputs = {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]}
+        if not self._is_vlm and "position_ids" in self.model_kwarg_keys:
+            model_inputs["position_ids"] = (inputs["attention_mask"].cumsum(-1) - 1).clamp(min=0)
+        student_outputs = model(**model_inputs)
         prompt_length = self._compute_prompt_length(inputs)
         labels = inputs["labels"][:, prompt_length:]
         completion_tokens = inputs["input_ids"][:, prompt_length:]

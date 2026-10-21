@@ -366,6 +366,14 @@ class GRPOTrainer(_BaseTrainer):
         # Non-quantized models do not have the `is_loaded_in_{8,4}bit` attributes, whereas quantized models do
         _is_quantized_model = getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False)
 
+        # Some models (e.g. Bloom, Mamba) don't accept `position_ids`. Inspect the forward method before we wrap the
+        # model with PEFT
+        self.model_kwarg_keys = (
+            inspect.signature(model.forward).parameters.keys()
+            if not hasattr(model, "get_base_model")
+            else inspect.signature(model.get_base_model().forward).parameters.keys()
+        )
+
         # Processing class
         if processing_class is None:
             processor_class = AutoProcessor if model_accepts_images(model) else AutoTokenizer
@@ -1549,6 +1557,8 @@ class GRPOTrainer(_BaseTrainer):
 
             # Build model inputs
             model_inputs = {"input_ids": input_ids_batch, "attention_mask": attention_mask_batch}
+            if not self._is_vlm and "position_ids" in self.model_kwarg_keys:
+                model_inputs["position_ids"] = (attention_mask_batch.cumsum(-1) - 1).clamp(min=0)
             if num_images is not None:
                 cum_imgs = torch.tensor([0] + num_images).cumsum(0)
                 img_start, img_end = cum_imgs[start], cum_imgs[end]
