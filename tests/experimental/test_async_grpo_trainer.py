@@ -1838,12 +1838,10 @@ class TestGenerateOneTurn(TrlTestCase):
         asyncio.run(run())
         assert len(calls) == 1
 
-    def _check(self, loop, model_config, paths, version="0.31.0"):
+    def _check(self, loop, model_config, paths):
         class FakeSession:
             def get(self, url, **kwargs):
-                if url.endswith("/version"):
-                    body = {"version": version}
-                elif url.endswith("/server_info"):
+                if url.endswith("/server_info"):
                     body = {"vllm_config": {"model_config": model_config}}
                 else:
                     body = {"paths": paths}
@@ -1873,24 +1871,11 @@ class TestGenerateOneTurn(TrlTestCase):
             self._check(loop, {"return_sampling_mask": False}, {"/inference/v1/generate": {}})
         with pytest.raises(RuntimeError, match="--enable-scale-out"):
             self._check(loop, {"return_sampling_mask": True}, {"/v1/completions": {}})
-        with pytest.raises(RuntimeError, match="vLLM server \\(>= 0.28\\)"):
+        with pytest.raises(RuntimeError, match="Start the vLLM server with"):
             self._check(loop, {}, {"/inference/v1/generate": {}})
         loop = _rollout_loop()
         loop.session = None
         asyncio.run(loop._check_sampling_replay())
-
-    def test_older_vllm_keeps_the_full_vocabulary(self, caplog):
-        # A vLLM too old to record the set keeps the completions path, with a warning about the biased ratio
-        PartialState()  # accelerate's logger reads it
-        loop = _rollout_loop(top_p=0.9, top_k=4)
-        with caplog.at_level("WARNING"):
-            self._check(loop, {}, {"/v1/completions": {}}, version="0.27.1")
-        assert "vLLM 0.27.1" in caplog.text
-        response = {"choices": [{"token_ids": [4], "logprobs": {"token_logprobs": [-0.1]}}]}
-        requests, (ids, logprobs, sampling_mask) = self._generate(loop, response)
-        assert requests[0][0] == "/v1/completions"
-        assert requests[0][1]["top_p"] == 0.9
-        assert sampling_mask is None
 
     def test_top_p_requires_top_k(self):
         with pytest.raises(ValueError, match="top_k"):
