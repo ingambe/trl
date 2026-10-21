@@ -542,6 +542,22 @@ class IWOPDConfig(_BaseConfig):
                 f"(got loss_top_k={self.loss_top_k}). Mixed forward/reverse distillation with an external teacher "
                 "is only implemented for top-1 support."
             )
+        if (
+            self.use_teacher_server
+            and self.temperature != 1.0
+            and (
+                self.loss_add_tail
+                or self.distillation_objective == "iw_opd"
+                or self.beta == 1
+                or (self.beta == 0 and self.loss_top_k == 1)
+            )
+        ):
+            raise ValueError(
+                "vLLM scores the teacher's tokens at temperature 1, and only a distribution renormalized over at least "
+                "two returned tokens can be rescaled to another temperature exactly. Use `distillation_objective='jsd'` "
+                "and `loss_add_tail=False` with `0 < beta < 1`, or with `beta=0` and `loss_top_k > 1`, or use "
+                "`temperature=1.0`."
+            )
         if self.reverse_kl_top_1_mode != "sampled" and (self.beta == 0 or self.loss_top_k != 1):
             warnings.warn(
                 f"reverse_kl_top_1_mode='{self.reverse_kl_top_1_mode}' has no effect when beta={self.beta} "

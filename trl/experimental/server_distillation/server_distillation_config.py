@@ -105,3 +105,11 @@ class ServerDistillationConfig(DistillationConfig):
                 f"loss_top_k must be 1 with beta>0 (got loss_top_k={self.loss_top_k}). Mixed forward/reverse "
                 "distillation with an external teacher is only implemented for top-1 support."
             )
+        # The trainer scores at the sampling temperature, which `generation_kwargs` can override
+        temperature = (self.generation_kwargs or {}).get("temperature") or self.temperature
+        if temperature != 1.0 and (self.loss_add_tail or self.beta == 1 or (self.beta == 0 and self.loss_top_k == 1)):
+            raise ValueError(
+                "vLLM scores the teacher's tokens at temperature 1, and only a distribution renormalized over at least "
+                "two returned tokens can be rescaled to another temperature exactly. Set `loss_add_tail=False` with "
+                "`0 < beta < 1`, or with `beta=0` and `loss_top_k > 1`, or use `temperature=1.0`."
+            )
