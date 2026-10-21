@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+from unittest.mock import patch
+
 import pytest
 import torch
 from datasets import Dataset, DatasetDict, features, load_dataset
@@ -556,3 +559,31 @@ class TestOnlineDPOVisionTrainer(TrlTestCase):
         trainer.train()
 
         assert trainer.state.log_history[-1]["train_loss"] is not None
+
+
+def test_vllm_kv_cache_dtype_reaches_vllm(tiny_llama, tmp_path):
+    model, tokenizer = tiny_llama
+    with (
+        patch("trl.experimental.online_dpo.online_dpo_trainer.is_vllm_available", return_value=True),
+        patch("trl.experimental.online_dpo.online_dpo_trainer.LLM", create=True) as llm,
+        patch("trl.experimental.online_dpo.online_dpo_trainer.SamplingParams", create=True),
+        patch.dict(os.environ),  # colocated vLLM sets RANK, LOCAL_RANK and WORLD_SIZE
+    ):
+        OnlineDPOTrainer(
+            model=model,
+            processing_class=tokenizer,
+            reward_funcs=lambda completions, **kwargs: [0.0] * len(completions),
+            args=OnlineDPOConfig(
+                output_dir=str(tmp_path),
+                report_to="none",
+                per_device_train_batch_size=2,
+                use_vllm=True,
+                vllm_mode="colocate",
+                vllm_kv_cache_dtype="fp8_per_token_head",
+                vllm_kv_cache_dtype_skip_layers=["0"],
+            ),
+            train_dataset=Dataset.from_dict({"prompt": ["a", "a"]}),
+        )
+
+    assert llm.call_args.kwargs["kv_cache_dtype"] == "fp8_per_token_head"
+    assert llm.call_args.kwargs["kv_cache_dtype_skip_layers"] == ["0"]
