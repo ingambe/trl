@@ -2543,6 +2543,32 @@ class TestGRPOTrainer(TrlTestCase):
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
+    def test_train_with_temperature_in_generation_kwargs(self):
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+
+        def train(**kwargs):
+            training_args = GRPOConfig(
+                output_dir=self.tmp_dir,
+                learning_rate=0.1,
+                per_device_train_batch_size=3,
+                num_generations=3,
+                max_completion_length=8,
+                max_steps=1,
+                report_to="none",
+                **kwargs,
+            )
+            trainer = GRPOTrainer(
+                model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+                reward_funcs=lambda completions, **kwargs: [float(len(c)) for c in completions],
+                args=training_args,
+                train_dataset=dataset,
+            )
+            trainer.train()
+            return list(trainer.model.parameters())
+
+        for a, b in zip(train(temperature=0.5), train(generation_kwargs={"temperature": 0.5}), strict=True):
+            torch.testing.assert_close(a, b)
+
     @require_vllm
     @pytest.mark.skip(reason="We should add a mock for the vLLM server.")
     def test_train_vllm_with_additional_generation_kwargs(self):
