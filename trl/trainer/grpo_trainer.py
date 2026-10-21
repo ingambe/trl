@@ -3648,7 +3648,7 @@ class GRPOTrainer(_BaseTrainer):
                 values = [nanmax(value) for value in values]
             gathered = self.accelerator.gather(torch.stack(values)).unflatten(0, (self.accelerator.num_processes, -1))
             if reduction == "ratio":
-                values = gathered[..., 0].sum(0) / gathered[..., 1].sum(0).clamp(min=1.0)
+                values = (gathered[..., 0].sum() / gathered[..., 1].sum().clamp(min=1.0)).view(1)
             elif reduction == "mean":
                 values = gathered.nanmean(0)
             elif reduction == "min":

@@ -1747,9 +1747,7 @@ class DPOTrainer(_BaseTrainer):
             if reduction == "num_tokens":
                 self._metric_num_tokens[mode][key] += gathered.sum().item()
             elif reduction == "ratio":
-                self._metrics[mode][key].extend(
-                    (gathered[..., 0].sum(0) / gathered[..., 1].sum(0).clamp(min=1)).tolist()
-                )
+                self._metrics[mode][key].append((gathered[..., 0].sum() / gathered[..., 1].sum().clamp(min=1)).item())
             elif reduction == "sum":
                 self._metrics[mode][key].extend(gathered.sum(0).tolist())
             else:
