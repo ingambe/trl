@@ -252,7 +252,8 @@ def _jsd_loss_chunk(
     neg_inf = torch.full((), float("-inf"), dtype=student_log_probs_full.dtype, device=student_log_probs_full.device)
     student_support_logps = student_log_probs_full.gather(-1, target_ids_chunk.clamp_min(0))
     student_support_logps = torch.where(candidate_mask_chunk, student_support_logps, neg_inf)
-    teacher_support_logps = torch.where(candidate_mask_chunk, teacher_logps_chunk, neg_inf)
+    # vLLM scores at temperature 1; rescaling is exact once the loss renormalizes over the top-k
+    teacher_support_logps = torch.where(candidate_mask_chunk, teacher_logps_chunk / temperature, neg_inf)
 
     if add_tail_bucket:
         student_log_probs, support_mask = _add_tail_bucket(student_support_logps, candidate_mask_chunk)
@@ -1483,7 +1484,6 @@ class AsyncDistillationTrainer(_BaseTrainer):
                     vllm_server_url=self.args.vllm_server_base_url,
                     teacher_server_urls=self.args.teacher_server_urls,
                     teacher_top_k=self.args.teacher_top_k,
-                    teacher_temperature=self.args.teacher_temperature,
                     max_tokens=self.args.max_completion_length,
                     temperature=self.args.temperature,
                     top_p=self.args.top_p,

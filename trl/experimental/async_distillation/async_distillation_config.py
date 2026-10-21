@@ -78,12 +78,11 @@ class AsyncDistillationConfig(_BaseConfig):
             Teacher vLLM server(s), each started with `vllm serve <teacher-model> --logprobs-mode processed_logprobs
             --max-logprobs -1`. Every teacher is static: this trainer never streams weight updates to any of them, so a
             teacher needs neither `VLLM_SERVER_DEV_MODE` nor a weight-transfer backend, only those two flags, which
-            make its scoring exact (see `teacher_temperature` and `teacher_top_k`). Every teacher must share the
-            student's tokenizer: completions are sent as raw token ids, and the ids a teacher reports back are used
-            directly to index the student's own vocabulary in `compute_loss`. A teacher with a different vocabulary
-            trains against the wrong tokens, silently if its vocabulary is no larger than the student's. Scoring is a
-            teacher-forced request against the student's own completion tokens (`max_tokens=1`,
-            `prompt_logprobs=teacher_top_k`, `temperature=teacher_temperature`), the same request
+            make its scoring exact (see `teacher_top_k`). Every teacher must share the student's tokenizer: completions
+            are sent as raw token ids, and the ids a teacher reports back are used directly to index the student's own
+            vocabulary in `compute_loss`. A teacher with a different vocabulary trains against the wrong tokens,
+            silently if its vocabulary is no larger than the student's. Scoring is a teacher-forced request against the
+            student's own completion tokens (`max_tokens=1`, `prompt_logprobs=teacher_top_k`), the same request
             [`~trl.generation.vllm_client.VLLMClient.get_sequence_logprobs`] issues for the synchronous server-teacher
             trainers. A single entry scores every sample (plain single-teacher on-policy distillation, the default).
             Multiple entries enable MOPD (multi-teacher on-policy distillation, see
@@ -111,13 +110,12 @@ class AsyncDistillationConfig(_BaseConfig):
             vocabulary; anything wider would only be a probabilistic approximation of covering the student's own likely
             tokens, not a guarantee.
         teacher_temperature (`float`, *optional*, defaults to `1.0`):
-            Softmax temperature of the divergence, applied to *both* sides: sent to the teacher so vLLM computes its
-            logprobs at this temperature server-side (exact, not a client-side rescaling), and applied to the student's
-            own logits in `compute_loss`, mirroring
+            Softmax temperature of the divergence, applied to *both* sides: to the teacher's returned logprobs, which
+            vLLM always scores at temperature 1, and to the student's own logits in `compute_loss`, mirroring
             [`~trl.experimental.server_distillation.ServerDistillationTrainer`]'s single `temperature`. Unrelated to
-            `temperature`, which only controls how the student samples its completions. The teacher's server must run
-            with `--logprobs-mode processed_logprobs` for this to reach its returned logprobs at all; without it the
-            teacher silently reports raw logprobs and this setting only affects the student's side.
+            `temperature`, which only controls how the student samples its completions. Rescaling the teacher is exact
+            only over its renormalized top-k, so values other than `1.0` need `add_tail_bucket=False` and a support of
+            at least two tokens (not `beta=1.0`).
         teacher_top_k (`int`, *optional*, defaults to `8`):
             Number of per-position candidate tokens requested from the teacher via `prompt_logprobs`. Only these
             candidates (plus the realized token, which vLLM always reports even when it falls outside the top-k, plus a
@@ -315,8 +313,8 @@ class AsyncDistillationConfig(_BaseConfig):
     teacher_temperature: float = field(
         default=1.0,
         metadata={
-            "help": "Softmax temperature of the divergence, applied to both the teacher's returned logprobs "
-            "(server-side) and the student's own logits. Unrelated to `temperature`, which controls sampling."
+            "help": "Softmax temperature of the divergence, applied to both the teacher's returned logprobs and the "
+            "student's own logits. Unrelated to `temperature`, which controls sampling."
         },
     )
     teacher_top_k: int = field(
@@ -398,6 +396,14 @@ class AsyncDistillationConfig(_BaseConfig):
 
         if self.beta < 0.0 or self.beta > 1.0:
             raise ValueError(f"beta must be in [0.0, 1.0], got {self.beta}.")
+        if self.teacher_temperature != 1.0 and (
+            self.add_tail_bucket or self.beta == 1.0 or (self.beta == 0.0 and self.teacher_top_k == 1)
+        ):
+            raise ValueError(
+                "vLLM scores the teacher's tokens at temperature 1, and only a distribution renormalized over at least "
+                "two returned tokens can be rescaled to another temperature exactly. Set `add_tail_bucket=False` with "
+                "`0 < beta < 1`, or with `beta=0` and `teacher_top_k > 1`, or use `teacher_temperature=1.0`."
+            )
 
         if self.parallelism_config is not None and (
             self.parallelism_config.cp_enabled or self.parallelism_config.sp_enabled
