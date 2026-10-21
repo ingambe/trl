@@ -41,7 +41,6 @@ from typing import Any, TypeAlias
 import numpy as np
 from accelerate.logging import get_logger
 from datasets import Dataset
-from packaging.version import Version
 from transformers import PreTrainedTokenizerBase
 
 from ...chat_template_utils import (
@@ -572,23 +571,11 @@ class _AsyncRolloutLoop:
     async def _check_sampling_replay(self) -> None:
         """With top-k/top-p, make sure the server returns the candidate set of every sampled token.
 
-        That takes vLLM >= 0.28 started with `--return-sampling-mask` (recorded in its config) and `--enable-scale-out`
-        (the endpoint that returns the set). Checked once up front: without them the first rollout would fail on a
-        route that does not exist, after retrying it for minutes. An older vLLM cannot return the set at all, so it
-        keeps the full-vocabulary normalization, with a warning about the bias.
+        That takes a vLLM server started with `--return-sampling-mask` (recorded in its config) and
+        `--enable-scale-out` (the endpoint that returns the set). Checked once up front: without them the first rollout
+        would fail on a route that does not exist, after retrying it for minutes.
         """
         if not self.sampling_replay:
-            return
-        async with self.session.get(f"{self.vllm_server_url}/version") as r:
-            r.raise_for_status()
-            version = (await r.json())["version"]
-        if Version(version) < Version("0.28.0"):
-            logger.warning(
-                f"vLLM {version} cannot return the candidate set a token was sampled from (vLLM >= 0.28), so with "
-                "top_k/top_p the log-probabilities are normalized over the whole vocabulary and the importance ratio "
-                "is biased."
-            )
-            self.sampling_replay = False
             return
         async with self.session.get(f"{self.vllm_server_url}/server_info", params={"config_format": "json"}) as r:
             r.raise_for_status()
@@ -599,7 +586,7 @@ class _AsyncRolloutLoop:
         if not model_config.get("return_sampling_mask") or "/inference/v1/generate" not in paths:
             raise RuntimeError(
                 "top_k/top_p sampling needs the candidate set of every sampled token, which the trainer renormalizes "
-                "its log-probabilities over. Start the vLLM server (>= 0.28) with "
+                "its log-probabilities over. Start the vLLM server with "
                 "`--return-sampling-mask --enable-scale-out`."
             )
 
@@ -1218,9 +1205,7 @@ class _AsyncRolloutLoop:
         logprobs = [token["logprob"] for token in content]
         sampler_logprobs = None
         if self.num_sampler_logprobs:
-            sampler_logprobs = _by_token_id(
-                [{t["token"]: t["logprob"] for t in token["top_logprobs"]} for token in content]
-            )
+            sampler_logprobs = [{t["token_id"]: t["logprob"] for t in token["top_logprobs"]} for token in content]
         return choice["token_ids"], logprobs, choice["sampling_mask"], sampler_logprobs
 
     async def _score_group(self, group: RolloutGroup) -> list[RolloutSample]:

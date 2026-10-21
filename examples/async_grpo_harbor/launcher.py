@@ -17,7 +17,7 @@
 # dependencies = [
 #     "trl @ git+https://github.com/huggingface/trl.git",
 #     "openenv[harbor] @ git+https://github.com/huggingface/OpenEnv.git@86a180ede21e044f7929b9a7783ad83aa67d83a3",
-#     "vllm>=0.22,<0.26",
+#     "vllm==0.32.0",
 #     "datasets>=3.2",
 #     "trackio",
 #     "transformers>=5.2",
