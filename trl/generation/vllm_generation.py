@@ -590,7 +590,10 @@ class VLLMGeneration:
     def _iter_fsdp_params(self, model: nn.Module):
         """Dispatch FSDP parameter iteration to the version-appropriate method."""
         if self._dist.fsdp_version == 1:
-            yield from self._iter_fsdp1_params(model)
+            # The root FSDP wrapper, which only the prepared model reaches, owns the parameters outside the wrapped
+            # blocks (e.g. the embeddings)
+            root = next(m for m in self.accelerator._models if isinstance(m, FSDP) and m.module is model)
+            yield from self._iter_fsdp1_params(root)
         elif self._dist.fsdp_version == 2:
             yield from self._iter_fsdp2_params(model)
 
