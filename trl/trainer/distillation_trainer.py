@@ -1591,6 +1591,8 @@ class DistillationTrainer(_BaseTrainer):
             backbone = unwrapped_model.model
         else:
             backbone = unwrapped_model.base_model
+        if not self._is_vlm and "position_ids" in inspect.signature(backbone.forward).parameters:
+            model_inputs["position_ids"] = (attention_mask.cumsum(-1) - 1).clamp(min=0)
         last_hidden_state = backbone(**model_inputs).last_hidden_state
         # Exclude the last value: it corresponds to the next token pred
         last_hidden_state = last_hidden_state[:, :-1, :]  # (B, L-1, H)
