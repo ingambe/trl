@@ -169,6 +169,46 @@ class TestSDPOTrainer(TrlTestCase):
             if param.sum() != 0:
                 assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
+    def test_dapo_loss_normalizes_by_optimizer_step_tokens(self):
+        dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
+        # One optimizer step of 4 completions with 1, 3, 5 and 7 tokens
+        completion_mask = (torch.arange(7) < torch.tensor([[1], [3], [5], [7]])).long()
+        inputs = {
+            "prompt_ids": torch.ones(4, 2, dtype=torch.long),
+            "prompt_mask": torch.ones(4, 2, dtype=torch.long),
+            "completion_ids": torch.ones(4, 7, dtype=torch.long),
+            "completion_mask": completion_mask,
+            "advantages": torch.tensor([-1.0, 1.0, -1.0, 1.0]),
+        }
+
+        losses = []
+        for batch_size, accumulation_steps in [(4, 1), (2, 2)]:
+            training_args = SDPOConfig(
+                output_dir=self.tmp_dir,
+                per_device_train_batch_size=batch_size,
+                gradient_accumulation_steps=accumulation_steps,
+                num_generations=2,
+                distillation_weight=0.0,
+                loss_type="dapo",
+                report_to="none",
+            )
+            trainer = SDPOTrainer(
+                model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+                reward_funcs="trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5",
+                args=training_args,
+                train_dataset=dataset,
+            )
+            trainer.model.train()
+            trainer.current_gradient_accumulation_steps = accumulation_steps
+            loss = 0.0
+            for start in range(0, 4, batch_size):
+                micro_batch = {key: value[start : start + batch_size] for key, value in inputs.items()}
+                micro_batch["num_items_in_batch"] = completion_mask.sum()
+                loss += trainer.compute_loss(trainer.model, micro_batch)
+            losses.append(loss)
+
+        torch.testing.assert_close(losses[0], losses[1])
+
     def test_teacher_model_like_model_instance(self):
         # A student passed as an instance has no `model_init_kwargs`: the teacher is built with its dtype and attention
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
