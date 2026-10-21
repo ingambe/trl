@@ -780,7 +780,6 @@ class OnlineDPOTrainer(_BaseTrainer):
         completion_ids = [list(output.outputs[i].token_ids) for i in range(2) for output in outputs]
         prompt_ids = [list(output.prompt_token_ids) for _ in range(2) for output in outputs]
         if self.args.vllm_enable_sleep_mode:
-            self.llm.reset_mm_cache()
             self.llm.sleep(level=2)
 
         return completion_ids, prompt_ids
