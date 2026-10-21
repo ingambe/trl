@@ -59,7 +59,7 @@ class AsyncGRPOConfig(_BaseConfig):
         num_generations (`int`, *optional*, defaults to `8`):
             Number of generations per prompt to sample.
         max_completion_length (`int`, *optional*, defaults to `2048`):
-            Maximum number of tokens generated per vLLM request, so per turn in a multi-turn rollout.
+            Maximum number of tokens generated in a rollout, shared by all its turns.
         temperature (`float`, *optional*, defaults to `1.0`):
             Temperature for sampling. The higher the temperature, the more random the completions.
         top_p (`float`, *optional*, defaults to `1.0`):
@@ -78,7 +78,8 @@ class AsyncGRPOConfig(_BaseConfig):
             Additional keyword arguments to pass to the `apply_chat_template` function when generating completions.
         max_tool_calling_iterations (`int`, *optional*):
             Maximum number of tool-calling turns when training an agent. If `None`, there is no limit and generation
-            stops when the model generates a response turn with no tool calls.
+            stops when the model generates a response turn with no tool calls or when the total response length reaches
+            `max_completion_length`.
 
         > Parameters that control the vLLM server
 
@@ -249,7 +250,7 @@ class AsyncGRPOConfig(_BaseConfig):
     )
     max_completion_length: int = field(
         default=2048,
-        metadata={"help": "Maximum number of tokens generated per vLLM request, so per turn in a multi-turn rollout."},
+        metadata={"help": "Maximum number of tokens generated in a rollout, shared by all its turns."},
     )
     temperature: float = field(
         default=1.0,
@@ -287,7 +288,8 @@ class AsyncGRPOConfig(_BaseConfig):
         default=None,
         metadata={
             "help": "Maximum number of tool-calling turns when training an agent. If `None`, there is no limit and "
-            "generation stops when the model generates a response turn with no tool calls."
+            "generation stops when the model generates a response turn with no tool calls or when the total response "
+            "length reaches `max_completion_length`."
         },
     )
 
