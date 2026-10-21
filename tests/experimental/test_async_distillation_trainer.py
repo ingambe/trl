@@ -409,8 +409,8 @@ class TestPackingAwareBatching:
         assert collator.metrics["batch/pad_frac"] == [(1, 6)]  # the one slot row b was padded with
         assert "batch/row_fill_frac" not in collator.metrics  # no budget passed, so nothing to fill
 
-        # The prompts behind this micro-batch, accumulated for `_EpochStopCallback` to count epochs with.
-        assert collator.prompts_trained == {7, 8}
+        # The prompts behind this micro-batch, counted as trained once the trainer trains on it.
+        assert list(collator.pending_prompts) == [[7, 8]]
 
     def test_collator_packs_teacher_id_per_token_for_mopd(self):
         # Packing concatenates samples from different teachers into one row, so compute_loss can only attribute a
