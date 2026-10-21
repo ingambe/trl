@@ -819,19 +819,29 @@ class SDPOTrainer(_BaseTrainer):
             generate_every = self.args.steps_per_generation * self.num_iterations
             if self._step % generate_every == 0 or self._buffered_inputs is None:
                 buffered_batch = self._prepare_training_batch(generation_batch)
-                self._buffered_inputs = [
-                    send_to_device(batch, "cpu")
-                    for batch in split_tensor_dict(buffered_batch, self.args.steps_per_generation)
-                ]
+                generation_batches = split_tensor_dict(buffered_batch, self.args.steps_per_generation)
+                num_items = [batch["completion_mask"].sum() for batch in generation_batches]
+                self._buffered_num_items = (
+                    self.accelerator.gather(torch.stack(num_items)).view(-1, len(num_items)).sum(0)
+                )
+                self._buffered_inputs = [send_to_device(batch, "cpu") for batch in generation_batches]
                 self._dispatch_self_distillation_callback(
                     "on_generation_batch_built",
                     generate_every=generate_every,
                     steps_per_generation=self.args.steps_per_generation,
                 )
-            return send_to_device(
-                self._buffered_inputs[self._step % self.args.steps_per_generation], self.accelerator.device
-            )
-        return self._prepare_training_batch(generation_batch)
+            index = self._step % self.args.steps_per_generation
+            accumulation_steps = self.current_gradient_accumulation_steps
+            # Loss tokens of the optimizer step, extrapolated when it spans several generation batches
+            start = index - index % accumulation_steps
+            num_items = self._buffered_num_items[start : start + accumulation_steps]
+            num_items_in_batch = num_items.sum() * accumulation_steps / len(num_items)
+            inputs = send_to_device(self._buffered_inputs[index], self.accelerator.device)
+            inputs["num_items_in_batch"] = num_items_in_batch
+            return inputs
+        inputs = self._prepare_training_batch(generation_batch)
+        inputs["num_items_in_batch"] = self.accelerator.gather(inputs["completion_mask"].sum()).sum()
+        return inputs
 
     def _prepare_training_batch(self, inputs: list[dict[str, Any]]) -> TrainingBatch:
         """Sample student rollouts, calculate advantage and construct teacher prompts"""
@@ -1185,7 +1195,12 @@ class SDPOTrainer(_BaseTrainer):
         elif self.loss_type == "dr_grpo":
             loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
         elif self.loss_type == "dapo":
-            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
+            # `num_items_in_batch` counts the optimizer step's tokens and `compute_loss` divides by accumulation steps
+            accumulation_scale = self.current_gradient_accumulation_steps if self.model.training else 1.0
+            normalizer = inputs["num_items_in_batch"].clamp(min=1.0) / (
+                self.accelerator.num_processes * accumulation_scale
+            )
+            loss = (per_token_loss * completion_mask).sum() / normalizer
         else:
             raise ValueError(f"Unsupported loss_type: {self.loss_type}")
 
