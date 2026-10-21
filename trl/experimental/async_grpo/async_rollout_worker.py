@@ -1063,7 +1063,9 @@ class _AsyncRolloutLoop:
                 chat_template=self.chat_template,
                 **self.chat_template_kwargs,
             )
-            turn_ids, turn_logprobs, turn_sampling_mask = await self._generate_one_turn(prompt_ids)
+            turn_ids, turn_logprobs, turn_sampling_mask = await self._generate_one_turn(
+                prompt_ids, self.max_tokens - len(completion_ids)
+            )
             assistant_message = parse_response(self.tokenizer, turn_ids, prefix=prompt_ids, tools=tools)
             completion.append(assistant_message)
             completion_ids.extend(turn_ids)
@@ -1072,7 +1074,8 @@ class _AsyncRolloutLoop:
             tool_calls = assistant_message.get("tool_calls")
             if tool_calls is None:
                 break
-            if max_iterations is not None and iteration_num >= max_iterations:
+            out_of_turns = max_iterations is not None and iteration_num >= max_iterations
+            if out_of_turns or len(completion_ids) >= self.max_tokens:
                 # Cut off mid-loop: the model asked for another tool and we refused. The conversation is trained as if
                 # it had finished, so this is a silent truncation — hence the metric.
                 loop_exhausted = True
@@ -1137,10 +1140,12 @@ class _AsyncRolloutLoop:
         self._rates["tools/parallel_calls_mean"][1] += 1
         return tool_messages, n_calls, n_failures
 
-    async def _generate_one_turn(self, prompt_ids: list[int]) -> tuple[list[int], list[float], list[list[int]] | None]:
+    async def _generate_one_turn(
+        self, prompt_ids: list[int], max_tokens: int
+    ) -> tuple[list[int], list[float], list[list[int]] | None]:
         """Sample one turn: its token ids, their logprobs, and with top-k/top-p the candidate set of each token."""
         sampling_params = {
-            "max_tokens": self.max_tokens,
+            "max_tokens": max_tokens,
             "temperature": self.temperature,
             "top_p": self.top_p,
             "top_k": self.top_k,
