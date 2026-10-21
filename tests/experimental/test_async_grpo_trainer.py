@@ -1916,9 +1916,12 @@ class TestGenerateOneTurn(TrlTestCase):
         loop.session = None
         asyncio.run(loop._check_sampling_replay())
 
-    def test_top_p_requires_top_k(self):
-        with pytest.raises(ValueError, match="top_k"):
-            AsyncGRPOConfig(top_p=0.9)
+    @pytest.mark.parametrize(
+        "kwargs", [{"top_p": 0.9}, {"top_p": 0.9, "top_k": -1}, {"min_p": 0.1}, {"repetition_penalty": 1.1}]
+    )
+    def test_sampling_the_trainer_cannot_replay_is_rejected(self, kwargs):
+        with pytest.raises(ValueError, match="top_k|repetition_penalty"):
+            AsyncGRPOConfig(**kwargs)
 
 
 @require_response_parsing
