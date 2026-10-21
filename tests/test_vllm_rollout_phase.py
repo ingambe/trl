@@ -50,7 +50,6 @@ def test_sleep_does_not_sleep_an_asleep_engine(vllm_generation):
 
 @pytest.mark.parametrize("share_weights", [False, True])
 def test_sleep_resets_the_multimodal_cache(vllm_generation, monkeypatch, share_weights):
-    monkeypatch.setattr("trl.generation.vllm_generation.is_vllm_available", lambda min_version: True)
     monkeypatch.setattr("trl.generation.vllm_generation.CuMemAllocator", Mock(), raising=False)
     vllm_generation.enable_sleep_mode = True
     vllm_generation.share_weights = share_weights

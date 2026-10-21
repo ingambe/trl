@@ -20,8 +20,6 @@ import sys
 import warnings
 from dataclasses import dataclass, field
 
-from trl.import_utils import is_vllm_available
-
 
 @dataclass
 class ScriptArguments:
@@ -204,8 +202,8 @@ def build_command(script_args: ScriptArguments, extra_args: list[str] | None = N
       returned logprobs, which trainers use for importance sampling correction.
     - `--max-logprobs -1`: lifts the OpenAI-compatible cap of 20 logprobs per token, so that trainers can request the
       top-k teacher distribution (used for distillation).
-    - `--enable-scale-out` (vLLM 0.30.0 and later): registers `/v1/chat/completions/render` and
-      `/inference/v1/generate`, used by [`~generation.vllm_client.VLLMClient`] for multimodal prompts.
+    - `--enable-scale-out`: registers `/v1/chat/completions/render` and `/inference/v1/generate`, used by
+      [`~generation.vllm_client.VLLMClient`] for multimodal prompts.
 
     Args:
         script_args (`ScriptArguments`):
@@ -263,9 +261,8 @@ def build_command(script_args: ScriptArguments, extra_args: list[str] | None = N
     if script_args.speculative_config is not None:
         command += ["--speculative-config", script_args.speculative_config]
 
-    if is_vllm_available(min_version="0.30.0"):
-        command += ["--enable-scale-out"]
     command += [
+        "--enable-scale-out",
         "--weight-transfer-config",
         json.dumps({"backend": "nccl"}),
         "--logprobs-mode",

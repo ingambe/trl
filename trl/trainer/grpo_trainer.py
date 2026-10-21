@@ -73,7 +73,7 @@ from ..data_utils import apply_chat_template, is_conversational, prepare_multimo
 from ..distributed import DistributedBackend
 from ..extras.profiling import profiling_context, profiling_decorator
 from ..generation.vllm_generation import VLLMGeneration
-from ..import_utils import is_jmespath_available, is_vllm_available
+from ..import_utils import is_jmespath_available
 from ..models import prepare_deepspeed, prepare_fsdp, unwrap_model_for_generation
 from ..models.utils import disable_gradient_checkpointing
 from .base_trainer import _BaseTrainer
@@ -1187,7 +1187,6 @@ class GRPOTrainer(_BaseTrainer):
                 self.vllm_importance_sampling_correction
                 and filtered_sampling
                 and self.temperature > 0
-                and is_vllm_available(min_version="0.28.0")
             )
             # Initialize vLLM generation backend
             self.vllm_generation = VLLMGeneration(
@@ -1260,8 +1259,8 @@ class GRPOTrainer(_BaseTrainer):
                 # Without the candidate set the grammar leaves, the importance ratio is ~0 and training stalls: #7954
                 raise ValueError(
                     "Structured outputs with the vLLM importance sampling correction need the candidate set of each "
-                    "sampled token, which takes vLLM >= 0.28 and, in server mode, a server started with "
-                    "`--return-sampling-mask` (and `--enable-scale-out` from vLLM 0.30). Alternatively, set "
+                    "sampled token, which in server mode takes a server started with `--return-sampling-mask` and "
+                    "`--enable-scale-out`. Alternatively, set "
                     "`vllm_importance_sampling_correction=False`."
                 )
             if (
@@ -1272,8 +1271,7 @@ class GRPOTrainer(_BaseTrainer):
                 logger.warning(
                     "With top_k/top_p/min_p, the log-probabilities are normalized over the whole vocabulary and the "
                     "importance ratio is biased. Normalizing them over the candidate set a token was sampled from "
-                    "takes vLLM >= 0.28 and, in server mode, a server started with "
-                    "`--return-sampling-mask` (and `--enable-scale-out` from vLLM 0.30)."
+                    "takes, in server mode, a server started with `--return-sampling-mask` and `--enable-scale-out`."
                 )
         else:
             generation_kwargs = {

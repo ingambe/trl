@@ -55,7 +55,7 @@ class GRPOConfig(_BaseConfig):
             the [ScaleRL](https://huggingface.co/papers/2510.13786) recipe. This flag is only supported when the model
             has untied word embedding and language modeling head layers i.e. `tie_word_embeddings` in the model config
             is False. Also applies to vLLM in colocate mode; in server mode, start the server with `--hf-overrides
-            '{"head_dtype": "float32"}'` (vLLM 0.26.0 or later).
+            '{"head_dtype": "float32"}'`.
 
         > Parameters that control the data preprocessing
 
@@ -362,13 +362,12 @@ class GRPOConfig(_BaseConfig):
             recomputed training logprobs. If set to `False`, no IS is applied regardless of
             `vllm_importance_sampling_mode`. When `True`, the selected mode determines how the IS ratios are computed
             and constrained. With `top_p < 1`, `top_k > 0` or `min_p > 0`, the recomputed logprobs are normalized over
-            the candidate set each token was sampled from, which requires vLLM 0.28 or later and, in server mode, a
-            server started with `--return-sampling-mask` (and `--enable-scale-out` from vLLM 0.30); otherwise, the IS
-            ratios are biased. vLLM bounds that candidate set with `top_k`, so `top_p < 1`, `min_p > 0` and structured
-            outputs, which restrict it to the tokens the grammar allows, require `top_k > 0` (e.g. `top_k=512`).
-            Structured outputs, which would otherwise stall training, also require that candidate set. vLLM also
-            applies `repetition_penalty` to the logprobs it returns, so `repetition_penalty != 1.0` requires
-            `vllm_importance_sampling_correction=False`.
+            the candidate set each token was sampled from, which in server mode requires a server started with
+            `--return-sampling-mask` and `--enable-scale-out`; otherwise, the IS ratios are biased. vLLM bounds that
+            candidate set with `top_k`, so `top_p < 1`, `min_p > 0` and structured outputs, which restrict it to the
+            tokens the grammar allows, require `top_k > 0` (e.g. `top_k=512`). Structured outputs, which would
+            otherwise stall training, also require that candidate set. vLLM also applies `repetition_penalty` to the
+            logprobs it returns, so `repetition_penalty != 1.0` requires `vllm_importance_sampling_correction=False`.
         vllm_importance_sampling_mode (`str`, *optional*, defaults to `"sequence_mask"`):
             Specifies how Importance Sampling is performed when `vllm_importance_sampling_correction=True`. Possible
             values are:
@@ -508,7 +507,7 @@ class GRPOConfig(_BaseConfig):
             "As recommended by the [ScaleRL](https://huggingface.co/papers/2510.13786) recipe. This flag is only "
             "supported when the model has untied word embedding and language modeling head layers i.e. "
             "`tie_word_embeddings` in the model config is False. Also applies to vLLM in colocate mode; in server mode, "
-            'start the server with `--hf-overrides \'{"head_dtype": "float32"}\'` (vLLM 0.26.0 or later).'
+            'start the server with `--hf-overrides \'{"head_dtype": "float32"}\'`.'
         },
     )
 
@@ -1039,9 +1038,8 @@ class GRPOConfig(_BaseConfig):
             "completion logprobs and recomputed training logprobs. If set to `False`, no IS is applied "
             "regardless of `vllm_importance_sampling_mode`. When `True`, the selected mode determines how "
             "IS ratios are computed and constrained. With `top_p < 1`, `top_k > 0` or `min_p > 0`, the recomputed "
-            "logprobs are normalized over the candidate set each token was sampled from, which requires "
-            "vLLM 0.28 or later and, in server mode, a server started with `--return-sampling-mask` (and "
-            "`--enable-scale-out` from vLLM 0.30); otherwise, the IS "
+            "logprobs are normalized over the candidate set each token was sampled from, which in server mode "
+            "requires a server started with `--return-sampling-mask` and `--enable-scale-out`; otherwise, the IS "
             "ratios are biased. vLLM bounds that "
             "candidate set with `top_k`, so `top_p < 1`, `min_p > 0` and structured outputs, which restrict it to the "
             "tokens the grammar allows, require `top_k > 0` (e.g. `top_k=512`). Structured outputs, which would "

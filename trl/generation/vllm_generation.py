@@ -50,7 +50,7 @@ if is_peft_available():
 
 if is_vllm_available():
     from vllm import LLM, RequestOutput, SamplingParams
-    from vllm.device_allocator.cumem import CuMemAllocator, unmap_and_release
+    from vllm.device_allocator.cumem import CuMemAllocator
     from vllm.lora.request import LoRARequest
     from vllm.model_executor.models.interfaces import supports_lora
     from vllm.sampling_params import StructuredOutputsParams
@@ -205,7 +205,7 @@ class VLLMGeneration:
         trust_remote_code (`bool`, *optional*, defaults to `False`):
             Trust remote code (e.g., from HuggingFace) when downloading the model and tokenizer.
         cast_lm_head_to_fp32 (`bool`, *optional*, defaults to `False`):
-            Whether to compute the language modeling head in float32 in colocate mode. Requires vLLM 0.26.0 or later.
+            Whether to compute the language modeling head in float32 in colocate mode.
 
         > Parameters for generation:
 
@@ -238,8 +238,8 @@ class VLLMGeneration:
             override them.
         return_sampling_mask (`bool`, *optional*, defaults to `False`):
             Whether to also return, for every sampled token, the set of tokens it was sampled from after top-k, top-p
-            and min-p filtering. Requires vLLM >= 0.28 and `top_k > 0`, and in server mode a server started with
-            `--return-sampling-mask` (and `--enable-scale-out` from vLLM 0.30).
+            and min-p filtering. Requires `top_k > 0`, and in server mode a server started with
+            `--return-sampling-mask` and `--enable-scale-out`.
 
     """
 
@@ -458,13 +458,7 @@ class VLLMGeneration:
 
             hf_overrides = None
             if self.cast_lm_head_to_fp32:
-                if is_vllm_available(min_version="0.26.0"):
-                    hf_overrides = {"head_dtype": "float32"}
-                else:
-                    logger.warning(
-                        "`cast_lm_head_to_fp32=True` requires vLLM 0.26.0 or later to run the vLLM lm_head in float32. "
-                        "Generation will use the model dtype for the lm_head."
-                    )
+                hf_overrides = {"head_dtype": "float32"}
 
             # Build LLM initialization kwargs
             self.llm = LLM(
@@ -784,12 +778,7 @@ class VLLMGeneration:
                 # The model trains on vLLM's weights, so only the KV cache is released
                 core = self.llm.llm_engine.engine_core.engine_core
                 core.pause_scheduler(clear_cache=True)
-                if is_vllm_available(min_version="0.28.0"):
-                    CuMemAllocator.get_instance().discard("kv_cache")
-                else:
-                    for data in CuMemAllocator.get_instance().pointer_to_data.values():
-                        if data.tag == "kv_cache":
-                            unmap_and_release(data.handle)
+                CuMemAllocator.get_instance().discard("kv_cache")
                 core.model_executor.is_sleeping = True
                 core.model_executor.sleeping_tags = {"kv_cache"}
             else:
