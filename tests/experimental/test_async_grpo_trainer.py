@@ -1299,6 +1299,15 @@ class TestTreePacking(TrlTestCase):
         row = _tree_row(self.ROWS)
         assert (len(row.tokens), row.load) == (10, 15 + 12 + 11)  # depths 1..5, then 3..5 and 5..6 for the branches
 
+    def test_different_sampling_supports_do_not_share(self):
+        a, b = (_tree_sample([1, 2, 3], n_prompt=1) for _ in range(2))
+        a["sampling_mask"] = [[], [2, 5], [3]]
+        b["sampling_mask"] = [[], [2, 6], [3]]
+        packed = _tree_row([a, b]).pack()
+
+        assert packed["input_ids"].tolist() == [1, 2, 3, 1, 2, 3]
+        assert packed["sampling_mask"][packed["token_index"]].tolist() == [[2, 5], [3, -1], [2, 6], [3, -1]]
+
     def test_groups_share_a_common_prefix(self):
         rows = [_tree_sample([1, 2, 3, last], n_prompt=1, group_id=g) for g, last in ((0, 4), (1, 5))]
         packed = _tree_row(rows).pack()
