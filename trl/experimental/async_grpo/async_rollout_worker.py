@@ -965,7 +965,11 @@ class _AsyncRolloutLoop:
             try:
                 return await coro_factory()
             except _RETRYABLE_HTTP_ERRORS as e:
-                if attempt >= max_attempts - 1:
+                # A 4xx other than a timeout or rate limit fails the same way on every attempt
+                permanent = (
+                    isinstance(e, aiohttp.ClientResponseError) and 400 <= e.status < 500 and e.status not in (408, 429)
+                )
+                if permanent or attempt >= max_attempts - 1:
                     raise
                 self._counters["rollout/vllm_retry_total"] += 1
                 sleep = min(2 ** min(attempt, 4), 16)
