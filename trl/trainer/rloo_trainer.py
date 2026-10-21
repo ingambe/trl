@@ -1843,8 +1843,8 @@ class RLOOTrainer(_BaseTrainer):
             self._metrics[mode][name].append(total / count)
         self._pending_metrics.clear()
 
-        if images is not None and self.log_multimodal:
-            self._logs["images"].extend(gather_object(images))
+        if self._is_vlm and self.log_multimodal:
+            self._logs["images"].extend(gather_object(images if images is not None else [None] * len(prompts)))
 
         output = {
             "prompt_ids": prompt_ids,
@@ -2039,7 +2039,10 @@ class RLOOTrainer(_BaseTrainer):
                 if images_raw:
                     images = []
                     for image_list in self._logs["images"]:
-                        images.append([logging_backend.Image(image) for image in image_list])
+                        if image_list:
+                            images.append([logging_backend.Image(image) for image in image_list])
+                        else:
+                            images.append([])
                     df = pd.concat(
                         [df_base, pd.Series(images, name="image")],
                         axis=1,
