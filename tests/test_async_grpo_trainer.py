@@ -5437,7 +5437,7 @@ class TestEpochStop(TrlTestCase):
     what actually regresses if the wiring breaks.
     """
 
-    def _train(self, fork_k, num_train_epochs=2, drop_every=0):
+    def _train(self, fork_k, num_train_epochs=2, drop_every=0, **kwargs):
         model_id = "trl-internal-testing/small-Qwen2ForCausalLM-2.5"
         dataset = load_dataset("trl-internal-testing/zen", "conversational_prompt_completion", split="train")
         args = AsyncGRPOConfig(
@@ -5449,6 +5449,7 @@ class TestEpochStop(TrlTestCase):
             token_budget=64,
             vllm_server_timeout=5.0,
             report_to="none",
+            **kwargs,
         )
         rollout_worker = partial(_StubRolloutWorker, fork_k=fork_k, drop_every=drop_every, samples_per_weight_sync=30)
         with patch.object(async_grpo_trainer_module, "AsyncRolloutWorker", rollout_worker):
@@ -5484,6 +5485,12 @@ class TestEpochStop(TrlTestCase):
 
         # The run stops long before the default `save_steps=500`, so this checkpoint comes from the epoch stop alone.
         assert os.listdir(self.tmp_dir) == [f"checkpoint-{trainer.state.global_step}"]
+
+    def test_checkpoint_resumes_after_the_trained_groups(self):
+        # One group per step; the dataloader has already collated step 3's group when checkpoint-2 is saved
+        self._train(fork_k=1, max_steps=2, save_steps=2)
+        with open(os.path.join(self.tmp_dir, "checkpoint-2", "rollout_state.json"), encoding="utf-8") as f:
+            assert json.load(f)["prompt_index"] == 2
 
 
 @require_peft
