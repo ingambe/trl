@@ -1132,7 +1132,7 @@ class TestAsyncRolloutWorkerEnvironments(TrlTestCase):
         tool_call = loop.tokenizer.encode(_TOOL_CALL.replace('"t"', '"step"'), add_special_tokens=False)
         final = loop.tokenizer.encode(_FINAL, add_special_tokens=False)
 
-        async def generate_one_turn(prompt_ids):
+        async def generate_one_turn(prompt_ids, max_tokens):
             ids = final if "<tool_response>" in loop.tokenizer.decode(prompt_ids) else tool_call
             return TurnRecord(prompt_ids, ids, [-0.1] * len(ids))
 
@@ -2031,17 +2031,17 @@ def t() -> str:
     return "ok"
 
 
-def _run(*, turns, max_iters=None):
+def _run(*, turns, max_iters=None, max_tokens=32):
     """
     Drive `AsyncRolloutLoop.generate_one` with the real tokenizer, chat template and response parser, scripting only
     the vLLM server, which generates the text of `turns` one turn after the other. Returns the rollout and the training
     rows the loop builds from it.
     """
-    loop = _rollout_loop(tools=[t], max_tool_calling_iterations=max_iters)
+    loop = _rollout_loop(tools=[t], max_tool_calling_iterations=max_iters, max_completion_length=max_tokens)
     outputs = [loop.tokenizer.encode(text, add_special_tokens=False) for text in turns]
 
-    async def generate_one_turn(prompt_ids):
-        ids = outputs.pop(0)
+    async def generate_one_turn(prompt_ids, max_tokens):
+        ids = outputs.pop(0)[:max_tokens]
         return TurnRecord(prompt_ids, ids, [-0.1] * len(ids))
 
     loop.generate_one_turn = generate_one_turn
@@ -2059,7 +2059,7 @@ class TestGenerateOneTurn(TrlTestCase):
             return response
 
         loop._post = fake_post
-        return requests, asyncio.run(loop.generate_one_turn([1, 2, 3]))
+        return requests, asyncio.run(loop.generate_one_turn([1, 2, 3], 32))
 
     def test_full_vocabulary_sampling_uses_the_completions_endpoint(self):
         loop = _rollout_loop()
@@ -2154,7 +2154,7 @@ class TestGenerateOneTurn(TrlTestCase):
                 loop.vllm_server_url = str(server.make_url("")).rstrip("/")
                 loop.session = session
                 with pytest.raises(aiohttp.ClientResponseError):
-                    await loop._generate_one_turn([1, 2, 3])
+                    await loop.generate_one_turn([1, 2, 3], 32)
 
         asyncio.run(run())
         assert len(calls) == 1
@@ -2246,6 +2246,11 @@ class TestRolloutLoop(TrlTestCase):
         assert len(rows) == 1
         assert [m["role"] for m in rollout.completion] == ["assistant"]  # no tool message appended
         assert rollout.tool_call_count == 0
+
+    def test_max_tokens_caps_the_whole_conversation(self):
+        rollout = _run(turns=[_TOOL_CALL, _FINAL * 20], max_tokens=64)
+        assert rollout.tool_call_count == 1
+        assert len(rollout.completion_ids) == 64
 
 
 class _FixedRolloutLoop(AsyncRolloutLoop):

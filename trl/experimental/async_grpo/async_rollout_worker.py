@@ -1231,7 +1231,7 @@ class AsyncRolloutLoop:
                 chat_template=self.chat_template,
                 **self.chat_template_kwargs,
             )
-            turn = await self.generate_one_turn(prompt_ids)
+            turn = await self.generate_one_turn(prompt_ids, self.config.max_completion_length - len(completion_ids))
             assistant_message = parse_response(self.tokenizer, turn.output_ids, prefix=prompt_ids, tools=tools)
             completion.append(assistant_message)
             completion_ids.extend(turn.output_ids)
@@ -1240,7 +1240,8 @@ class AsyncRolloutLoop:
             tool_calls = assistant_message.get("tool_calls")
             if tool_calls is None:
                 break
-            if max_iterations is not None and iteration_num >= max_iterations:
+            out_of_turns = max_iterations is not None and iteration_num >= max_iterations
+            if out_of_turns or len(completion_ids) >= self.config.max_completion_length:
                 # Cut off mid-loop: the model asked for another tool and we refused. The conversation is trained as if
                 # it had finished, so this is a silent truncation — hence the metric.
                 loop_exhausted = True
@@ -1300,14 +1301,16 @@ class AsyncRolloutLoop:
         self._rates["tools/parallel_calls_mean"][1] += 1
         return tool_messages, n_calls, n_failures
 
-    async def generate_one_turn(self, prompt_ids: list[int]) -> TurnRecord:
+    async def generate_one_turn(self, prompt_ids: list[int], max_tokens: int) -> TurnRecord:
         """
         Sample one reply from the vLLM server, with the config's sampling settings (`temperature`, `top_p`, `top_k`,
-        `min_p`, `repetition_penalty` and `max_completion_length`).
+        `min_p` and `repetition_penalty`).
 
         Args:
             prompt_ids (`list[int]`):
                 Token ids of the full prompt.
+            max_tokens (`int`):
+                Maximum number of tokens to sample.
 
         Returns:
             [`TurnRecord`]: The prompt and the sampled tokens with their log-probabilities. With `top_k` or `top_p`, it
@@ -1315,7 +1318,7 @@ class AsyncRolloutLoop:
             log-probabilities.
         """
         sampling_params = {
-            "max_tokens": self.config.max_completion_length,
+            "max_tokens": max_tokens,
             "temperature": self.config.temperature,
             "top_p": self.config.top_p,
             "top_k": self.config.top_k,
