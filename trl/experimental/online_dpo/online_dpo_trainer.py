@@ -519,7 +519,10 @@ class OnlineDPOTrainer(_BaseTrainer):
                     "max_num_batched_tokens": self.args.vllm_max_num_batched_tokens,
                     "enable_sleep_mode": self.args.vllm_enable_sleep_mode,
                     "quantization": vllm_quantization,
+                    "kv_cache_dtype": self.args.vllm_kv_cache_dtype,
                 }
+                if self.args.vllm_kv_cache_dtype_skip_layers:
+                    vllm_kwargs["kv_cache_dtype_skip_layers"] = self.args.vllm_kv_cache_dtype_skip_layers
 
                 # vLLM requires the environment variables to be set for distributed training.
                 os.environ["RANK"] = str(self.accelerator.process_index)
