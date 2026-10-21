@@ -124,10 +124,11 @@ class TreeRow:
     not raw ones, and it sends a sample to a row already holding its `group_id` ([`~TreeRow.groups`]), where its prompt
     is.
 
-    A node is keyed on its token *and* the next one, so samples share a token only when they also agree on what follows
-    it. The trie therefore forks one token before the samples diverge, and every node has a single next-token label: a
-    branch costs one extra token per extra branch, and the loss can go through plain per-position labels. A sample's
-    last token is keyed on `None`, which no other sample extends, so every sample ends on a leaf.
+    A node is keyed on its token *and* the next one, with the candidate set that next token was sampled from, so
+    samples share a token only when they also agree on what follows it. The trie therefore forks one token before the
+    samples diverge, and every node has a single next-token label and support: a branch costs one extra token per extra
+    branch, and the loss can go through plain per-position labels. A sample's last token is keyed on `None`, which no
+    other sample extends, so every sample ends on a leaf.
 
     The trie is stored as chains: the tokens a sample adds, from where it leaves the trie to its end, form one chain,
     laid out in `tokens` after the previous ones, and the chain hangs off the last node the sample shares:
@@ -148,6 +149,8 @@ class TreeRow:
         self.samples: list[dict[str, Any]] = []
         self.sample_ends: list[int] = []  # sample -> node of its last token
         self.tokens = np.zeros(0, dtype=np.int64)  # node -> its token
+        self.token_supports = np.zeros(0, dtype=np.int64)  # node -> id of the candidate set its token was sampled from
+        self.supports: dict[tuple[int, ...], int] = {(): 0}  # candidate set -> its id
         self.chain_offsets: list[int] = [0]  # chain c holds the nodes chain_offsets[c] to chain_offsets[c + 1] - 1
         self.chain_parents: list[int] = []  # chain -> node it hangs off, -1 for a root
         self.chain_depths: list[int] = []  # chain -> depth of its first node
@@ -155,24 +158,33 @@ class TreeRow:
         self.trained = 0
         self.load = 0
 
-    def _walk(self, input_ids: np.ndarray) -> tuple[int, int]:
-        """
-        How many leading tokens of `input_ids` the trie holds, and the node of the last one, `-1` if none.
+    def _support_ids(self, sample: dict[str, Any]) -> np.ndarray:
+        """Id of the candidate set each token of `sample` was sampled from."""
+        ids = [self.supports.setdefault(tuple(support), len(self.supports)) for support in sample["sampling_mask"]]
+        return np.array(ids, dtype=np.int64)
 
-        The walk compares whole chains. Since a node is also keyed on the next token, the sample shares a chain's nodes
-        up to one before the first token that differs, then goes on along the chains hanging off the last one:
+    def _walk(self, sample: dict[str, Any]) -> tuple[int, int]:
+        """
+        How many leading tokens of `sample` the trie holds, and the node of the last one, `-1` if none.
+
+        The walk compares whole chains. Since a node is also keyed on the next token and its candidate set, the sample
+        shares a chain's nodes up to one before the first token that differs, then goes on along the chains hanging off
+        the last one:
 
         ```
         chain    30 60 70
         sample   30 60 80     same = 2 tokens, so 1 node shared (the 30); then the chains hanging off that 30
         ```
         """
+        input_ids, supports = sample["input_ids"], self._support_ids(sample)
         depth, node = 0, -1
         while True:
             for c in np.flatnonzero(np.asarray(self.chain_parents) == node):  # the chains hanging off `node`
                 start, end = self.chain_offsets[c], self.chain_offsets[c + 1]
                 ids = input_ids[depth : depth + end - start]
-                match = ids == self.tokens[start : start + len(ids)]
+                match = (ids == self.tokens[start : start + len(ids)]) & (
+                    supports[depth : depth + len(ids)] == self.token_supports[start : start + len(ids)]
+                )
                 same = len(ids) if match.all() else int(match.argmin())
                 if same == end - start and depth + same == len(input_ids):
                     return len(input_ids), end - 1  # a copy of the sample that added this chain
@@ -193,22 +205,23 @@ class TreeRow:
 
     def fits(self, sample: dict[str, Any], budget: int) -> bool:
         """Whether the row stays within `budget` unique tokens and `budget` trained tokens with `sample` added."""
-        novel = len(sample["input_ids"]) - self._walk(sample["input_ids"])[0]
+        novel = len(sample["input_ids"]) - self._walk(sample)[0]
         return len(self.tokens) + novel <= budget and self.trained + int(sample["completion_mask"].sum()) <= budget
 
     def cost(self, sample: dict[str, Any]) -> int:
         """Load `add(sample)` would add to the row: `depth + 1` for each of its tokens not already in the trie."""
-        n, shared = len(sample["input_ids"]), self._walk(sample["input_ids"])[0]
+        n, shared = len(sample["input_ids"]), self._walk(sample)[0]
         return (n * (n + 1) - shared * (shared + 1)) // 2  # sum of depth + 1 over depths shared..n - 1
 
     def add(self, sample: dict[str, Any]) -> None:
         input_ids = sample["input_ids"]
         self.load += self.cost(sample)
-        shared, node = self._walk(input_ids)
+        shared, node = self._walk(sample)
         if shared < len(input_ids):  # a copy of a sample already in the row adds no chain
             self.chain_parents.append(node)
             self.chain_depths.append(shared)
             self.tokens = np.concatenate([self.tokens, input_ids[shared:]])
+            self.token_supports = np.concatenate([self.token_supports, self._support_ids(sample)[shared:]])
             self.chain_offsets.append(len(self.tokens))
             node = len(self.tokens) - 1
         self.samples.append(sample)

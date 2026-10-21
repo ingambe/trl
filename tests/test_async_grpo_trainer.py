@@ -4324,6 +4324,16 @@ class TestTreePacking(TrlTestCase):
         assert packed["tree_cu_seqlens_q"].tolist() == [0, 2, 5, 6, 8, 10]
         assert packed["tree_segment_parents"].tolist() == [-1, 0, 0, 2, 2]
 
+    def test_different_sampling_supports_do_not_share(self):
+        a, b = (_tree_sample([1, 2, 3], n_prompt=1) for _ in range(2))
+        a["sampling_mask"] = [[], [2, 5], [3]]
+        b["sampling_mask"] = [[], [2, 6], [3]]
+        packed = _tree_row([a, b]).pack()
+
+        assert packed["input_ids"].tolist() == [1, 2, 3, 1, 2, 3]
+        assert packed["sampling_mask"].tolist() == [2, 5, 3, 2, 6, 3]
+        assert packed["sampling_mask_counts"].tolist() == [2, 1, 0, 2, 1, 0]
+
     def test_groups_share_a_common_prefix(self):
         rows = [_tree_sample([1, 2, 3, last], n_prompt=1, group_id=g) for g, last in ((0, 4), (1, 5))]
         packed = _tree_row(rows).pack()
@@ -5171,7 +5181,6 @@ class TestGenerateOneTurn(TrlTestCase):
         loop = _rollout_loop()
         loop.session = None
         asyncio.run(loop._check_sampling_replay())
-
 
 
 @require_response_parsing
