@@ -574,7 +574,10 @@ class OnlineDPOTrainer(_BaseTrainer):
                         * (args.max_length + args.max_new_tokens),
                     ),
                     "enable_sleep_mode": self.args.vllm_enable_sleep_mode,
+                    "kv_cache_dtype": self.args.vllm_kv_cache_dtype,
                 }
+                if self.args.vllm_kv_cache_dtype_skip_layers:
+                    vllm_kwargs["kv_cache_dtype_skip_layers"] = self.args.vllm_kv_cache_dtype_skip_layers
                 # The extensible KV cache (vLLM >= 0.34) caps torch's allocator for the whole process and keeps the cap
                 # while asleep, so the colocated trainer could not use the memory that sleep frees.
                 if is_vllm_available(min_version="0.34.0"):
