@@ -367,6 +367,8 @@ class IWOPDTrainer(_BaseTrainer):
     - Student on-policy generation via vLLM or model.generate()
     """
 
+    loss_is_scaled_for_ga = True
+
     _tag_names = ["trl", "iw-opd"]
     _name = "IW-OPD"
     _paper = {
@@ -604,6 +606,7 @@ class IWOPDTrainer(_BaseTrainer):
 
         # ── Buffer state ──
         self._buffered_inputs = None
+        self._buffered_num_items_in_batch = None
         self._buffered_on_policy_flags = None
         self._buffered_text_logs = None
         self._buffer_step = 0
@@ -849,6 +852,11 @@ class IWOPDTrainer(_BaseTrainer):
         # Generate student completions for on-policy slices
         if on_policy_indices:
             self._generate_student_completions(slices, on_policy_indices)
+
+        num_items_in_batch = sum((batch["labels"] != -100).sum() for batch in self._buffered_inputs)
+        if self.args.average_tokens_across_devices:
+            num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
+        self._buffered_num_items_in_batch = num_items_in_batch.clamp(min=1)
 
         # Gather on-policy text logs once per optimizer step (all processes must participate)
         if self.log_completions:
@@ -1479,6 +1487,7 @@ class IWOPDTrainer(_BaseTrainer):
         student_log_probs: torch.Tensor,
         completion_tokens: torch.Tensor,
         labels: torch.Tensor,
+        num_items_in_batch=None,
     ) -> torch.Tensor:
         """Compute exact sparse top-1 generalized JSD/KL from server-provided teacher logprobs.
 
@@ -1523,10 +1532,6 @@ class IWOPDTrainer(_BaseTrainer):
         # Server path only supports "sampled" mode — config validation enforces this, but we guard
         # explicitly so future relaxations of the config check don't silently change behaviour.
         reverse_token_ids = self._get_reverse_kl_top_1_tokens(student_log_probs, completion_tokens)
-        # The server path normalizes locally (batchmean), not by num_items_in_batch: teacher logprobs may not cover
-        # every student completion token (the loss is summed over the trimmed teacher window), so the global token
-        # count would be the wrong denominator. Gradient-accumulation normalization for the server path is left as a
-        # follow-up.
         return self._compute_sparse_top_1_divergence_loss(
             student_log_probs=student_log_probs,
             teacher_top1_token_ids=topk_token_ids.squeeze(-1),
@@ -1534,6 +1539,7 @@ class IWOPDTrainer(_BaseTrainer):
             reverse_token_ids=reverse_token_ids,
             reverse_teacher_logprobs=actual_teacher_lps,
             labels=labels,
+            num_items_in_batch=num_items_in_batch,
         )
 
     def _compute_server_forward_kl_loss(
@@ -1541,6 +1547,7 @@ class IWOPDTrainer(_BaseTrainer):
         teacher_result: dict[str, torch.Tensor],
         student_log_probs: torch.Tensor,
         labels: torch.Tensor,
+        num_items_in_batch=None,
     ) -> torch.Tensor:
         """Compute sparse forward KL from server-provided teacher top-k logprobs (beta==0 path).
 
@@ -1576,12 +1583,15 @@ class IWOPDTrainer(_BaseTrainer):
             beta=0.0,
             support_mask=support_mask,
         )
-        # See `_compute_server_sparse_top_1_divergence_loss`: the server path normalizes locally, not by
-        # num_items_in_batch, because the teacher window may not cover every student completion token.
-        return self._reduce_divergence_loss(jsd, labels=labels, reduction="batchmean")
+        return self._reduce_divergence_loss(
+            jsd, labels=labels, reduction="batchmean", num_items_in_batch=num_items_in_batch
+        )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         self._raise_if_local_teacher_tokenizer_mismatch()
+        # transformers counts the raw dataloader labels, before on-policy generation replaces the completions
+        if self.model.training:
+            num_items_in_batch = self._buffered_num_items_in_batch
 
         # Student forward pass
         model_inputs = {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]}
@@ -1630,22 +1640,24 @@ class IWOPDTrainer(_BaseTrainer):
                     rollout_logprobs=rollout_logprobs,
                     num_items_in_batch=num_items_in_batch,
                 )
-                # Undo DDP gradient averaging for the global token count.
-                if self.args.average_tokens_across_devices and num_items_in_batch is not None:
-                    loss *= self.accelerator.num_processes
             elif self.beta > 0:
                 loss = self._compute_server_sparse_top_1_divergence_loss(
                     teacher_result=teacher_result,
                     student_log_probs=student_log_probs[:, :comp_len, :],
                     completion_tokens=completion_tokens,
                     labels=trimmed_labels,
+                    num_items_in_batch=num_items_in_batch,
                 )
             else:
                 loss = self._compute_server_forward_kl_loss(
                     teacher_result=teacher_result,
                     student_log_probs=student_log_probs[:, :comp_len, :],
                     labels=trimmed_labels,
+                    num_items_in_batch=num_items_in_batch,
                 )
+            # Undo DDP gradient averaging for the global token count.
+            if self.args.average_tokens_across_devices and num_items_in_batch is not None:
+                loss *= self.accelerator.num_processes
         else:
             # Local teacher: exact full-vocabulary loss except for the shared mixed top-1 path.
             teacher_logits = self._get_teacher_logits(inputs)
