@@ -40,25 +40,10 @@ if is_requests_available():
 
 
 if is_vllm_available():
-    from vllm.utils.network_utils import get_ip
-
-# vLLM 0.28.0 (vllm-project/vllm#50902) replaced the static `NCCLWeightTransferEngine.trainer_init` /
-# `trainer_send_weights` with a stateful trainer engine and moved `packed` from the per-update info to the init info.
-# The rendezvous and packed-broadcast helpers the statics were built on are still exposed, so they are called directly.
-_HAS_STATEFUL_TRAINER_ENGINE = is_vllm_available(min_version="0.28.0")
-if _HAS_STATEFUL_TRAINER_ENGINE:
     from vllm.distributed.weight_transfer.nccl_common import trainer_init as open_trainer_endpoint
     from vllm.distributed.weight_transfer.packed_tensor import packed_nccl_broadcast_producer
-elif is_vllm_available():
-    from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
+    from vllm.utils.network_utils import get_ip
 
-# vLLM 0.32.0 (vllm-project/vllm#58181) gave `/inference/v1/generate` its own logprob wire shape with integer token
-# IDs; before that it used the OpenAI shape with "token_id:<id>" placeholder strings.
-_HAS_GENERATE_LOGPROBS = is_vllm_available(min_version="0.32.0")
-
-# vLLM 0.26.0 (vllm-project/vllm#46893) made `/reset_prefix_cache` return `{"success": bool}`. Before that, it answered
-# with an empty body.
-_HAS_RESET_PREFIX_CACHE_SUCCESS = is_vllm_available(min_version="0.26.0")
 
 _DEFAULT_GENERATION_CONCURRENCY = 64
 
@@ -106,8 +91,7 @@ def parse_logprobs(choices_logprobs: list[dict | None]) -> tuple[list | None, li
     Args:
         choices_logprobs (`list[dict]`):
             Logprobs of each choice, either `{"tokens": ..., "top_logprobs": ...}` (completions) or `{"content":
-            [{"token": ..., "logprob": ..., "top_logprobs": ...}]}` (chat completions, and `/inference/v1/generate`
-            below vLLM 0.32.0).
+            [{"token": ..., "logprob": ..., "top_logprobs": ...}]}` (chat completions).
 
     Returns:
         Tuple of (logprobs, logprob_token_ids), or `(None, None)` when the server returned no logprob.
@@ -399,7 +383,7 @@ class VLLMClient:
             if response.status_code == 404:
                 raise RuntimeError(
                     f"The vLLM server at {self.base_url} does not serve `/v1/chat/completions/render`, which "
-                    "multimodal prompts use. From vLLM 0.30.0, restart it with `--enable-scale-out`."
+                    "multimodal prompts use. Restart it with `--enable-scale-out`."
                 )
             if response.status_code != 200:
                 raise Exception(f"Request failed: {response.status_code}, {response.text}")
@@ -534,10 +518,7 @@ class VLLMClient:
             responses = list(executor.map(send, range(len(prompts))))
 
         choices = [choice for response in responses for choice in response["choices"]]
-        if _HAS_GENERATE_LOGPROBS:
-            logprobs, logprob_token_ids = parse_generate_logprobs([choice["logprobs"] for choice in choices])
-        else:
-            logprobs, logprob_token_ids = parse_logprobs([choice["logprobs"] for choice in choices])
+        logprobs, logprob_token_ids = parse_generate_logprobs([choice["logprobs"] for choice in choices])
         return {
             "prompt_ids": list(prompts),  # the server generates from what it was given, so it echoes back unchanged
             "completion_ids": [choice["token_ids"] for choice in choices],
@@ -790,9 +771,8 @@ class VLLMClient:
             "master_port": self.group_port,
             "rank_offset": 1,
             "world_size": world_size,
+            "packed": True,
         }
-        if _HAS_STATEFUL_TRAINER_ENGINE:
-            init_info["packed"] = True
 
         # vLLM builds the trainer side of the group on the current device, so point it at the requested one. A device
         # without an index (e.g. `torch.device("cuda")`) means the current device, which is already the right one.
@@ -811,10 +791,7 @@ class VLLMClient:
             future = executor.submit(
                 self._post, f"{self.base_url}/init_weight_transfer_engine", json={"init_info": init_info}
             )
-            if _HAS_STATEFUL_TRAINER_ENGINE:
-                self.communicator = open_trainer_endpoint(init_info)
-            else:
-                self.communicator = NCCLWeightTransferEngine.trainer_init(init_info)
+            self.communicator = open_trainer_endpoint(init_info)
             future.result()
 
         # When the client object is deleted, close the weight update group
@@ -880,8 +857,6 @@ class VLLMClient:
         """
         names, dtype_names, shapes = (list(field) for field in zip(*metadata, strict=True))
         update_info = {"names": names, "dtype_names": dtype_names, "shapes": shapes}
-        if not _HAS_STATEFUL_TRAINER_ENGINE:
-            update_info["packed"] = True
 
         if not self._updating_weights:
             self._start_weight_update()
@@ -889,15 +864,9 @@ class VLLMClient:
         # trainer-side broadcast.
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(self._post, f"{self.base_url}/update_weights", json={"update_info": update_info})
-            if _HAS_STATEFUL_TRAINER_ENGINE:
-                packed_nccl_broadcast_producer(
-                    iterator=named_params, group=self.communicator, src=0, post_iter_func=lambda item: item[1]
-                )
-            else:
-                NCCLWeightTransferEngine.trainer_send_weights(
-                    iterator=named_params,
-                    trainer_args=NCCLTrainerSendWeightsArgs(group=self.communicator, packed=True),
-                )
+            packed_nccl_broadcast_producer(
+                iterator=named_params, group=self.communicator, src=0, post_iter_func=lambda item: item[1]
+            )
             future.result()
         if not self._updating_weights:
             self._finish_weight_update()
@@ -920,12 +889,7 @@ class VLLMClient:
         """
         Resets the prefix cache for the model.
         """
-        if _HAS_RESET_PREFIX_CACHE_SUCCESS:
-            self._post(f"{self.base_url}/reset_prefix_cache")
-        else:
-            response = self.session.post(f"{self.base_url}/reset_prefix_cache")
-            if response.status_code != 200:
-                raise Exception(f"Request failed: {response.status_code}, {response.text}")
+        self._post(f"{self.base_url}/reset_prefix_cache")
 
     def close_communicator(self):
         """
