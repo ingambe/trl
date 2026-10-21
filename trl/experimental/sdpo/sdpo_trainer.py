@@ -456,7 +456,8 @@ class SDPOTrainer(_BaseTrainer):
         self.shuffle_dataset = args.shuffle_dataset
         self.loss_type = args.loss_type
         self.mask_truncated_completions = args.mask_truncated_completions
-        self.temperature = args.temperature
+        # Scoring must use the sampling temperature, which `generation_kwargs` can override (except a greedy 0)
+        self.temperature = (args.generation_kwargs or {}).get("temperature") or args.temperature
         self.use_vllm = args.use_vllm
         self.chat_template_kwargs = args.chat_template_kwargs or {}
         self._step = 0
