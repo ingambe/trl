@@ -245,6 +245,30 @@ class TestDPOTrainer(TrlTestCase):
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
+    def test_logits_metrics_weight_micro_batches_by_tokens(self):
+        dataset = Dataset.from_list(
+            [
+                {"prompt": "The sky is", "chosen": " blue.", "rejected": " green."},
+                {"prompt": "The sun is", "chosen": " a hot star in our solar system.", "rejected": " cold."},
+            ]
+        )
+        logs = []
+        for batch_size, accumulation_steps in [(2, 1), (1, 2)]:
+            training_args = DPOConfig(
+                output_dir=self.tmp_dir,
+                per_device_train_batch_size=batch_size,
+                gradient_accumulation_steps=accumulation_steps,
+                max_steps=1,
+                report_to="none",
+            )
+            trainer = DPOTrainer(
+                model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", args=training_args, train_dataset=dataset
+            )
+            trainer.train()
+            logs.append(trainer.state.log_history[0])
+        assert logs[0]["logits/chosen"] == pytest.approx(logs[1]["logits/chosen"])
+        assert logs[0]["logits/rejected"] == pytest.approx(logs[1]["logits/rejected"])
+
     @pytest.mark.parametrize("precompute_ref_log_probs", [False, True])
     @pytest.mark.parametrize(
         "eval_dataset_type",
