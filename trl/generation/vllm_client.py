@@ -664,7 +664,6 @@ class VLLMClient:
         sequences: list[list[int]],
         prompt_lengths: list[int],
         top_logprobs: int = 100,
-        temperature: float = 1.0,
         chunk_size: int = 0,
         max_concurrent_requests: int = 4,
     ) -> dict[str, list]:
@@ -685,8 +684,6 @@ class VLLMClient:
                 Number of prompt tokens in each sequence. Logprobs are returned starting from this position.
             top_logprobs (`int`, *optional*, defaults to `100`):
                 Number of top logprobs to return per token position.
-            temperature (`float`, *optional*, defaults to `1.0`):
-                Temperature used when scoring the teacher distribution.
             chunk_size (`int`, *optional*, defaults to `0`):
                 If > 0, split batch into chunks of this size and dispatch concurrently. If 0, send the entire batch in
                 a single request.
@@ -706,9 +703,6 @@ class VLLMClient:
                 - `actual_token_ids` (`list[list[list[int]]]`):
                     Actual token IDs, same shape as `actual_logprobs`.
         """
-        if temperature <= 0:
-            raise ValueError(f"temperature must be positive, got {temperature}")
-
         chunk_size = chunk_size if chunk_size > 0 else len(sequences)
         chunks = [
             (sequences[idx : idx + chunk_size], prompt_lengths[idx : idx + chunk_size])
@@ -721,7 +715,6 @@ class VLLMClient:
                 "model": self.model,
                 "prompt": chunk_sequences,
                 "max_tokens": 1,
-                "temperature": temperature,
                 "prompt_logprobs": top_logprobs,
             }
             choices = self._post(f"{self.base_url}/v1/completions", json=payload)["choices"]

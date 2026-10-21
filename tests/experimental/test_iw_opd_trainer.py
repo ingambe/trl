@@ -37,7 +37,7 @@ def _make_distillation_config_kwargs(tmp_path):
     return {"output_dir": str(tmp_path), "report_to": "none"}
 
 
-def _build_server_result(teacher_logits, inputs, temperature=1.0):
+def _build_server_result(teacher_logits, inputs):
     """Simulate a vLLM server response with variable-length per-sample completions."""
     _, _, completion_lengths = build_teacher_request_inputs(
         inputs["input_ids"],
@@ -60,7 +60,7 @@ def _build_server_result(teacher_logits, inputs, temperature=1.0):
 
         comp_start = int(torch.nonzero(label_mask[i], as_tuple=False)[0].item())
         sample_logits = teacher_logits[i, comp_start - 1 : comp_start - 1 + comp_len, :]
-        sample_log_probs = F.log_softmax(sample_logits / temperature, dim=-1)
+        sample_log_probs = F.log_softmax(sample_logits, dim=-1)
         comp_tokens = inputs["input_ids"][i, comp_start : comp_start + comp_len]
 
         top1_ids = sample_logits.argmax(dim=-1, keepdim=True)
@@ -83,15 +83,8 @@ class RecordingTeacherClient:
         self.calls = []
         self.result = None
 
-    def get_sequence_logprobs(self, sequences, prompt_lengths, top_logprobs, temperature):
-        self.calls.append(
-            {
-                "sequences": sequences,
-                "prompt_lengths": prompt_lengths,
-                "top_logprobs": top_logprobs,
-                "temperature": temperature,
-            }
-        )
+    def get_sequence_logprobs(self, sequences, prompt_lengths, top_logprobs):
+        self.calls.append({"sequences": sequences, "prompt_lengths": prompt_lengths, "top_logprobs": top_logprobs})
         return self.result
 
 
@@ -629,14 +622,16 @@ class TestIWOPDTrainer(TrlTestCase):
         # Doubling the global count exactly halves the loss (sum / num_items is linear in 1/num_items).
         torch.testing.assert_close(loss_double, loss_mean / 2, rtol=1e-4, atol=1e-6)
 
-    def test_sampled_mode_matches_between_local_and_external_teachers(self, monkeypatch):
+    @pytest.mark.parametrize("temperature", [1.0, 2.0])
+    def test_sampled_mode_matches_between_local_and_external_teachers(self, monkeypatch, temperature):
         import trl.generation.vllm_client as vllm_client_module
 
         teacher_client = RecordingTeacherClient()
         monkeypatch.setattr(vllm_client_module, "VLLMClient", lambda *args, **kwargs: teacher_client)
 
-        local_trainer = self._make_local_trainer(beta=0.5, loss_top_k=1, reverse_kl_top_1_mode="sampled")
-        server_trainer = self._make_server_trainer(beta=0.5, loss_top_k=1)
+        kwargs = {"beta": 0.5, "loss_top_k": 1, "temperature": temperature, "loss_add_tail": temperature == 1.0}
+        local_trainer = self._make_local_trainer(reverse_kl_top_1_mode="sampled", **kwargs)
+        server_trainer = self._make_server_trainer(**kwargs)
 
         cpu_inputs = self._make_batch(local_trainer)
         expected_sequences, expected_prompt_lengths, _ = build_teacher_request_inputs(
@@ -655,11 +650,7 @@ class TestIWOPDTrainer(TrlTestCase):
                 input_ids=local_inputs["input_ids"],
                 attention_mask=local_inputs["attention_mask"],
             ).logits
-            teacher_client.result = _build_server_result(
-                teacher_logits,
-                local_inputs,
-                temperature=local_trainer.temperature,
-            )
+            teacher_client.result = _build_server_result(teacher_logits, local_inputs)
             local_loss = local_trainer.compute_loss(local_trainer.model, local_inputs)
             server_loss = server_trainer.compute_loss(server_trainer.model, server_inputs)
 
