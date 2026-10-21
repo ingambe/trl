@@ -50,12 +50,13 @@ class GMPOTrainer(GRPOTrainer):
         mask = completion_mask if "tool_mask" not in inputs else completion_mask * inputs["tool_mask"]
 
         # Compute the per_token_logps and the entropy at each position in the completion
-        per_token_logps, entropies, _ = self._get_per_token_logps_and_entropies(
+        per_token_logps, entropies, aux_loss = self._get_per_token_logps_and_entropies(
             model,
             input_ids,
             attention_mask,
             logits_to_keep,
             compute_entropy=True,
+            compute_aux_loss=self.aux_loss_enabled,
             pixel_values=inputs.get("pixel_values"),
             image_grid_thw=inputs.get("image_grid_thw"),
             num_images=inputs.get("num_images"),
@@ -126,6 +127,11 @@ class GMPOTrainer(GRPOTrainer):
         loss = per_sequence_loss.sum() / num_sequences
         normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0  # no accum in eval
         loss = loss / normalizer
+
+        # The policy loss above is scaled for gradient accumulation (HF auto-scaling is off here), so scale aux too
+        if self.aux_loss_enabled:
+            loss = loss + self.router_aux_loss_coef * aux_loss / normalizer
+            log_metric("aux_loss", "mean", aux_loss)
 
         # Log the metrics
         def masked_seq_mean(x):
