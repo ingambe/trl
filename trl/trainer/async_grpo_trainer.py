@@ -1403,7 +1403,8 @@ class AsyncRolloutLoop:
         """Retry an aiohttp coroutine on transport errors and 5xx responses with bounded exponential backoff, counting the
         retries.
 
-        A 4xx is raised at once, since sending the same request again gets the same answer.
+        A 4xx other than a timeout or rate limit is raised at once, since sending the same request again gets the same
+        answer.
 
         Every retried call in this loop targets vLLM, so the counter is named for the dependency rather than for the
         transport.
@@ -1412,9 +1413,10 @@ class AsyncRolloutLoop:
             try:
                 return await coro_factory()
             except _RETRYABLE_HTTP_ERRORS as e:
-                if attempt >= max_attempts - 1 or (
-                    isinstance(e, aiohttp.ClientResponseError) and 400 <= e.status < 500
-                ):
+                permanent = (
+                    isinstance(e, aiohttp.ClientResponseError) and 400 <= e.status < 500 and e.status not in (408, 429)
+                )
+                if permanent or attempt >= max_attempts - 1:
                     raise
                 self._counters["rollout/vllm_retry_count"] += 1
                 sleep = min(2 ** min(attempt, 4), 16)
