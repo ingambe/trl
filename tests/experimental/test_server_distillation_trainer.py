@@ -87,6 +87,19 @@ def test_config_rejects_mixed_loss_without_top_1(tmp_path):
         ServerDistillationConfig(**_make_server_config_kwargs(tmp_path), beta=0.5, loss_top_k=2)
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"temperature": 2.0},
+        {"generation_kwargs": {"temperature": 2.0}},
+        {"temperature": 2.0, "loss_add_tail": False},  # beta=1 renormalizes over the sampled token alone
+    ],
+)
+def test_config_rejects_inexact_teacher_temperature(tmp_path, kwargs):
+    with pytest.raises(ValueError, match="temperature 1"):
+        ServerDistillationConfig(**_make_server_config_kwargs(tmp_path), **kwargs)
+
+
 def test_config_requires_server_url(tmp_path):
     kwargs = _make_server_config_kwargs(tmp_path)
     kwargs.pop("teacher_model_server_url")
