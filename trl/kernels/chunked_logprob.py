@@ -72,7 +72,8 @@ def _support_mask(support_ids: torch.Tensor, vocab_start: int, vocab_end: int) -
     local = support_ids - vocab_start
     in_tile = (local >= 0) & (local < width)
     support_mask = torch.zeros((local.shape[0], width), device=support_ids.device, dtype=torch.int8)
-    support_mask.scatter_add_(1, local.clamp(0, width - 1), in_tile.to(torch.int8))
+    # `amax`, not a sum: repeated ids (e.g. the zero-filled supports of masked positions) would overflow an int8 count
+    support_mask.scatter_reduce_(1, local.clamp(0, width - 1), in_tile.to(torch.int8), "amax")
     return support_mask
 
 
