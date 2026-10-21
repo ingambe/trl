@@ -46,7 +46,6 @@ from .vllm_client import VLLMClient
 
 if is_vllm_available():
     from vllm import LLM, RequestOutput, SamplingParams
-    from vllm.device_allocator.cumem import CuMemAllocator
     from vllm.lora.request import LoRARequest
     from vllm.model_executor.models.interfaces import supports_lora
     from vllm.sampling_params import StructuredOutputsParams
@@ -739,14 +738,10 @@ class VLLMGeneration:
             self._unmerge()
             self._weights_dirty = True
         if self.mode == "colocate" and self.enable_sleep_mode and not self._kv_cache_sleeping:
-            self.llm.reset_mm_cache()
             if self.share_weights:
                 # The model trains on vLLM's weights, so only the KV cache is released
-                core = self.llm.llm_engine.engine_core.engine_core
-                core.pause_scheduler(clear_cache=True)
-                CuMemAllocator.get_instance().discard("kv_cache")
-                core.model_executor.is_sleeping = True
-                core.model_executor.sleeping_tags = {"kv_cache"}
+                self.llm.sleep(level=0)
+                self.llm.release_kv_cache_memory()
             else:
                 # Sleep level 2 discards the weights; track it so that generate() knows it must re-push them
                 self.llm.sleep(level=2)
