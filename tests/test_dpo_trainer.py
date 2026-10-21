@@ -996,6 +996,25 @@ class TestDPOTrainer(TrlTestCase):
 
         assert trainer.state.log_history[-1]["train_loss"] is not None
 
+    def test_precomputed_ref_logps_cache_depends_on_ld_alpha(self):
+        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+
+        def precompute(ld_alpha):
+            # `max_length=None` skips the truncation filter, whose closure would hash every argument
+            training_args = DPOConfig(
+                output_dir=self.tmp_dir,
+                precompute_ref_log_probs=True,
+                ld_alpha=ld_alpha,
+                max_length=None,
+                report_to="none",
+            )
+            trainer = DPOTrainer(
+                model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", args=training_args, train_dataset=dataset
+            )
+            return trainer.train_dataset["ref_rejected_logps"]
+
+        assert precompute(None) != precompute(0.0)
+
     @require_peft
     def test_peft_lm_head_raises(self):
         # The chunked projection reads `lm_head.weight` directly, so a LoRA adapter on `lm_head` is silently
