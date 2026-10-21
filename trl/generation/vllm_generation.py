@@ -14,6 +14,7 @@
 
 """vLLM-based generation backend for TRL trainers."""
 
+import json
 import logging
 import math
 import os
@@ -40,6 +41,7 @@ from transformers.utils import (
 from ..distributed import DistributedBackend
 from ..extras.profiling import ProfilingContext
 from ..import_utils import is_vllm_available
+from ..models.fp8 import BlockFP8Linear, FP8Linear, fused_layer_name
 from ..trainer.utils import ensure_master_addr_port
 from .vllm_client import VLLMClient
 
@@ -182,6 +184,10 @@ class VLLMGeneration:
             Maximum number of sequences to process in parallel, effectively capping the batch size.
         max_num_batched_tokens (`int`, *optional*, defaults to `4096`):
             Maximum number of tokens processed per engine step. vLLM's larger default misleads its memory profiler.
+        kv_cache_dtype (`str`, *optional*, defaults to `"auto"`):
+            Data type of the KV cache, e.g. `"fp8_per_token_head"`.
+        kv_cache_dtype_skip_layers (`list[str]`, *optional*):
+            Layer indices or attention types whose KV cache keeps the model dtype.
         enable_sleep_mode (`bool`, *optional*, defaults to `False`):
             Whether to enable sleep mode for the engine to offload weights/cache during the optimizer step. Keeps GPU
             memory usage low, but waking the engine adds host–device transfer latency.
@@ -257,6 +263,8 @@ class VLLMGeneration:
         max_model_length: int | None = None,
         max_num_seqs: int | None = None,
         max_num_batched_tokens: int = 4096,
+        kv_cache_dtype: str = "auto",
+        kv_cache_dtype_skip_layers: list[str] | None = None,
         enable_sleep_mode: bool = False,
         share_weights: bool = False,
         native_lora: bool = False,
@@ -296,6 +304,8 @@ class VLLMGeneration:
         self.max_model_length = max_model_length
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens
+        self.kv_cache_dtype = kv_cache_dtype
+        self.kv_cache_dtype_skip_layers = kv_cache_dtype_skip_layers
         self.enable_sleep_mode = enable_sleep_mode
         self.share_weights = share_weights
         self.native_lora = native_lora
@@ -340,6 +350,18 @@ class VLLMGeneration:
                 "`pip install trl[vllm]` to use it."
             )
 
+        fp8_layers = [module for module in model.modules() if isinstance(module, FP8Linear)]
+        frozen_fp8 = any(layer.weight is None for layer in fp8_layers) or any(
+            isinstance(module, BlockFP8Linear) for module in model.modules()
+        )
+        if frozen_fp8 and not (
+            self.mode == "colocate" and self.share_weights and is_peft_model(model) and self.native_lora
+        ):
+            raise ValueError(
+                "vLLM can only serve a PEFT adapter over an FP8 base in colocate mode with `share_weights=True` and "
+                "`native_lora=True`: merging the adapter into the base would change the policy."
+            )
+
         if self.mode == "server":
             if accelerator.is_main_process:
                 if self.server_base_url is not None:
@@ -350,6 +372,22 @@ class VLLMGeneration:
                     base_url=base_url, group_port=self.group_port, connection_timeout=self.server_timeout
                 )
                 self.vllm_client.init_communicator(device=accelerator.device)
+                if fp8_layers:
+                    # The server requantizes the high-precision weights it receives on each update
+                    server_config = self.vllm_client.get_model_config()
+                    quantization = server_config["quantization"]
+                    if quantization == "fp8_per_channel":
+                        ignore = self._fp8_ignore_list(model)
+                        if sorted(server_config["quantization_config"]["ignore"]) != sorted(ignore):
+                            raise ValueError(
+                                "The vLLM server must keep the same layers in high precision as the trainer: start it "
+                                f"with `--quantization-config '{json.dumps({'ignore': ignore})}'`."
+                            )
+                    elif quantization is not None:
+                        raise ValueError(
+                            f"The vLLM server runs `{quantization}` quantization, unlike `fp8_recipe`: serve the "
+                            "high-precision checkpoint, with `--quantization fp8_per_channel` for FP8 inference."
+                        )
 
         elif self.mode == "colocate":
             # Make sure tensor_parallel_size group size evenly divides the world size - each group should have
@@ -393,6 +431,13 @@ class VLLMGeneration:
                     "`share_weights=True` requires `tensor_parallel_size=1`, no FSDP or DeepSpeed ZeRO-3, and no "
                     "quantization."
                 )
+            fp8_kwargs = {}
+            if self.kv_cache_dtype_skip_layers:
+                fp8_kwargs["kv_cache_dtype_skip_layers"] = self.kv_cache_dtype_skip_layers
+            if self.share_weights and fp8_layers:
+                # vLLM quantizes the same layers as the trainer, whose FP8 weights it then shares
+                quantization = "fp8_per_channel"
+                fp8_kwargs["quantization_config"] = {"ignore": self._fp8_ignore_list(model)}
             lora_kwargs = {}
             if self.share_weights and is_peft_model(model):
                 config = model.peft_config[model.active_adapters[0]]
@@ -442,6 +487,7 @@ class VLLMGeneration:
                 # Feed identical seed for tp groups to ensure sampling results are the same across workers
                 seed=accelerator.process_index // self.tensor_parallel_size,
                 max_num_batched_tokens=self.max_num_batched_tokens,
+                kv_cache_dtype=self.kv_cache_dtype,
                 # Important so temperature scaling/logit tweaking affects the TIS log probs
                 logprobs_mode="processed_logprobs",
                 quantization=quantization,
@@ -450,6 +496,7 @@ class VLLMGeneration:
                 # Not passed otherwise: vLLM < 0.28 doesn't accept it
                 **({"return_sampling_mask": True} if self.return_sampling_mask else {}),
                 **lora_kwargs,
+                **fp8_kwargs,
             )
             unshared = self._share_weights() if self.share_weights else []
             if unshared and lora_kwargs:
@@ -465,6 +512,24 @@ class VLLMGeneration:
         # synchronize all processes after vLLM has been fully initialized.
         accelerator.wait_for_everyone()
 
+    def _fp8_ignore_list(self, model: nn.Module) -> list[str]:
+        """Layers vLLM keeps in high precision to quantize the same layers as the trainer."""
+        ignored = [
+            name for name, module in model.named_modules() if isinstance(module, nn.Linear) and "lora_" not in name
+        ]
+        fused_fp8 = {fused_layer_name(name) for name, module in model.named_modules() if isinstance(module, FP8Linear)}
+        for name in ignored:
+            if fused_layer_name(name) in fused_fp8:
+                raise ValueError(
+                    f"vLLM quantizes `{name}` together with the projections it fuses it with: keep all of them in "
+                    "high precision with `fp8_skip_modules`, or none."
+                )
+        # vLLM's fused MoE experts have no trainer counterpart
+        return ["*.experts"] + [
+            self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", ""))
+            for name in ignored
+        ]
+
     @torch.no_grad()
     def _share_weights(self) -> list[tuple[str, torch.Tensor]]:
         """Point the model's parameters at vLLM's weights, and return the parameters that can't be shared."""
@@ -472,13 +537,30 @@ class VLLMGeneration:
         views = {name.replace(".base_layer", ""): param.data for name, param in vllm_model.named_parameters()}
         # Fused layers (e.g. qkv_proj) stack several parameters
         packed = vllm_model.packed_modules_mapping if supports_lora(vllm_model) else {}
+        fp8_views = {}
         for module_name, module in vllm_model.named_modules():
             module_name = module_name.replace(".base_layer", "")
             fused = module_name.rpartition(".")[2]
             parts = packed.get(fused)
+            prefix = module_name.removesuffix(fused)
+            params = dict(module.named_parameters(recurse=False))
+            if "weight_scale_inv" in params:
+                # vLLM loaded the blockwise FP8 weights of the checkpoint itself, like the trainer
+                del params["weight"], params["weight_scale_inv"]
+            if "weight" in params and params["weight"].dtype == torch.float8_e4m3fn:
+                # Per-channel FP8: one row and one scale per output channel, whatever layout the kernel uses
+                weight = params.pop("weight").data
+                rows = weight if weight.stride(-1) == 1 else weight.t()
+                sizes = module.output_sizes if parts and parts != [fused] else [rows.size(0)]
+                for part, row_view, scale_view in zip(
+                    parts or [fused],
+                    rows.split(sizes),
+                    params.pop("weight_scale").data.view(-1, 1).split(sizes),
+                    strict=True,
+                ):
+                    fp8_views[f"{prefix}{part}"] = (row_view, scale_view)
             if parts and parts != [fused]:
-                prefix = module_name.removesuffix(fused)
-                for name, param in module.named_parameters(recurse=False):
+                for name, param in params.items():
                     for part, view in zip(parts, param.data.split(module.output_sizes), strict=True):
                         views[f"{prefix}{part}.{name}"] = view
 
@@ -492,11 +574,18 @@ class VLLMGeneration:
                 for name, module in self.model.named_modules()
                 if isinstance(module, BaseTunerLayer)
             }
+        fp8_layers = {
+            self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", "")): module
+            for name, module in self.model.named_modules()
+            if isinstance(module, FP8Linear)
+        }
         params = [
             (self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", "")), param)
             for name, param in self.model.named_parameters()
             if not (adapter_prefix and adapter_prefix in name)
         ]
+        # vLLM gets the FP8 copies of these layers' weights, never the high-precision ones
+        params = [(name, param) for name, param in params if name.removesuffix(".weight") not in fp8_layers]
         if self._unshareable is None:
             self._unshareable = set()
             # vLLM's loader can't address layers wrapped by native LoRA
@@ -521,6 +610,20 @@ class VLLMGeneration:
                 view.copy_(original)
             for parent, child_name, child in wrapped:
                 setattr(parent, child_name, child)
+        for name, module in fp8_layers.items():
+            weight, scale = fp8_views.get(name, (None, None))
+            if weight is None or weight.shape != (module.out_features, module.in_features):
+                raise ValueError(f"vLLM doesn't hold `{name}` in per-channel FP8 like the trainer.")
+            if not module.weight_fp8.is_set_to(weight):
+                # vLLM loaded the same checkpoint, unless its loader reordered the rows (e.g. GPT-NeoX's QKV)
+                vllm_weight, trainer_weight = weight.float() * scale, module.weight_fp8.float() * module.weight_scale
+                if (vllm_weight - trainer_weight).norm() > 0.1 * trainer_weight.norm():
+                    raise ValueError(
+                        f"vLLM's loader changes the layout of `{name}`, so its FP8 weights can't be shared."
+                    )
+                weight.copy_(module.weight_fp8)
+                scale.copy_(module.weight_scale)
+                module.weight_fp8, module.weight_scale = weight, scale
         unshared = []
         for name, param in params:
             if name in self._unshareable:

@@ -182,6 +182,13 @@ class SDFTConfig(_BaseConfig):
             Maximum number of sequences vLLM schedules at once per engine. Defaults to the number of completions each
             engine generates per generation batch. If you are using `vllm_mode="server"`, pass `--max-num-seqs` when
             launching the vLLM server instead.
+        vllm_kv_cache_dtype (`str`, *optional*, defaults to `"auto"`):
+            Data type of vLLM's KV cache in colocate mode. `"fp8_per_token_head"` scales each token and head
+            dynamically (Triton attention backend), while `"fp8"` uses the scales stored in the checkpoint, or `1.0`
+            without them. In server mode, pass `--kv-cache-dtype` to the server instead.
+        vllm_kv_cache_dtype_skip_layers (`list[str]`, *optional*):
+            Layer indices (e.g. `"0"`) or attention types (e.g. `"sliding_window"`) whose KV cache keeps the model
+            dtype with `vllm_kv_cache_dtype`.
 
         > Parameters that control the training
 
@@ -412,6 +419,21 @@ class SDFTConfig(_BaseConfig):
             "help": "Maximum number of sequences vLLM schedules at once per engine. Defaults to the number of "
             "completions each engine generates per generation batch. If you are using `vllm_mode='server'`, pass "
             "`--max-num-seqs` when launching the vLLM server instead."
+        },
+    )
+    vllm_kv_cache_dtype: str = field(
+        default="auto",
+        metadata={
+            "help": "Data type of vLLM's KV cache in colocate mode. `'fp8_per_token_head'` scales each token and head "
+            "dynamically (Triton attention backend), while `'fp8'` uses the scales stored in "
+            "the checkpoint, or `1.0` without them. In server mode, pass `--kv-cache-dtype` to the server instead."
+        },
+    )
+    vllm_kv_cache_dtype_skip_layers: list[str] | None = field(
+        default=None,
+        metadata={
+            "help": "Layer indices (e.g. `'0'`) or attention types (e.g. `'sliding_window'`) whose KV cache keeps the "
+            "model dtype with `vllm_kv_cache_dtype`."
         },
     )
     num_iterations: int = field(

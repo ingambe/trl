@@ -20,6 +20,7 @@ from collections.abc import Callable
 import psutil
 import pytest
 import torch
+from packaging.version import Version
 from transformers import is_bitsandbytes_available, is_comet_available, is_wandb_available
 from transformers.testing_utils import backend_device_count, torch_device
 from transformers.utils import (
@@ -29,6 +30,7 @@ from transformers.utils import (
     is_torch_available,
     is_torch_bf16_gpu_available,
     is_torch_xla_available,
+    is_torchao_available,
     is_triton_available,
     is_vision_available,
 )
@@ -54,6 +56,10 @@ require_mergekit = pytest.mark.skipif(not is_mergekit_available(), reason="test 
 require_openreward = pytest.mark.skipif(not is_openreward_available(), reason="test requires openreward")
 require_peft = pytest.mark.skipif(not is_peft_available(), reason="test requires peft")
 require_requests = pytest.mark.skipif(not is_requests_available(), reason="test requires requests")
+require_torchao = pytest.mark.skipif(
+    not is_torchao_available("0.18.0") or Version(torch.__version__) < Version("2.9.0"),
+    reason="test requires torchao>=0.18.0 and torch>=2.9.0",
+)
 # Response parsing needs jmespath only on transformers < 5.13, which ships the legacy `response_schema` parser; the
 # new-style `response_template` parser doesn't use it. See `_SUPPORTS_RESPONSE_TEMPLATE`.
 require_response_parsing = pytest.mark.skipif(
@@ -153,3 +159,14 @@ def kill_process(process):
         process.kill()
     except psutil.NoSuchProcess:
         pass
+
+
+@torch.no_grad()
+def quantize_like_fp8_checkpoint(linear: torch.nn.Linear) -> None:
+    """Store the weight of `linear` in FP8 with a scale per 128x128 block, as Transformers loads an FP8 checkpoint."""
+    blocks = linear.weight.float().unflatten(0, (-1, 128)).unflatten(-1, (-1, 128))
+    scale = blocks.abs().amax(dim=(1, 3)) / torch.finfo(torch.float8_e4m3fn).max
+    weight = (blocks / scale[:, None, :, None]).flatten(2).flatten(0, 1).to(torch.float8_e4m3fn)
+    linear.weight = torch.nn.Parameter(weight, requires_grad=False)
+    linear.weight_scale_inv = torch.nn.Parameter(scale, requires_grad=False)
+    linear.activation_scheme = "dynamic"

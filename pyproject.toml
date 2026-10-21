@@ -78,7 +78,8 @@ quality = [
     "hf-doc-builder"
 ]
 quantization = [
-    "bitsandbytes>=0.45.2"  # older versions fail to import without a GPU on torch 2.6/2.7 (Triton 3.2/3.3), see #7863
+    "bitsandbytes>=0.45.2",  # older versions fail to import without a GPU on torch 2.6/2.7 (Triton 3.2/3.3), see #7863
+    "torchao>=0.18.0"
 ]
 test = [
     "pytest-cov",
@@ -114,6 +115,7 @@ dev = [
     "hf-doc-builder",
     # quantization
     "bitsandbytes>=0.45.2",  # older versions fail to import without a GPU on torch 2.6/2.7 (Triton 3.2/3.3), see #7863
+    "torchao>=0.18.0",
     # test
     "pytest-cov",
     "pytest-datadir>=1.7.0",  # lazy datadirs
