@@ -280,6 +280,13 @@ class ServerDistillationTrainer(DistillationTrainer):
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # transformers computes `num_items_in_batch` from the raw dataloader labels, before on-policy generation
+        # replaces the completions; use the count over the generated completions instead (computed in
+        # `_generate_and_score_completions`). Divide by the process count so the per-process loss compensates for DDP
+        # gradient averaging.
+        if self.model.training and inputs.get("num_items_in_batch") is not None:
+            num_items_in_batch = inputs["num_items_in_batch"].clamp(min=1.0) / self.accelerator.num_processes
+
         # Reconstruct the old `input_ids` / `attention_mask` / `labels` layout this server path is built on from GRPO's
         # keys, so it rides on the base's (evolving) generation. The teacher-server loss is migrated onto the stable
         # base wholesale later (issue #6449, item 58). The first four lines mirror `DistillationTrainer.compute_loss`.
@@ -327,19 +334,15 @@ class ServerDistillationTrainer(DistillationTrainer):
                 student_log_probs=student_log_probs[:, :comp_len, :],
                 completion_tokens=completion_tokens,
                 labels=trimmed_labels,
+                num_items_in_batch=num_items_in_batch,
             )
         else:
             loss = self._compute_server_forward_kl_loss(
                 teacher_result=teacher_result,
                 student_log_probs=student_log_probs[:, :comp_len, :],
                 labels=trimmed_labels,
+                num_items_in_batch=num_items_in_batch,
             )
-
-        # The base trainer sets `loss_is_scaled_for_ga = True` because it normalizes by the global completion-token
-        # count. The server path normalizes locally with `batchmean` and does not consume `num_items_in_batch`, so it
-        # must re-apply that scaling itself.
-        if self.model.training:
-            loss = loss / self.current_gradient_accumulation_steps
 
         return (loss, student_outputs) if return_outputs else loss
 
@@ -439,6 +442,7 @@ class ServerDistillationTrainer(DistillationTrainer):
         student_log_probs: torch.Tensor,
         completion_tokens: torch.Tensor,
         labels: torch.Tensor,
+        num_items_in_batch=None,
     ) -> torch.Tensor:
         """Compute exact sparse top-1 generalized JSD/KL from server-provided teacher logprobs.
 
@@ -483,10 +487,6 @@ class ServerDistillationTrainer(DistillationTrainer):
         # Server path only supports "sampled" mode — config validation enforces this, but we guard
         # explicitly so future relaxations of the config check don't silently change behaviour.
         reverse_token_ids = self._get_reverse_kl_top_1_tokens(student_log_probs, completion_tokens)
-        # The server path normalizes locally (batchmean), not by num_items_in_batch: teacher logprobs may not cover
-        # every student completion token (the loss is summed over the trimmed teacher window), so the global token
-        # count would be the wrong denominator. Gradient-accumulation normalization for the server path is left as a
-        # follow-up.
         return self._compute_sparse_top_1_divergence_loss(
             student_log_probs=student_log_probs,
             teacher_top1_token_ids=topk_token_ids.squeeze(-1),
@@ -494,6 +494,7 @@ class ServerDistillationTrainer(DistillationTrainer):
             reverse_token_ids=reverse_token_ids,
             reverse_teacher_logprobs=actual_teacher_lps,
             labels=labels,
+            num_items_in_batch=num_items_in_batch,
         )
 
     def _compute_server_forward_kl_loss(
@@ -501,6 +502,7 @@ class ServerDistillationTrainer(DistillationTrainer):
         teacher_result: dict[str, torch.Tensor],
         student_log_probs: torch.Tensor,
         labels: torch.Tensor,
+        num_items_in_batch=None,
     ) -> torch.Tensor:
         """Compute sparse forward KL from server-provided teacher top-k logprobs (beta==0 path).
 
@@ -536,6 +538,6 @@ class ServerDistillationTrainer(DistillationTrainer):
             beta=0.0,
             support_mask=support_mask,
         )
-        # See `_compute_server_sparse_top_1_divergence_loss`: the server path normalizes locally, not by
-        # num_items_in_batch, because the teacher window may not cover every student completion token.
-        return self._reduce_divergence_loss(jsd, completion_mask=labels != -100, reduction="batchmean")
+        return self._reduce_divergence_loss(
+            jsd, completion_mask=labels != -100, reduction="batchmean", num_items_in_batch=num_items_in_batch
+        )
