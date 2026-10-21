@@ -101,6 +101,11 @@ class TestMissingServerSettings(TrlTestCase):
     def server_info(self, weight_transfer_config):
         return self.make_response(200, {"vllm_config": {"weight_transfer_config": weight_transfer_config}})
 
+    def test_weight_transfer_requests_are_not_retried(self):
+        client = self.make_client()
+        assert client.session.get_adapter(f"{client.base_url}/update_weights").max_retries.total == 0
+        assert client.session.get_adapter(f"{client.base_url}/v1/completions").max_retries.total == 5
+
     def test_get_server_info(self):
         client = self.make_client()
         response = self.server_info(weight_transfer_config={"backend": "nccl"})
