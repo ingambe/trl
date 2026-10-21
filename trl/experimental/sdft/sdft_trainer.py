@@ -337,7 +337,8 @@ class SDFTTrainer(_BaseTrainer):
         self.num_generations_eval = args.num_generations_eval or args.num_generations
         self.num_iterations = args.num_iterations
         self.shuffle_dataset = args.shuffle_dataset
-        self.temperature = args.temperature
+        # Scoring must use the sampling temperature, which `generation_kwargs` can override (except a greedy 0)
+        self.temperature = (args.generation_kwargs or {}).get("temperature") or args.temperature
         self.generate_from_teacher = args.generate_from_teacher
         self.use_vllm = args.use_vllm
         self.chat_template_kwargs = args.chat_template_kwargs or {}
