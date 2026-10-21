@@ -1087,7 +1087,7 @@ class _AsyncRolloutLoop:
                 **self.chat_template_kwargs,
             )
             turn_ids, turn_logprobs, turn_sampling_mask, turn_sampler_logprobs = await self._generate_one_turn(
-                prompt_ids
+                prompt_ids, self.max_tokens - len(completion_ids)
             )
             assistant_message = parse_response(self.tokenizer, turn_ids, prefix=prompt_ids, tools=tools)
             completion.append(assistant_message)
@@ -1105,7 +1105,8 @@ class _AsyncRolloutLoop:
             tool_calls = assistant_message.get("tool_calls")
             if tool_calls is None:
                 break
-            if max_iterations is not None and iteration_num >= max_iterations:
+            out_of_turns = max_iterations is not None and iteration_num >= max_iterations
+            if out_of_turns or len(completion_ids) >= self.max_tokens:
                 # Cut off mid-loop: the model asked for another tool and we refused. The conversation is trained as if
                 # it had finished, so this is a silent truncation — hence the metric.
                 loop_exhausted = True
@@ -1171,12 +1172,12 @@ class _AsyncRolloutLoop:
         return tool_messages, n_calls, n_failures
 
     async def _generate_one_turn(
-        self, prompt_ids: list[int]
+        self, prompt_ids: list[int], max_tokens: int
     ) -> tuple[list[int], list[float], list[list[int]] | None, list[dict[int, float]] | None]:
         """Sample one turn: its token ids, their logprobs, with top-k/top-p the candidate set of each token, and with
         `num_sampler_logprobs` the sampler's top log-probs at each token, by token id."""
         sampling_params = {
-            "max_tokens": self.max_tokens,
+            "max_tokens": max_tokens,
             "temperature": self.temperature,
             "top_p": self.top_p,
             "top_k": self.top_k,
