@@ -43,6 +43,7 @@ from datasets import Dataset, DatasetDict, IterableDataset, IterableDatasetDict
 from huggingface_hub import CommitScheduler, DatasetCard, DatasetCardData, create_repo
 from packaging.version import Version
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Sampler
 from transformers import (
     AutoModelForSequenceClassification,
@@ -74,6 +75,7 @@ from ..extras.profiling import profiling_context, profiling_decorator
 from ..generation.vllm_generation import VLLMGeneration
 from ..import_utils import is_jmespath_available
 from ..models import prepare_deepspeed, prepare_fsdp, unwrap_model_for_generation
+from ..models.fp8 import convert_to_fp8_training, requantize_fp8_layers
 from ..models.utils import disable_gradient_checkpointing
 from .base_trainer import _BaseTrainer
 from .callbacks import SyncRefModelCallback
@@ -1101,6 +1103,42 @@ class GRPOTrainer(_BaseTrainer):
             if self.ref_model is not None:
                 _cast_lm_head_to_fp32(self.ref_model)
 
+        if args.fp8_recipe is not None:
+            quantization_config = model.config.to_dict().get("quantization_config")
+            # On GPU, Transformers keeps the FP8 weights of a blockwise FP8 checkpoint, for a PEFT adapter to train
+            if quantization_config is not None and not (
+                quantization_config["quant_method"] == "fp8"
+                and quantization_config.get("weight_block_size") == [128, 128]
+                and not quantization_config.get("dequantize")
+                and is_peft_model(model)
+            ):
+                raise ValueError(
+                    "`fp8_recipe` trains a quantized checkpoint only as the frozen base of a PEFT adapter, and only an "
+                    "FP8 one quantized in 128x128 blocks and loaded on GPU, not one quantized with "
+                    f"{quantization_config['quant_method']}. Full fine-tuning needs high-precision master weights, so a "
+                    "dequantized FP8 checkpoint saves no memory over the BF16 one, starts from rounded weights and "
+                    "trains in a different FP8 layout than vLLM serves it: train the BF16 checkpoint instead."
+                )
+            backend = DistributedBackend(self.accelerator)
+            if backend.is_fsdp or backend.is_zero3:
+                raise ValueError("`fp8_recipe` keeps its FP8 weights in buffers, which FSDP and ZeRO-3 don't shard.")
+            if args.bf16_full_eval or args.fp16_full_eval:
+                raise ValueError(
+                    "`fp8_recipe` doesn't support `bf16_full_eval` or `fp16_full_eval`, whose model cast "
+                    "also casts the FP8 weights."
+                )
+            if self.ref_model is not None:
+                # The reference converts the same layers as the policy, whose frozen layers stay in high precision
+                for param, ref_param in zip(model.parameters(), self.ref_model.parameters(), strict=True):
+                    ref_param.requires_grad_(param.requires_grad)
+                convert_to_fp8_training(self.ref_model, args.fp8_recipe, args.fp8_skip_modules, args.fp8_fast_accum)
+            convert_to_fp8_training(model, args.fp8_recipe, args.fp8_skip_modules, args.fp8_fast_accum)
+            # Each rank requantizes its own FP8 copies, which DDP can't broadcast
+            DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(
+                model, [name for name, _ in model.named_buffers() if name.endswith((".weight_fp8", ".weight_scale"))]
+            )
+            self._fp8_quantized_step = 0
+
         # Liger's fused linear cross-entropy replaces `model.forward` when training starts, which would drop the fused
         # LM head, so only its layer kernels are applied
         if args.use_liger_kernel:
@@ -1181,6 +1219,8 @@ class GRPOTrainer(_BaseTrainer):
                 max_num_seqs=args.vllm_max_num_seqs
                 or args.per_device_train_batch_size * args.vllm_tensor_parallel_size * args.steps_per_generation,
                 max_num_batched_tokens=args.vllm_max_num_batched_tokens,
+                kv_cache_dtype=args.vllm_kv_cache_dtype,
+                kv_cache_dtype_skip_layers=args.vllm_kv_cache_dtype_skip_layers,
                 enable_sleep_mode=args.vllm_enable_sleep_mode,
                 share_weights=args.vllm_share_weights,
                 native_lora=args.vllm_native_lora,
@@ -1628,6 +1668,13 @@ class GRPOTrainer(_BaseTrainer):
         #   - The input is treated as a standard local batch (no accumulation, no multiple iterations)
         #   - Completions are generated for each batch without buffering or reuse
         # Returns a single local batch in both cases.
+
+        # FP8 layers don't check their weights in their forward: requantize them after an optimizer step or a resume
+        if self.args.fp8_recipe is not None and self.state.global_step != self._fp8_quantized_step:
+            requantize_fp8_layers(self.model)
+            if self.args.sync_ref_model:
+                requantize_fp8_layers(self.ref_model)
+            self._fp8_quantized_step = self.state.global_step
 
         mode = "train" if self.model.training else "eval"
         if mode == "train":
