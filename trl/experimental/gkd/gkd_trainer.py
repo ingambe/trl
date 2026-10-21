@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import itertools
 import random
 import textwrap
@@ -185,6 +186,19 @@ class GKDTrainer(SFTTrainer):
                 f"GOLD for cross-tokenizer distillation."
             )
 
+        # Some models (e.g. Bloom, Mamba) don't accept `position_ids`. Inspect the forward method of the unwrapped
+        # models
+        self.model_kwarg_keys = (
+            inspect.signature(self.model.forward).parameters.keys()
+            if not hasattr(self.model, "get_base_model")
+            else inspect.signature(self.model.get_base_model().forward).parameters.keys()
+        )
+        self.teacher_model_kwarg_keys = (
+            inspect.signature(teacher_model.forward).parameters.keys()
+            if not hasattr(teacher_model, "get_base_model")
+            else inspect.signature(teacher_model.get_base_model().forward).parameters.keys()
+        )
+
         # Disable dropout in the model
         if args.disable_dropout:
             disable_dropout_in_model(self.model)
@@ -324,18 +338,19 @@ class GKDTrainer(SFTTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # compute student output
-        student_outputs = model(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-        )
+        position_ids = (inputs["attention_mask"].cumsum(-1) - 1).clamp(min=0)
+        model_inputs = {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]}
+        if "position_ids" in self.model_kwarg_keys:
+            model_inputs["position_ids"] = position_ids
+        student_outputs = model(**model_inputs)
 
         # compute teacher output in eval mode
         self.teacher_model.eval()
+        teacher_inputs = {"input_ids": inputs["input_ids"], "attention_mask": inputs["attention_mask"]}
+        if "position_ids" in self.teacher_model_kwarg_keys:
+            teacher_inputs["position_ids"] = position_ids
         with torch.no_grad():
-            teacher_outputs = self.teacher_model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-            )
+            teacher_outputs = self.teacher_model(**teacher_inputs)
 
         # Standard causal shift: logits at position i predict the token at i + 1. The `labels != -100` mask
         # inside `generalized_jsd_loss` already excludes prompt (and padding) positions, so we do not slice by
