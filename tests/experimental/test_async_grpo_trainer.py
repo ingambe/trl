@@ -65,6 +65,7 @@ from trl.experimental.async_grpo.async_rollout_worker import (
     _SampleBuilder,
 )
 from trl.experimental.async_grpo.packing import TREE_ATTENTION, TreeRow
+from trl.import_utils import is_aiohttp_available
 from trl.trainer.base_trainer import _BaseTrainer
 
 from ..testing_utils import (
@@ -75,6 +76,12 @@ from ..testing_utils import (
     require_torch_accelerator,
     require_vllm,
 )
+
+
+if is_aiohttp_available():
+    import aiohttp
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
 
 
 # The trainer loads the model with Flash Attention, which requires a `head_size` multiple of 8. Hence the `small-*`
@@ -839,10 +846,6 @@ class TestAsyncRolloutWorkerEnvironments(TrlTestCase):
     def test_inflight_cap_follows_vllm_load(self):
         # The in-flight cap starts at `KV cache tokens / max_model_len`, grows while the server reads clear, is cut
         # when KV usage passes 0.8 and holds until the pool has drained below it.
-        import aiohttp
-        from aiohttp import web
-        from aiohttp.test_utils import TestServer
-
         PartialState()  # the worker logs via accelerate's logger, which needs an initialized state
         load = {"usage": 0.1, "polls": 0}
 
@@ -1842,6 +1845,28 @@ class TestGenerateOneTurn(TrlTestCase):
         assert requests[0][1]["sampling_params"]["top_p"] == 0.9
         assert requests[0][1]["sampling_params"]["top_k"] == 4
         assert (ids, logprobs, sampling_mask) == ([4, 5], [-0.1, -0.2], [[4, 7], [5]])
+
+    def test_client_error_is_not_retried(self):
+        PartialState()
+        calls = []
+
+        async def completions(request):
+            calls.append(request)
+            return web.json_response({"error": "prompt too long"}, status=400)
+
+        app = web.Application()
+        app.router.add_post("/v1/completions", completions)
+        loop = _rollout_loop()
+
+        async def run():
+            async with TestServer(app) as server, aiohttp.ClientSession() as session:
+                loop.vllm_server_url = str(server.make_url("")).rstrip("/")
+                loop.session = session
+                with pytest.raises(aiohttp.ClientResponseError):
+                    await loop._generate_one_turn([1, 2, 3])
+
+        asyncio.run(run())
+        assert len(calls) == 1
 
     def _check(self, loop, model_config, paths, version="0.31.0"):
         class FakeSession:
