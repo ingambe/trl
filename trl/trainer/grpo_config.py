@@ -1393,6 +1393,12 @@ class GRPOConfig(_BaseConfig):
             if self.loss_type != "reinforce" or not self.use_vllm:
                 raise ValueError("`score_centering` requires `loss_type='reinforce'` and `use_vllm=True`.")
             # The trainer's distribution must be the sampler's, up to the recorded truncation
+            overridden = {"top_k", "top_p", "min_p", "repetition_penalty"} & set(self.generation_kwargs or {})
+            if overridden:
+                raise ValueError(
+                    f"`score_centering` checks the sampling options set by their own arguments: pass "
+                    f"{sorted(overridden)} as arguments rather than in `generation_kwargs`."
+                )
             if self.repetition_penalty != 1.0 or self.off_policy_mask_threshold is not None:
                 raise ValueError("`score_centering` requires `repetition_penalty=1.0` and no off-policy mask.")
             if self.top_entropy_quantile < 1.0:

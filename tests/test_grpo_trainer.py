@@ -5844,6 +5844,10 @@ def test_score_centering_vanishes_when_the_sampler_matches(
         ({"loss_type": "reinforce", "score_centering": "head_tail", "top_k": 50}, "untruncated sampling"),
         ({"loss_type": "reinforce", "score_centering": "support_replay"}, "`top_k > 0`"),
         (
+            {"loss_type": "reinforce", "score_centering": "head_tail", "generation_kwargs": {"top_k": 4}},
+            "rather than in `generation_kwargs`",
+        ),
+        (
             {"loss_type": "reinforce", "vllm_importance_sampling_mode": "sequence_mask"},
             "'token_truncate' or 'token_mask'",
         ),
