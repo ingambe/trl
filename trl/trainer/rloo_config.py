@@ -198,6 +198,39 @@ class RLOOConfig(_BaseConfig):
         epsilon_high (`float`, *optional*):
             Upper-bound epsilon value for clipping. If not specified, it defaults to the same value as the lower-bound
             specified in argument `epsilon`. Paper [DAPO](https://huggingface.co/papers/2503.14476) recommends `0.28`.
+        loss_type (`str`, *optional*, defaults to `"ppo"`):
+            Objective. Possible values are:
+
+                - `"ppo"`: The clipped sequence-ratio objective, `-min(r * A, clip(r, 1 - ε, 1 + ε_high) * A)` with `r`
+                the ratio of the sequence probabilities to the old policy's.
+                - `"reinforce"`: REINFORCE with the leave-one-out advantages, `-A * log p` summed over each
+                  completion's
+                tokens and averaged over completions. With vLLM, each token is weighted by its
+                `vllm_importance_sampling_mode` ratio of the current policy's probability over the sampler's, `p / q`.
+                Requires `num_iterations=1`. Combine it with `score_centering`.
+        vllm_importance_sampling_correction (`bool`, *optional*, defaults to `True`):
+            Whether `loss_type="reinforce"` weights each token by its importance sampling ratio `p / q` when using
+            vLLM.
+        vllm_importance_sampling_mode (`str`, *optional*, defaults to `"token_truncate"`):
+            How the ratios are constrained: `"token_truncate"` clips them to [C_min, C_max], `"token_mask"` sets those
+            outside [C_min, C_max] to zero.
+        vllm_importance_sampling_clip_max (`float`, *optional*, defaults to `3.0`):
+            Importance sampling upper bound C_max.
+        vllm_importance_sampling_clip_min (`float`, *optional*):
+            Importance sampling lower bound C_min.
+        score_centering (`str`, *optional*, defaults to `"off"`):
+            Score centering, from [Score Centering Stabilizes Off-policy Reinforcement
+            Learning](https://huggingface.co/papers/2609.20807), for `loss_type="reinforce"` with vLLM: subtracts from
+            each token's weighted score its expectation under the sampler. Possible values are:
+
+                - `"off"`: No score centering.
+                - `"head_tail"`: Records the sampler's top-`score_centering_topk` probabilities and models the rest as
+                the policy's, rescaled to the sampler's remaining mass. Requires untruncated sampling (`top_k=0`,
+                `top_p=1.0`, `min_p=0.0`).
+                - `"support_replay"`: Records every token of the sampler's top-k support, and normalizes the policy
+                over that support, for an exact expectation. Requires `top_k > 0`.
+        score_centering_topk (`int`, *optional*, defaults to `128`):
+            Number of sampler probabilities recorded per token with `score_centering="head_tail"`.
         reward_weights (`list[float]`, *optional*):
             Weights for each reward function. Must match the number of reward functions. If `None`, all rewards are
             weighted equally with weight `1.0`.
@@ -264,12 +297,10 @@ class RLOOConfig(_BaseConfig):
 
             </Deprecated>
 
-    > [!NOTE]
-    > These parameters have default values different from [`~transformers.TrainingArguments`]:
-    > - `logging_steps`: Defaults to `10` instead of `500`.
-    > - `gradient_checkpointing`: Defaults to `True` instead of `False`.
-    > - `bf16`: Defaults to `True` if `fp16` is not set, instead of `False`.
-    > - `learning_rate`: Defaults to `1e-6` instead of `5e-5`.
+    > [!NOTE] > These parameters have default values different from [`~transformers.TrainingArguments`]: > -
+    `logging_steps`: Defaults to `10` instead of `500`. > - `gradient_checkpointing`: Defaults to `True` instead of
+    `False`. > - `bf16`: Defaults to `True` if `fp16` is not set, instead of `False`. > - `learning_rate`: Defaults to
+    `1e-6` instead of `5e-5`.
     """
 
     _VALID_DICT_FIELDS = _BaseConfig._VALID_DICT_FIELDS + [
@@ -604,6 +635,50 @@ class RLOOConfig(_BaseConfig):
             "lower-bound specified in argument `epsilon`. Paper DAPO recommends `0.28`."
         },
     )
+    loss_type: str = field(
+        default="ppo",
+        metadata={
+            "help": "Objective. 'ppo': the clipped sequence-ratio objective. 'reinforce': `-A * log p` summed over "
+            "each completion's tokens and averaged over completions, weighted with vLLM by each token's "
+            "`vllm_importance_sampling_mode` ratio `p / q`; requires `num_iterations=1`."
+        },
+    )
+    vllm_importance_sampling_correction: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether `loss_type='reinforce'` weights each token by its importance sampling ratio `p / q` when "
+            "using vLLM."
+        },
+    )
+    vllm_importance_sampling_mode: str = field(
+        default="token_truncate",
+        metadata={
+            "help": "How the ratios are constrained: 'token_truncate' clips them to [C_min, C_max], 'token_mask' sets "
+            "those outside [C_min, C_max] to zero."
+        },
+    )
+    vllm_importance_sampling_clip_max: float | None = field(
+        default=3.0,
+        metadata={"help": "Importance sampling upper bound C_max."},
+    )
+    vllm_importance_sampling_clip_min: float | None = field(
+        default=None,
+        metadata={"help": "Importance sampling lower bound C_min."},
+    )
+    score_centering: str = field(
+        default="off",
+        metadata={
+            "help": "Score centering for `loss_type='reinforce'` with vLLM: subtracts from each token's weighted "
+            "score its expectation under the sampler. 'off': none. 'head_tail': records the sampler's top "
+            "`score_centering_topk` probabilities and models the rest as the policy's, rescaled to the sampler's "
+            "remaining mass; requires `top_k=0`, `top_p=1.0` and `min_p=0.0`. 'support_replay': records the sampler's "
+            "whole top-k support and normalizes the policy over it; requires `top_k > 0`."
+        },
+    )
+    score_centering_topk: int = field(
+        default=128,
+        metadata={"help": "Number of sampler probabilities recorded per token with `score_centering='head_tail'`."},
+    )
     reward_weights: list[float] | None = field(
         default=None,
         metadata={
@@ -789,6 +864,45 @@ class RLOOConfig(_BaseConfig):
                 f"generation_batch_size ({self.generation_batch_size}) must be divisible by num_generations "
                 f"({self.num_generations})."
             )
+
+        if self.loss_type not in ("ppo", "reinforce"):
+            raise ValueError(f"`loss_type` must be 'ppo' or 'reinforce', got '{self.loss_type}'.")
+        if self.loss_type == "reinforce" and self.num_iterations != 1:
+            raise ValueError("`loss_type='reinforce'` updates on each completion once: set `num_iterations=1`.")
+        if self.vllm_importance_sampling_mode not in ("token_truncate", "token_mask"):
+            raise ValueError(
+                "`vllm_importance_sampling_mode` must be 'token_truncate' or 'token_mask', got "
+                f"'{self.vllm_importance_sampling_mode}'."
+            )
+
+        if self.score_centering not in ("off", "head_tail", "support_replay"):
+            raise ValueError(
+                f"`score_centering` must be 'off', 'head_tail' or 'support_replay', got '{self.score_centering}'."
+            )
+        if self.score_centering != "off":
+            if self.loss_type != "reinforce" or not self.use_vllm:
+                raise ValueError("`score_centering` requires `loss_type='reinforce'` and `use_vllm=True`.")
+            # The trainer's distribution must be the sampler's, up to the recorded truncation
+            overridden = {"top_k", "top_p", "min_p", "repetition_penalty"} & set(self.generation_kwargs or {})
+            if overridden:
+                raise ValueError(
+                    f"`score_centering` checks the sampling options set by their own arguments: pass "
+                    f"{sorted(overridden)} as arguments rather than in `generation_kwargs`."
+                )
+            if self.repetition_penalty != 1.0:
+                raise ValueError("`score_centering` requires `repetition_penalty=1.0`.")
+            if self.score_centering == "head_tail" and (
+                self.top_k not in (0, -1) or self.top_p != 1.0 or self.min_p not in (None, 0.0)
+            ):
+                raise ValueError(
+                    "`score_centering='head_tail'` models the sampler's tail, so it requires untruncated sampling: "
+                    "`top_k=0`, `top_p=1.0` and `min_p=0.0`."
+                )
+            if self.score_centering == "support_replay" and (self.top_k <= 0 or self.min_p not in (None, 0.0)):
+                raise ValueError(
+                    "`score_centering='support_replay'` records the sampler's whole support, so it requires "
+                    "`top_k > 0` (the support's size bound) and `min_p=0.0`."
+                )
 
         if self.num_generations < 2:
             raise ValueError(
