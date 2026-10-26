@@ -201,13 +201,12 @@ class RLOOConfig(_BaseConfig):
         loss_type (`str`, *optional*, defaults to `"ppo"`):
             Objective. Possible values are:
 
-                - `"ppo"`: The clipped sequence-ratio objective, `-min(r * A, clip(r, 1 - ε, 1 + ε_high) * A)` with `r`
-                the ratio of the sequence probabilities to the old policy's.
-                - `"reinforce"`: REINFORCE with the leave-one-out advantages, `-A * log p` summed over each
-                  completion's
-                tokens and averaged over completions. With vLLM, each token is weighted by its
-                `vllm_importance_sampling_mode` ratio of the current policy's probability over the sampler's, `p / q`.
-                Requires `num_iterations=1`. Combine it with `score_centering`.
+            - `"ppo"`: The clipped sequence-ratio objective, `-min(r * A, clip(r, 1 - ε, 1 + ε_high) * A)` with `r` the
+              ratio of the sequence probabilities to the old policy's.
+            - `"reinforce"`: REINFORCE with the leave-one-out advantages, `-A * log p` summed over each completion's
+              tokens and averaged over completions. With vLLM, each token is weighted by its
+              `vllm_importance_sampling_mode` ratio of the current policy's probability over the sampler's, `p / q`.
+              Requires `num_iterations=1`. Combine it with `score_centering`.
         vllm_importance_sampling_correction (`bool`, *optional*, defaults to `True`):
             Whether `loss_type="reinforce"` weights each token by its importance sampling ratio `p / q` when using
             vLLM.
@@ -223,12 +222,12 @@ class RLOOConfig(_BaseConfig):
             Learning](https://huggingface.co/papers/2609.20807), for `loss_type="reinforce"` with vLLM: subtracts from
             each token's weighted score its expectation under the sampler. Possible values are:
 
-                - `"off"`: No score centering.
-                - `"head_tail"`: Records the sampler's top-`score_centering_topk` probabilities and models the rest as
-                the policy's, rescaled to the sampler's remaining mass. Requires untruncated sampling (`top_k=0`,
-                `top_p=1.0`, `min_p=0.0`).
-                - `"support_replay"`: Records every token of the sampler's top-k support, and normalizes the policy
-                over that support, for an exact expectation. Requires `top_k > 0`.
+            - `"off"`: No score centering.
+            - `"head_tail"`: Records the sampler's top-`score_centering_topk` probabilities and models the rest as the
+              policy's, rescaled to the sampler's remaining mass. Requires untruncated sampling (`top_k=0`,
+              `top_p=1.0`, `min_p=0.0`).
+            - `"support_replay"`: Records every token of the sampler's top-k support, and normalizes the policy over
+              that support, for an exact expectation. Requires `top_k > 0`.
         score_centering_topk (`int`, *optional*, defaults to `128`):
             Number of sampler probabilities recorded per token with `score_centering="head_tail"`.
         reward_weights (`list[float]`, *optional*):
@@ -297,10 +296,12 @@ class RLOOConfig(_BaseConfig):
 
             </Deprecated>
 
-    > [!NOTE] > These parameters have default values different from [`~transformers.TrainingArguments`]: > -
-    `logging_steps`: Defaults to `10` instead of `500`. > - `gradient_checkpointing`: Defaults to `True` instead of
-    `False`. > - `bf16`: Defaults to `True` if `fp16` is not set, instead of `False`. > - `learning_rate`: Defaults to
-    `1e-6` instead of `5e-5`.
+    > [!NOTE]
+    > These parameters have default values different from [`~transformers.TrainingArguments`]:
+    > - `logging_steps`: Defaults to `10` instead of `500`.
+    > - `gradient_checkpointing`: Defaults to `True` instead of `False`.
+    > - `bf16`: Defaults to `True` if `fp16` is not set, instead of `False`.
+    > - `learning_rate`: Defaults to `1e-6` instead of `5e-5`.
     """
 
     _VALID_DICT_FIELDS = _BaseConfig._VALID_DICT_FIELDS + [
