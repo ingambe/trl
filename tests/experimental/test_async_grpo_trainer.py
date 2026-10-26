@@ -1199,6 +1199,7 @@ def _rollout_sample(length: int, advantage: float = 0.0, reward: float = 0.0) ->
         "sampler_log_probs": np.full((length, 0), -np.inf, dtype=np.float32),
         "advantage": advantage,
         "group_id": int(input_ids[0]),
+        "model_version": 0,
         "metrics": {"reward": reward},
     }
 
@@ -1410,7 +1411,7 @@ class TestPackingAwareBatching(TrlTestCase):
         assert grads == pytest.approx([180 / 220, 180 / 220])
 
 
-def _tree_sample(tokens: list[int], n_prompt: int, advantage: float = 0.0, group_id: int = 0):
+def _tree_sample(tokens: list[int], n_prompt: int, advantage: float = 0.0, group_id: int = 0, model_version: int = 0):
     return {
         "input_ids": np.array(tokens, dtype=np.int64),
         "completion_mask": np.array([0] * n_prompt + [1] * (len(tokens) - n_prompt), dtype=np.int64),
@@ -1420,6 +1421,7 @@ def _tree_sample(tokens: list[int], n_prompt: int, advantage: float = 0.0, group
         "sampler_log_probs": np.full((len(tokens), 0), -np.inf, dtype=np.float32),
         "advantage": advantage,
         "group_id": group_id,
+        "model_version": model_version,
         "metrics": {"reward": 0.0},
     }
 
@@ -1499,6 +1501,12 @@ class TestTreePacking(TrlTestCase):
         assert packed["input_ids"].tolist() == [1, 2, 3, 1, 2, 3]
         assert packed["sampling_mask"].tolist() == [2, 5, 3, 2, 6, 3]
         assert packed["sampling_mask_counts"].tolist() == [2, 1, 0, 2, 1, 0]
+
+    def test_policy_versions_do_not_share(self):
+        rows = [_tree_sample([1, 2, 3], n_prompt=1, model_version=v) for v in (0, 1)]
+        packed = _tree_row(rows).pack()
+
+        assert packed["input_ids"].tolist() == [1, 2, 3, 1, 2, 3]
 
     def test_groups_share_a_common_prefix(self):
         rows = [_tree_sample([1, 2, 3, last], n_prompt=1, group_id=g) for g, last in ((0, 4), (1, 5))]
