@@ -765,6 +765,8 @@ training_args = GRPOConfig(
 )
 ```
 
+With `score_centering="support_replay"`, the clipped GRPO objectives are centered too: the weight of each support token is the derivative of the clipped surrogate in its log-probability,  \\( f(\pi_{\text{old}} / \mu) \, (\pi_\theta / \pi_{\text{old}}) \, G \\), with  \\( G \\) zero where the clipping is flat (`trl.trainer.utils.ppo_clip_gate`). The trainer scores the old policy over the same support.
+
 [`RLOOConfig`] takes the same options, with REINFORCE summed over each completion's tokens and averaged over completions.
 
 ## Optimal Advantage Regression
