@@ -1989,6 +1989,20 @@ class TestGenerateOneTurn(TrlTestCase):
         with pytest.raises(ValueError, match="score_centering"):
             AsyncGRPOConfig(**kwargs)
 
+    @pytest.mark.parametrize(
+        "kwargs, match",
+        [
+            (
+                {"vllm_importance_sampling_clip_min": 2.0, "vllm_importance_sampling_clip_max": 1.0},
+                "must be less than",
+            ),
+            ({"vllm_importance_sampling_clip_max": None}, "At least one of"),
+        ],
+    )
+    def test_invalid_importance_sampling_bounds_are_rejected(self, kwargs, match):
+        with pytest.raises(ValueError, match=match):
+            AsyncGRPOConfig(**kwargs)
+
 
 @require_response_parsing
 class TestRolloutLoop(TrlTestCase):

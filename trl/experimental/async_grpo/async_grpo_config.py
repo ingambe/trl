@@ -475,6 +475,25 @@ class AsyncGRPOConfig(_BaseConfig):
                 "`vllm_importance_sampling_mode` must be 'token_truncate' or 'token_mask', got "
                 f"'{self.vllm_importance_sampling_mode}'."
             )
+        if (
+            self.vllm_importance_sampling_clip_min is not None
+            and self.vllm_importance_sampling_clip_max is not None
+            and self.vllm_importance_sampling_clip_min >= self.vllm_importance_sampling_clip_max
+        ):
+            raise ValueError(
+                f"vllm_importance_sampling_clip_min ({self.vllm_importance_sampling_clip_min}) must be less than "
+                f"vllm_importance_sampling_clip_max ({self.vllm_importance_sampling_clip_max})."
+            )
+        if (
+            self.vllm_importance_sampling_correction
+            and self.vllm_importance_sampling_mode == "token_truncate"
+            and self.vllm_importance_sampling_clip_min is None
+            and self.vllm_importance_sampling_clip_max is None
+        ):
+            raise ValueError(
+                "At least one of `vllm_importance_sampling_clip_min` or `vllm_importance_sampling_clip_max` "
+                "must be set when `vllm_importance_sampling_mode` is 'token_truncate'."
+            )
         if self.score_centering not in ("off", "support_replay"):
             raise ValueError(f"`score_centering` must be 'off' or 'support_replay', got '{self.score_centering}'.")
         if self.score_centering != "off":
