@@ -490,6 +490,27 @@ class GRPOTrainer(_BaseTrainer):
                     "peft, or load the model with `device_map=None`. See "
                     "https://github.com/huggingface/peft/issues/2821."
                 )
+            # With transformers v5, peft<0.19 doesn't apply `target_modules` to the fused MoE routed experts (#7765)
+            if (
+                isinstance(peft_config, LoraConfig)
+                and Version(transformers.__version__) >= Version("5.0.0")
+                and Version(peft.__version__) < Version("0.19.0")
+                and not peft_config.target_parameters
+                and any(param.ndim == 3 for name, param in model.named_parameters() if ".experts." in name)
+                and (
+                    peft_config.target_modules == "all-linear"
+                    or any(
+                        name.rsplit(".", 1)[-1] in {"gate_proj", "up_proj", "down_proj", "w1", "w2", "w3"}
+                        for name in peft_config.target_modules or []
+                    )
+                )
+            ):
+                raise ValueError(
+                    "With transformers v5, LoRA `target_modules` only reach the routed experts of MoE models from "
+                    "`peft>=0.19.0`. Upgrade peft, or also target the expert parameters with `target_parameters` "
+                    "(e.g. `target_parameters=['mlp.experts.gate_up_proj', 'mlp.experts.down_proj']`). See "
+                    "https://github.com/huggingface/trl/issues/7765."
+                )
             # With transformers v5, peft 0.19 to 0.21.2 skip the MoE dense and shared layers (#7767)
             if (
                 isinstance(peft_config, LoraConfig)
@@ -1566,18 +1587,18 @@ class GRPOTrainer(_BaseTrainer):
         token_type_ids=None,
         mm_token_type_ids=None,
         image_position_ids=None,
-        query_ids=None,
+        score_ids=None,
         support_ids=None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """
         Compute log-probs, (optionally) entropies, (optionally) the MoE load-balancing aux loss, and (optionally) the
-        log-probs of the completion's `query_ids`. With `support_ids`, the log-probs are normalized over that support.
+        log-probs of the completion's `score_ids`. With `support_ids`, the log-probs are normalized over that support.
         """
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
         all_entropies = []
         all_aux_losses = []
-        all_query_logps = []
+        all_score_logps = []
         for start in range(0, input_ids.size(0), batch_size):
             end = min(start + batch_size, input_ids.size(0))  # the last chunk can be smaller than batch_size
             input_ids_batch = input_ids[start:end]
@@ -1634,8 +1655,8 @@ class GRPOTrainer(_BaseTrainer):
             labels = input_ids_batch.masked_fill(attention_mask_batch == 0, -100)
             labels[:, :-logits_to_keep] = -100
 
-            # The queried ids and supports are aligned with the completion tokens; the prompt queries nothing
-            for key, ids in (("query_ids", query_ids), ("support_ids", support_ids)):
+            # The scored ids and supports are aligned with the completion tokens; the prompt scores nothing
+            for key, ids in (("score_ids", score_ids), ("support_ids", support_ids)):
                 if ids is not None:
                     ids = ids[start:end].long()
                     prompt = ids.new_full((ids.size(0), input_ids_batch.size(1) - logits_to_keep, ids.size(2)), -1)
@@ -1652,14 +1673,14 @@ class GRPOTrainer(_BaseTrainer):
                 all_entropies.append(outputs.entropy[:, -logits_to_keep:])
             if compute_aux_loss:
                 all_aux_losses.append(outputs.aux_loss)
-            if query_ids is not None:
-                all_query_logps.append(outputs.query_log_probs[:, -logits_to_keep:])
+            if score_ids is not None:
+                all_score_logps.append(outputs.score_log_probs[:, -logits_to_keep:])
 
         logps = torch.cat(all_logps, dim=0)
         entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
         aux_loss = torch.stack(all_aux_losses).mean() if compute_aux_loss else None
-        query_logps = torch.cat(all_query_logps, dim=0) if query_ids is not None else None
-        return logps, entropies, aux_loss, query_logps
+        score_logps = torch.cat(all_score_logps, dim=0) if score_ids is not None else None
+        return logps, entropies, aux_loss, score_logps
 
     def training_step(self, model, inputs, num_items_in_batch):
         time_before = time.perf_counter()
@@ -1759,8 +1780,8 @@ class GRPOTrainer(_BaseTrainer):
                         "tool_mask",
                         "old_per_token_logps",
                         "sampling_per_token_logps",
-                        "sampling_query_ids",
-                        "sampling_query_logps",
+                        "sampling_score_ids",
+                        "sampling_score_logps",
                         "ref_per_token_logps",
                     ]:
                         if key in batch:
@@ -2843,16 +2864,16 @@ class GRPOTrainer(_BaseTrainer):
             in_token = torch.arange(max(sizes.tolist(), default=1)) < sizes.unsqueeze(-1)
             lengths = torch.tensor([len(seq) for seq in evidence_list], dtype=torch.long)
             is_token = torch.arange(completion_ids.size(1)) < lengths.unsqueeze(-1)
-            sampling_query_ids = torch.full((*is_token.shape, in_token.size(-1)), -1, dtype=torch.int32)
-            sampling_query_logps = torch.zeros(sampling_query_ids.shape)
-            sampling_query_ids[is_token] = torch.full(in_token.shape, -1, dtype=torch.int32).masked_scatter(
+            sampling_score_ids = torch.full((*is_token.shape, in_token.size(-1)), -1, dtype=torch.int32)
+            sampling_score_logps = torch.zeros(sampling_score_ids.shape)
+            sampling_score_ids[is_token] = torch.full(in_token.shape, -1, dtype=torch.int32).masked_scatter(
                 in_token, torch.tensor([i for ids, _ in tokens for i in ids], dtype=torch.int32)
             )
-            sampling_query_logps[is_token] = torch.zeros(in_token.shape).masked_scatter(
+            sampling_score_logps[is_token] = torch.zeros(in_token.shape).masked_scatter(
                 in_token, torch.tensor([lp for _, logps in tokens for lp in logps])
             )
-            sampling_query_ids = sampling_query_ids.to(device)
-            sampling_query_logps = sampling_query_logps.to(device)
+            sampling_score_ids = sampling_score_ids.to(device)
+            sampling_score_logps = sampling_score_logps.to(device)
         if tool_mask_list is not None:
             tool_mask = [torch.tensor(mask) for mask in tool_mask_list]
             tool_mask = pad(
@@ -3198,8 +3219,8 @@ class GRPOTrainer(_BaseTrainer):
         if sampling_per_token_logps is not None:
             output["sampling_per_token_logps"] = sampling_per_token_logps
         if evidence_list is not None:
-            output["sampling_query_ids"] = sampling_query_ids
-            output["sampling_query_logps"] = sampling_query_logps
+            output["sampling_score_ids"] = sampling_score_ids
+            output["sampling_score_logps"] = sampling_score_logps
         if ref_per_token_logps is not None:
             output["ref_per_token_logps"] = ref_per_token_logps
         if "pixel_values" in forward_kwargs:
@@ -3318,11 +3339,11 @@ class GRPOTrainer(_BaseTrainer):
         mask = completion_mask if "tool_mask" not in inputs else completion_mask * inputs["tool_mask"]
 
         # Under score centering, also score the sampler's head (or, normalized over it, its complete support)
-        query_ids = inputs.get("sampling_query_ids")
-        support_ids = query_ids if self.score_centering == "support_replay" else None
+        score_ids = inputs.get("sampling_score_ids")
+        support_ids = score_ids if self.score_centering == "support_replay" else None
 
         # Compute the per_token_logps and the entropy at each position in the completion
-        per_token_logps, entropies, aux_loss, query_logps = self._get_per_token_logps_and_entropies(
+        per_token_logps, entropies, aux_loss, score_logps = self._get_per_token_logps_and_entropies(
             model,
             input_ids,
             attention_mask,
@@ -3339,7 +3360,7 @@ class GRPOTrainer(_BaseTrainer):
             token_type_ids=inputs.get("token_type_ids"),
             mm_token_type_ids=inputs.get("mm_token_type_ids"),
             image_position_ids=inputs.get("image_position_ids"),
-            query_ids=query_ids,
+            score_ids=score_ids,
             support_ids=support_ids,
         )
 
@@ -3501,19 +3522,19 @@ class GRPOTrainer(_BaseTrainer):
             weighting = None
             if self.vllm_importance_sampling_correction:
                 weighting = "truncate" if self.vllm_importance_sampling_mode == "token_truncate" else "mask"
-            query_mask = query_ids >= 0
-            _, query_coef, tail_floored = score_centering_coefficients(
+            score_mask = score_ids >= 0
+            _, score_coef, tail_floored = score_centering_coefficients(
                 per_token_logps,
                 inputs["sampling_per_token_logps"],
-                query_logps,
-                inputs["sampling_query_logps"],
-                query_mask,
+                score_logps,
+                inputs["sampling_score_logps"],
+                score_mask,
                 complete_support=self.score_centering == "support_replay",
                 weighting=weighting,
                 clip_min=self.vllm_importance_sampling_clip_min,
                 clip_max=self.vllm_importance_sampling_clip_max,
             )
-            per_token_loss = per_token_loss + advantages * (query_coef * query_logps).sum(-1)
+            per_token_loss = per_token_loss + advantages * (score_coef * score_logps).sum(-1)
 
         if self.beta != 0.0:
             per_token_loss = per_token_loss + self.beta * per_token_kl
@@ -3651,11 +3672,11 @@ class GRPOTrainer(_BaseTrainer):
             log_metric("sampling/importance_sampling_ratio/max", "max", masked_is_ratio.max())
 
         if self.score_centering == "head_tail":
-            head_mass = (query_logps.detach().exp() * query_mask).sum(-1)
+            head_mass = (score_logps.detach().exp() * score_mask).sum(-1)
             log_metric("score_centering/head_mass", "ratio", masked_sum_and_count(head_mass))
             log_metric("score_centering/tail_floored", "ratio", masked_sum_and_count(tail_floored.float()))
         elif self.score_centering == "support_replay":
-            log_metric("score_centering/support_size", "ratio", masked_sum_and_count(query_mask.sum(-1).float()))
+            log_metric("score_centering/support_size", "ratio", masked_sum_and_count(score_mask.sum(-1).float()))
 
         if self.loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo"]:
             # Compute the clipped probability ratios
