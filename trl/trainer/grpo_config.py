@@ -416,7 +416,8 @@ class GRPOConfig(_BaseConfig):
             Score centering, from [Score Centering Stabilizes Off-policy Reinforcement
             Learning](https://huggingface.co/papers/2609.20807), for `loss_type="reinforce"` with vLLM: subtracts from
             each token's weighted score its expectation under the sampler, so that the sampler's mismatch with the
-            policy adds no drift. Possible values are:
+            policy adds no drift. With `"support_replay"`, it also applies to the token-level clipped `loss_type`s
+            (`"grpo"`, `"bnpo"`, `"dr_grpo"`, `"dapo"`). Possible values are:
 
             - `"off"`: No score centering.
             - `"head_tail"`: Records the sampler's top-`score_centering_topk` probabilities and models the rest as the
@@ -427,7 +428,10 @@ class GRPOConfig(_BaseConfig):
               `beta=0.0`.
 
             The weight `w` of the sampled token and of the expectation is `1`, or with
-            `vllm_importance_sampling_correction`, the `token_truncate` or `token_mask` ratio `p / q`.
+            `vllm_importance_sampling_correction`, the `token_truncate` or `token_mask` ratio `p / q`. For a clipped
+            `loss_type`, it is the derivative of the clipped surrogate in `log p`: the ratio `p_old / q` of the old
+            policy to the sampler, times `p / p_old`, or `0` where the clipping is flat. The correction can then
+            update a token whose own surrogate is clipped, so the trust region of PPO is no longer guaranteed.
         score_centering_topk (`int`, *optional*, defaults to `128`):
             Number of sampler probabilities recorded per token with `score_centering="head_tail"`.
         off_policy_mask_threshold (`float`, *optional*):
@@ -1169,8 +1173,9 @@ class GRPOConfig(_BaseConfig):
     score_centering: str = field(
         default="off",
         metadata={
-            "help": "Score centering for `loss_type='reinforce'` with vLLM: subtracts from each token's weighted "
-            "score its expectation under the sampler. 'off': none. 'head_tail': records the sampler's top "
+            "help": "Score centering for `loss_type='reinforce'` with vLLM, or with 'support_replay', a token-level "
+            "clipped `loss_type`: subtracts from each token's weighted score its expectation under the sampler. "
+            "'off': none. 'head_tail': records the sampler's top "
             "`score_centering_topk` probabilities and models the rest as the policy's, rescaled to the sampler's "
             "remaining mass; requires `top_k=0`, `top_p=1.0` and `min_p=0.0`. 'support_replay': records the sampler's "
             "whole top-k support and normalizes the policy over it; requires `top_k > 0` and `beta=0.0`."
@@ -1410,8 +1415,23 @@ class GRPOConfig(_BaseConfig):
                 f"`score_centering` must be 'off', 'head_tail' or 'support_replay', got '{self.score_centering}'."
             )
         if self.score_centering != "off":
-            if self.loss_type != "reinforce" or not self.use_vllm:
-                raise ValueError("`score_centering` requires `loss_type='reinforce'` and `use_vllm=True`.")
+            clipped = self.loss_type in ("grpo", "bnpo", "dr_grpo", "dapo")
+            if not (self.loss_type == "reinforce" or clipped) or not self.use_vllm:
+                raise ValueError(
+                    "`score_centering` requires `use_vllm=True` and `loss_type='reinforce'`, or with "
+                    "`score_centering='support_replay'`, a token-level clipped `loss_type` ('grpo', 'bnpo', "
+                    "'dr_grpo' or 'dapo')."
+                )
+            if clipped and (
+                self.score_centering != "support_replay"
+                or self.importance_sampling_level != "token"
+                or self.vllm_importance_sampling_mode not in ("token_truncate", "token_mask")
+            ):
+                raise ValueError(
+                    "`score_centering` with a clipped `loss_type` sums the clipped weight over the sampler's whole "
+                    "support, so it requires `score_centering='support_replay'`, `importance_sampling_level='token'` "
+                    "and a `token_*` `vllm_importance_sampling_mode`."
+                )
             # The trainer's distribution must be the sampler's, up to the recorded truncation
             overridden = {"top_k", "top_p", "min_p", "repetition_penalty", "logprobs"} & set(
                 self.generation_kwargs or {}

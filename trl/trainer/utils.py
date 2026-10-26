@@ -805,6 +805,43 @@ def score_centering_coefficients(
     return token_weight, score_coef, tail_floored
 
 
+def ppo_clip_gate(
+    ratio: torch.Tensor,
+    advantages: torch.Tensor,
+    epsilon_low: float,
+    epsilon_high: float,
+    delta: float | None = None,
+) -> torch.Tensor:
+    """
+    Gate `G` of the two-sided clipped surrogate `min(min(r, delta) * A, clip(r, 1 - epsilon_low, 1 + epsilon_high) *
+    A)`, whose derivative in `log r` is `G * r * A`: `1` where the selected branch is not clipped, `0` where it is, and
+    `0.5` on each branch of a tie, as autograd splits it.
+
+    Args:
+        ratio (`torch.Tensor`):
+            Ratio `r` of the current policy's probability to the old one's.
+        advantages (`torch.Tensor`):
+            Advantages `A`, broadcastable to `ratio`.
+        epsilon_low (`float`):
+            Lower clipping epsilon.
+        epsilon_high (`float`):
+            Upper clipping epsilon.
+        delta (`float`, *optional*):
+            Upper bound of the unclipped ratio.
+
+    Returns:
+        `torch.Tensor` of the shape of `ratio`: the gate `G`.
+    """
+    unclipped = ratio if delta is None else ratio.clamp(max=delta)
+    clipped = ratio.clamp(1 - epsilon_low, 1 + epsilon_high)
+    # Like their autograd, `clamp` passes the gradient strictly inside its bounds
+    unclipped_gate = torch.ones_like(ratio) if delta is None else (ratio < delta).float()
+    clipped_gate = ((ratio > 1 - epsilon_low) & (ratio < 1 + epsilon_high)).float()
+    unclipped, clipped = unclipped * advantages, clipped * advantages
+    tie = (unclipped_gate + clipped_gate) / 2
+    return torch.where(unclipped < clipped, unclipped_gate, torch.where(clipped < unclipped, clipped_gate, tie))
+
+
 def print_prompt_completions_sample(
     prompts: list,
     completions: list,
