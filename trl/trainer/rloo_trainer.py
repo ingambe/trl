@@ -1075,12 +1075,18 @@ class RLOOTrainer(_BaseTrainer):
         token_type_ids=None,
         mm_token_type_ids=None,
         image_position_ids=None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        """Compute log-probs, (optionally) entropies, and (optionally) the MoE load-balancing aux loss."""
+        score_ids=None,
+        support_ids=None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """
+        Compute log-probs, (optionally) entropies, (optionally) the MoE load-balancing aux loss, and (optionally) the
+        log-probs of the completion's `score_ids`. With `support_ids`, the log-probs are normalized over that support.
+        """
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
         all_entropies = []
         all_aux_losses = []
+        all_score_logps = []
         for start in range(0, input_ids.size(0), batch_size):
             end = min(start + batch_size, input_ids.size(0))  # the last chunk can be smaller than batch_size
             input_ids_batch = input_ids[start:end]
@@ -1136,6 +1142,18 @@ class RLOOTrainer(_BaseTrainer):
             # Only the completion tokens are scored
             labels = input_ids_batch.masked_fill(attention_mask_batch == 0, -100)
             labels[:, :-logits_to_keep] = -100
+
+            # The scored ids and supports are aligned with the completion tokens; the prompt scores nothing
+            for key, ids in (("score_ids", score_ids), ("support_ids", support_ids)):
+                if ids is not None:
+                    ids = ids[start:end].long()
+                    prompt = ids.new_full((ids.size(0), input_ids_batch.size(1) - logits_to_keep, ids.size(2)), -1)
+                    model_inputs[key] = torch.cat([prompt, ids], dim=1)
+            if support_ids is not None:
+                # Tokens without a support (tool outputs) were not sampled, so they are not scored
+                labels[:, -logits_to_keep:] = labels[:, -logits_to_keep:].masked_fill(
+                    support_ids[start:end, :, 0] < 0, -100
+                )
             with self.accelerator.autocast():
                 outputs = model(**model_inputs, labels=labels, fused_lm_head=True)
             all_logps.append(outputs.log_probs[:, -logits_to_keep:])
@@ -1143,11 +1161,14 @@ class RLOOTrainer(_BaseTrainer):
                 all_entropies.append(outputs.entropy[:, -logits_to_keep:])
             if compute_aux_loss:
                 all_aux_losses.append(outputs.aux_loss)
+            if score_ids is not None:
+                all_score_logps.append(outputs.score_log_probs[:, -logits_to_keep:])
 
         logps = torch.cat(all_logps, dim=0)
         entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
         aux_loss = torch.stack(all_aux_losses).mean() if compute_aux_loss else None
-        return logps, entropies, aux_loss
+        score_logps = torch.cat(all_score_logps, dim=0) if score_ids is not None else None
+        return logps, entropies, aux_loss, score_logps
 
     def training_step(self, model, inputs, num_items_in_batch):
         time_before = time.perf_counter()
@@ -1723,7 +1744,7 @@ class RLOOTrainer(_BaseTrainer):
         # Temporarily disable checkpointing to avoid this warning during inference.
         with torch.no_grad(), disable_gradient_checkpointing(self.model, self.args.gradient_checkpointing_kwargs):
             # Compute the per-token log probabilities for the current model
-            old_per_token_logps, _, _ = self._get_per_token_logps_and_entropies(
+            old_per_token_logps, _, _, _ = self._get_per_token_logps_and_entropies(
                 self.model,
                 prompt_completion_ids,
                 attention_mask,
@@ -1738,7 +1759,7 @@ class RLOOTrainer(_BaseTrainer):
             # Compute the per-token log probabilities for the reference model
             if self.beta != 0.0:
                 if self.ref_model is not None:
-                    ref_per_token_logps, _, _ = self._get_per_token_logps_and_entropies(
+                    ref_per_token_logps, _, _, _ = self._get_per_token_logps_and_entropies(
                         self.ref_model,
                         prompt_completion_ids,
                         attention_mask,
@@ -1754,7 +1775,7 @@ class RLOOTrainer(_BaseTrainer):
                     # - Re-training an existing adapter: an initial copy is loaded under the name "ref".
                     model = self.accelerator.unwrap_model(self.model)
                     with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
-                        ref_per_token_logps, _, _ = self._get_per_token_logps_and_entropies(
+                        ref_per_token_logps, _, _, _ = self._get_per_token_logps_and_entropies(
                             self.model,
                             prompt_completion_ids,
                             attention_mask,
@@ -1927,7 +1948,7 @@ class RLOOTrainer(_BaseTrainer):
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
         # Compute the per_token_logps and the entropy at each position in the completion
-        per_token_logps, entropies, aux_loss = self._get_per_token_logps_and_entropies(
+        per_token_logps, entropies, aux_loss, _ = self._get_per_token_logps_and_entropies(
             model,
             input_ids,
             attention_mask,
