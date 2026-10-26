@@ -1393,7 +1393,9 @@ class GRPOConfig(_BaseConfig):
             if self.loss_type != "reinforce" or not self.use_vllm:
                 raise ValueError("`score_centering` requires `loss_type='reinforce'` and `use_vllm=True`.")
             # The trainer's distribution must be the sampler's, up to the recorded truncation
-            overridden = {"top_k", "top_p", "min_p", "repetition_penalty"} & set(self.generation_kwargs or {})
+            overridden = {"top_k", "top_p", "min_p", "repetition_penalty", "logprobs"} & set(
+                self.generation_kwargs or {}
+            )
             if overridden:
                 raise ValueError(
                     f"`score_centering` checks the sampling options set by their own arguments: pass "
