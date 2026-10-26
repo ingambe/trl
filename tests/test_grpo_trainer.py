@@ -5839,10 +5839,71 @@ def test_score_centering_vanishes_when_the_sampler_matches(
     assert any(not torch.allclose(runs[score_centering, 0.8][n], runs["off", 0.8][n]) for n in runs["off", 0.8])
 
 
+def test_clipped_score_centering_scores_the_old_policy_over_the_support(tiny_llama, tmp_path):
+    # With two iterations, the old policy is scored in a separate forward, which must match the current one before
+    # any update
+    model, tokenizer = tiny_llama
+    torch.manual_seed(0)
+    for param in model.parameters():
+        param.data.normal_(std=0.3)
+
+    class RecordGradients(TrainerCallback):
+        def on_pre_optimizer_step(self, args, state, control, model, **kwargs):
+            gradients.append({n: p.grad.clone() for n, p in model.named_parameters()})
+
+    runs = {}
+    for centering, num_iterations in [("off", 2), ("support_replay", 1), ("support_replay", 2)]:
+        gradients = []
+        with (
+            patch("trl.generation.vllm_generation.is_vllm_available", return_value=True),
+            patch("trl.generation.vllm_generation.LLM", create=True),
+            patch.dict(os.environ),  # colocated vLLM sets RANK, LOCAL_RANK and WORLD_SIZE
+        ):
+            trainer = GRPOTrainer(
+                model=copy.deepcopy(model),
+                processing_class=tokenizer,
+                reward_funcs=lambda completions, **kwargs: [float(i % 2) for i in range(len(completions))],
+                args=GRPOConfig(
+                    output_dir=str(tmp_path),
+                    report_to="none",
+                    bf16=False,
+                    learning_rate=0.0,
+                    max_grad_norm=0.0,
+                    per_device_train_batch_size=4,
+                    num_generations=2,
+                    max_completion_length=3,
+                    max_steps=1,
+                    num_iterations=num_iterations,
+                    use_vllm=True,
+                    vllm_mode="colocate",
+                    loss_type="dapo",
+                    vllm_importance_sampling_mode="token_truncate",
+                    vllm_importance_sampling_clip_max=1.0,
+                    top_k=4,
+                    score_centering=centering,
+                ),
+                train_dataset=Dataset.from_dict({"prompt": ["a", "a a"]}),
+                callbacks=[RecordGradients()],
+            )
+        trainer.vllm_generation = MagicMock()
+        trainer.vllm_generation.generate.side_effect = make_vllm_generate(model, 4, 3, 0.8, 4)
+        trainer.train()
+        runs[centering, num_iterations] = gradients[0]
+
+    for name, gradient in runs["support_replay", 2].items():
+        torch.testing.assert_close(gradient, runs["support_replay", 1][name])
+    assert any(not torch.allclose(runs["support_replay", 2][n], runs["off", 2][n]) for n in runs["off", 2])
+
+
 @pytest.mark.parametrize(
     "kwargs, match",
     [
-        ({"score_centering": "head_tail"}, "requires `loss_type='reinforce'`"),
+        ({"loss_type": "sapo", "score_centering": "support_replay", "top_k": 4}, "token-level clipped"),
+        ({"score_centering": "head_tail"}, "with a clipped `loss_type`"),
+        (
+            {"score_centering": "support_replay", "top_k": 4, "importance_sampling_level": "sequence"},
+            "with a clipped `loss_type`",
+        ),
         ({"loss_type": "reinforce", "score_centering": "head_tail", "top_k": 50}, "untruncated sampling"),
         ({"loss_type": "reinforce", "score_centering": "support_replay"}, "`top_k > 0`"),
         (
