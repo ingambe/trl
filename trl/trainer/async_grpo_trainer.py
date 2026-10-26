@@ -128,7 +128,8 @@ class TreeRow:
     samples share a token only when they also agree on what follows it. The trie therefore forks one token before the
     samples diverge, and every node has a single next-token label and support: a branch costs one extra token per extra
     branch, and the loss can go through plain per-position labels. A sample's last token is keyed on `None`, which no
-    other sample extends, so every sample ends on a leaf.
+    other sample extends, so every sample ends on a leaf. Nodes are also keyed on the policy version that sampled them,
+    so every node has a single sampler distribution.
 
     The trie is stored as chains: the tokens a sample adds, from where it leaves the trie to its end, form one chain,
     laid out in `tokens` after the previous ones, and the chain hangs off the last node the sample shares:
@@ -154,6 +155,7 @@ class TreeRow:
         self.chain_offsets: list[int] = [0]  # chain c holds the nodes chain_offsets[c] to chain_offsets[c + 1] - 1
         self.chain_parents: list[int] = []  # chain -> node it hangs off, -1 for a root
         self.chain_depths: list[int] = []  # chain -> depth of its first node
+        self.chain_versions: list[int] = []  # chain -> policy version of the sample that added it
         self.groups: set[Any] = set()
         self.trained = 0
         self.load = 0
@@ -176,10 +178,12 @@ class TreeRow:
         sample   30 60 80     same = 2 tokens, so 1 node shared (the 30); then the chains hanging off that 30
         ```
         """
-        input_ids, supports = sample["input_ids"], self._support_ids(sample)
+        input_ids, supports, version = sample["input_ids"], self._support_ids(sample), sample["model_version"]
         depth, node = 0, -1
         while True:
-            for c in np.flatnonzero(np.asarray(self.chain_parents) == node):  # the chains hanging off `node`
+            # The chains of the sample's policy version hanging off `node`
+            hanging = (np.asarray(self.chain_parents) == node) & (np.asarray(self.chain_versions) == version)
+            for c in np.flatnonzero(hanging):
                 start, end = self.chain_offsets[c], self.chain_offsets[c + 1]
                 ids = input_ids[depth : depth + end - start]
                 match = (ids == self.tokens[start : start + len(ids)]) & (
@@ -220,6 +224,7 @@ class TreeRow:
         if shared < len(input_ids):  # a copy of a sample already in the row adds no chain
             self.chain_parents.append(node)
             self.chain_depths.append(shared)
+            self.chain_versions.append(sample["model_version"])
             self.tokens = np.concatenate([self.tokens, input_ids[shared:]])
             self.token_supports = np.concatenate([self.token_supports, self._support_ids(sample)[shared:]])
             self.chain_offsets.append(len(self.tokens))
@@ -2473,6 +2478,7 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
                 "sampler_log_probs": sample.sampler_log_probs,
                 "advantage": sample.advantage,
                 "group_id": sample.group_id,
+                "model_version": sample.model_version,
                 "metrics": sample.metrics,  # per-sample rewards; aggregated by the collator, never sent to the model
             }
 
