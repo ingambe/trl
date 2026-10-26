@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from functools import cache
+from itertools import chain, repeat
 from typing import Any
 
+import numpy as np
 import torch
 from transformers import AttentionInterface
 from transformers.integrations.flash_attention import get_target_dtype
@@ -40,15 +43,16 @@ class TreeRow:
     samples share a token only when they also agree on what follows it. The trie therefore forks one token before the
     samples diverge, and every node has a single next-token label and support: a branch costs one extra token per extra
     branch, and the loss can go through plain per-position labels. A sample's last token is keyed on `None`, which no
-    other sample extends, so every sample ends on a leaf.
+    other sample extends, so every sample ends on a leaf. Nodes are also keyed on the policy version that sampled them,
+    so every node has a single sampler distribution.
     """
 
     def __init__(self):
         self.samples: list[dict[str, Any]] = []
         self.sample_nodes: list[list[int]] = []  # sample -> trie node of each of its tokens
         self.tokens: list[int] = []  # node -> its token
-        self.children: list[dict[tuple, int]] = []  # node -> {(token, next token, its support): child node}
-        self.roots: dict[tuple, int] = {}  # {(token, next token, its support): root node}
+        self.children: list[dict[tuple, int]] = []  # node -> {(token, next token, its support, version): child node}
+        self.roots: dict[tuple, int] = {}  # {(token, next token, its support, version): root node}
         self.groups: set[Any] = set()
         self.trained = 0
         self.load = 0
@@ -58,7 +62,7 @@ class TreeRow:
         input_ids = sample["input_ids"].tolist()
         supports = [*map(tuple, sample["sampling_mask"][1:]), ()]
         children, shared = self.roots, 0
-        for key in zip(input_ids, [*input_ids[1:], None], supports, strict=True):
+        for key in zip(input_ids, [*input_ids[1:], None], supports, repeat(sample["model_version"])):
             if key not in children:
                 break
             children = self.children[children[key]]
@@ -66,12 +70,24 @@ class TreeRow:
         novel = len(input_ids) - shared
         return len(self.tokens) + novel <= budget and self.trained + int(sample["completion_mask"].sum()) <= budget
 
+    def cost(self, sample: dict[str, Any]) -> int:
+        """Load `add(sample)` would add to the row: `depth + 1` for each of its tokens not already in the trie."""
+        input_ids = sample["input_ids"].tolist()
+        supports = [*map(tuple, sample["sampling_mask"][1:]), ()]
+        children, shared = self.roots, 0
+        for key in zip(input_ids, [*input_ids[1:], None], supports, repeat(sample["model_version"])):
+            if key not in children:
+                break
+            children = self.children[children[key]]
+            shared += 1
+        return sum(depth + 1 for depth in range(shared, len(input_ids)))
+
     def add(self, sample: dict[str, Any]) -> None:
         input_ids = sample["input_ids"].tolist()
         supports = [*map(tuple, sample["sampling_mask"][1:]), ()]
         children = self.roots
         nodes = []
-        for depth, key in enumerate(zip(input_ids, [*input_ids[1:], None], supports, strict=True)):
+        for depth, key in enumerate(zip(input_ids, [*input_ids[1:], None], supports, repeat(sample["model_version"]))):
             if key not in children:
                 children[key] = len(self.tokens)
                 self.tokens.append(key[0])
@@ -97,8 +113,11 @@ class TreeRow:
                 - `input_ids` (`N`): the unique tokens.
                 - `position_ids` (`N`): each token's position in its samples, which is its depth in the trie.
                 - `shift_labels` (`N`): next token each position predicts, `-100` where it is not trained.
-                - `sampling_mask` (`N`, `C`): candidate set the sampler drew that next token from, padded with `-1`;
-                  `C` is `0` without top-k/top-p truncation.
+                - `sampling_mask` (`T`), `sampling_mask_counts` (`N`): candidate sets the sampler drew the next tokens
+                  from, laid end to end in position order, and the size of each position's set; `T` is `0` without
+                  top-k/top-p truncation. Ragged, because the sets average a few tokens but can reach the top-k cap.
+                - `sampler_ids` (`N`, `K`), `sampler_log_probs` (`N`, `K`): the sampler's most likely next tokens at
+                  the position and their log-probs, padded with `-1` and `-inf`; `K` is `0` unless requested.
                 - `tree_kv_index` (`K`): packed position of every K/V row [`tree_attention`] gathers, the
                   root-to-segment paths of all segments laid end to end.
                 - `tree_cu_seqlens_q` (`S + 1`), `tree_cu_seqlens_k` (`S + 1`): segment boundaries in the row, path
@@ -132,9 +151,13 @@ class TreeRow:
 
         shift_labels = [-100] * len(input_ids)
         sampling_mask = [[] for _ in input_ids]
+        num_logprobs = max(sample["sampler_ids"].shape[1] for sample in self.samples)
+        sampler_ids = np.full((len(input_ids), num_logprobs), -1, dtype=np.int64)
+        sampler_log_probs = np.full((len(input_ids), num_logprobs), -math.inf, dtype=np.float32)
         token_index, old_log_probs, advantages, segment_id = [], [], [], []
         for i, (sample, nodes) in enumerate(zip(self.samples, self.sample_nodes, strict=True)):
             ids, mask, logps = (sample[key].tolist() for key in ("input_ids", "completion_mask", "old_log_probs"))
+            first = len(token_index)
             for p in range(1, len(nodes)):
                 if mask[p]:
                     shift_labels[packed[nodes[p - 1]]] = ids[p]
@@ -143,14 +166,19 @@ class TreeRow:
                     old_log_probs.append(logps[p])
                     advantages.append(sample["advantage"])
                     segment_id.append(i)
-        width = max(map(len, sampling_mask))
+            trained = np.flatnonzero(sample["completion_mask"][1:]) + 1
+            sampler_ids[token_index[first:], : sample["sampler_ids"].shape[1]] = sample["sampler_ids"][trained]
+            sampler_log_probs[token_index[first:], : sample["sampler_ids"].shape[1]] = sample["sampler_log_probs"][
+                trained
+            ]
         return {
             "input_ids": torch.tensor(input_ids),
             "position_ids": torch.tensor(position_ids),
             "shift_labels": torch.tensor(shift_labels),
-            "sampling_mask": torch.tensor(
-                [candidates + [-1] * (width - len(candidates)) for candidates in sampling_mask], dtype=torch.long
-            ).view(len(input_ids), width),
+            "sampling_mask": torch.tensor(list(chain.from_iterable(sampling_mask)), dtype=torch.long),
+            "sampling_mask_counts": torch.tensor(list(map(len, sampling_mask))),
+            "sampler_ids": torch.from_numpy(sampler_ids),
+            "sampler_log_probs": torch.from_numpy(sampler_log_probs),
             "tree_kv_index": torch.tensor(kv_index, dtype=torch.long),
             "tree_cu_seqlens_q": torch.tensor(offsets, dtype=torch.int32),
             "tree_cu_seqlens_k": torch.tensor(cu_seqlens_k, dtype=torch.int32),

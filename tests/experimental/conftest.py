@@ -102,6 +102,9 @@ def async_grpo_loss_trainer():
 
     trainer = object.__new__(AsyncGRPOTrainer)
     trainer.model = model
+    trainer.args = SimpleNamespace(
+        score_centering=False, vllm_importance_sampling_clip_min=0.5, vllm_importance_sampling_clip_max=5.0
+    )
     trainer.accelerator = SimpleNamespace(
         num_processes=1, reduce=lambda tensor, reduction: tensor, gather=lambda tensor: tensor
     )
