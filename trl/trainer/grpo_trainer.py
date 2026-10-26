@@ -94,6 +94,7 @@ from .utils import (
     nanmin,
     nanstd,
     pad,
+    ppo_clip_gate,
     print_prompt_completions_sample,
     repeat_iterable_dataset,
     score_centering_coefficients,
@@ -1761,6 +1762,7 @@ class GRPOTrainer(_BaseTrainer):
                         "sampling_per_token_logps",
                         "sampling_query_ids",
                         "sampling_query_logps",
+                        "old_query_logps",
                         "ref_per_token_logps",
                     ]:
                         if key in batch:
@@ -3019,8 +3021,11 @@ class GRPOTrainer(_BaseTrainer):
             # old_per_token_logps to None.
             generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
             # REINFORCE weights the sampled tokens by the current policy, with no old one
+            old_query_logps = None
             if self.args.gradient_accumulation_steps % generate_every != 0 and self.loss_type != "reinforce":
-                old_per_token_logps, _, _, _ = self._get_per_token_logps_and_entropies(
+                # Score centering also needs the old policy over the sampler's support, normalized over it
+                old_query_ids = sampling_query_ids if self.score_centering == "support_replay" else None
+                old_per_token_logps, _, _, old_query_logps = self._get_per_token_logps_and_entropies(
                     self.model,
                     prompt_completion_ids,
                     attention_mask,
@@ -3028,6 +3033,8 @@ class GRPOTrainer(_BaseTrainer):
                     batch_size=batch_size,
                     num_images=num_images,
                     num_tiles=num_tiles,
+                    query_ids=old_query_ids,
+                    support_ids=old_query_ids,
                     **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask, spatial_shapes, image_sizes, image_position_ids
                 )
             else:
@@ -3195,6 +3202,8 @@ class GRPOTrainer(_BaseTrainer):
         }
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
+        if old_query_logps is not None:
+            output["old_query_logps"] = old_query_logps
         if sampling_per_token_logps is not None:
             output["sampling_per_token_logps"] = sampling_per_token_logps
         if evidence_list is not None:
@@ -3502,17 +3511,40 @@ class GRPOTrainer(_BaseTrainer):
             if self.vllm_importance_sampling_correction:
                 weighting = "truncate" if self.vllm_importance_sampling_mode == "token_truncate" else "mask"
             query_mask = query_ids >= 0
-            _, query_coef, tail_floored = score_centering_coefficients(
-                per_token_logps,
-                inputs["sampling_per_token_logps"],
-                query_logps,
-                inputs["sampling_query_logps"],
-                query_mask,
-                complete_support=self.score_centering == "support_replay",
-                weighting=weighting,
-                clip_min=self.vllm_importance_sampling_clip_min,
-                clip_max=self.vllm_importance_sampling_clip_max,
-            )
+            if self.loss_type == "reinforce":
+                _, query_coef, tail_floored = score_centering_coefficients(
+                    per_token_logps,
+                    inputs["sampling_per_token_logps"],
+                    query_logps,
+                    inputs["sampling_query_logps"],
+                    query_mask,
+                    complete_support=self.score_centering == "support_replay",
+                    weighting=weighting,
+                    clip_min=self.vllm_importance_sampling_clip_min,
+                    clip_max=self.vllm_importance_sampling_clip_max,
+                )
+            else:
+                # The clipped surrogate weights each token by its ratio of the old policy to the sampler, times the
+                # derivative of the clipping in its ratio of the current policy to the old one
+                old_query_logps = (
+                    inputs["old_query_logps"] if "old_per_token_logps" in inputs else query_logps.detach()
+                )
+                _, query_coef, tail_floored = score_centering_coefficients(
+                    old_per_token_logps,
+                    inputs["sampling_per_token_logps"],
+                    old_query_logps,
+                    inputs["sampling_query_logps"],
+                    query_mask,
+                    complete_support=True,
+                    weighting=weighting,
+                    clip_min=self.vllm_importance_sampling_clip_min,
+                    clip_max=self.vllm_importance_sampling_clip_max,
+                )
+                query_ratio = torch.exp(query_logps.detach() - old_query_logps)
+                gate = ppo_clip_gate(
+                    query_ratio, advantages.unsqueeze(-1), self.epsilon_low, self.epsilon_high, self.args.delta
+                )
+                query_coef = query_coef * query_ratio * gate
             per_token_loss = per_token_loss + advantages * (query_coef * query_logps).sum(-1)
 
         if self.beta != 0.0:

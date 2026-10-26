@@ -50,6 +50,7 @@ from trl.trainer.utils import (
     model_accepts_images,
     nanstd,
     pad,
+    ppo_clip_gate,
     print_prompt_completions_sample,
     repeat_iterable_dataset,
     score_centering_coefficients,
@@ -839,6 +840,51 @@ class TestScoreCenteringCoefficients(TrlTestCase):
         union_head = -_expected_score_centered_gradient(logits, q, advantages, head=[0], union_head=True)
         torch.testing.assert_close(fixed_head, torch.tensor([0.5, -0.5, 0.0]))
         torch.testing.assert_close(union_head, torch.tensor([0.5, -0.5875, 0.0875]))
+
+
+class TestPPOClipGate(TrlTestCase):
+    @pytest.mark.parametrize("delta", [None, 1.5])
+    @pytest.mark.parametrize("advantage", [1.0, -1.0])
+    def test_matches_autograd_of_the_surrogate(self, advantage, delta):
+        # Ratios inside, on and outside the clipping bounds and delta
+        log_ratio = torch.tensor([0.5, 0.8, 0.9, 1.0, 1.2, 1.3, 1.5, 2.0]).log().requires_grad_()
+        ratio = log_ratio.exp()
+        unclipped = ratio if delta is None else torch.clamp(ratio, max=delta)
+        torch.min(unclipped * advantage, torch.clamp(ratio, 0.8, 1.2) * advantage).sum().backward()
+        gate = ppo_clip_gate(ratio.detach(), torch.tensor(advantage), 0.2, 0.2, delta)
+        torch.testing.assert_close(gate * ratio.detach() * advantage, log_ratio.grad)
+
+    @pytest.mark.parametrize("delta", [None, 1.5])
+    @pytest.mark.parametrize("advantage", [1.0, -1.0])
+    @pytest.mark.parametrize(
+        "kwargs", [{}, {"weighting": "truncate", "clip_max": 1.2}, {"weighting": "mask", "clip_max": 1.2}]
+    )
+    def test_clipped_correction_cancels_drift(self, kwargs, advantage, delta):
+        # Ratios to the old policy of 0.4, 1, 1.6 and 1: the clipping is flat on one side or the other
+        logits = torch.tensor([0.1, 0.25, 0.4, 0.25]).log()
+        old_logps = torch.full((4,), 0.25).log()
+        q = torch.tensor([0.1, 0.4, 0.3, 0.2])
+        support = torch.ones(4, dtype=torch.bool)
+        expected, uncentered = torch.zeros(4), torch.zeros(4)
+        for action in range(4):
+            logits_ = logits.clone().requires_grad_()
+            logps = logits_.log_softmax(-1)
+            # The sampled token's surrogate, as in `GRPOTrainer`, and its correction
+            ratio = torch.exp(logps[action] - old_logps[action])
+            token_weight, query_coef, _ = score_centering_coefficients(
+                old_logps[action], q[action].log(), old_logps, q.log(), support, complete_support=True, **kwargs
+            )
+            unclipped = ratio if delta is None else torch.clamp(ratio, max=delta)
+            loss = -token_weight * torch.min(unclipped * advantage, torch.clamp(ratio, 0.8, 1.2) * advantage)
+            query_ratio = torch.exp(logps.detach() - old_logps)
+            query_coef = (
+                query_coef * query_ratio * ppo_clip_gate(query_ratio, torch.tensor(advantage), 0.2, 0.2, delta)
+            )
+            uncentered += q[action] * torch.autograd.grad(loss, logits_, retain_graph=True)[0]
+            loss = loss + advantage * (query_coef * logps).sum()
+            expected += q[action] * torch.autograd.grad(loss, logits_)[0]
+        torch.testing.assert_close(expected, torch.zeros(4), atol=1e-6, rtol=0)
+        assert uncentered.abs().max() > 0.01
 
 
 @require_rich
