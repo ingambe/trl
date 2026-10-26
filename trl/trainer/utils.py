@@ -1671,6 +1671,9 @@ class FusedCausalLMOutput(ModelOutput):
             Mean of the temperature-scaled next-token logits over the vocabulary, without gradient.
         is_top1 (`torch.Tensor`, same shape as `log_probs`):
             Whether the label is the most likely next token.
+        query_log_probs (`torch.Tensor` of shape `(*log_probs.shape, K)`):
+            Log-probability of each token of `query_ids`, under the same normalization as `log_probs`. Zero where the
+            id is `-1`.
         label_mask (`torch.Tensor`, same shape as `log_probs`):
             Whether the label is not `-100`. Prompt-learning PEFT pads the labels, so this can count one more token per
             sequence than the caller's labels.
@@ -1684,6 +1687,7 @@ class FusedCausalLMOutput(ModelOutput):
     log_sum_sq_probs: torch.Tensor | None = None
     mean_logits: torch.Tensor | None = None
     is_top1: torch.Tensor | None = None
+    query_log_probs: torch.Tensor | None = None
     label_mask: torch.Tensor | None = None
     aux_loss: torch.Tensor | None = None
 
@@ -1706,6 +1710,7 @@ def add_fused_lm_head(
     `support_ids`, a `(batch, seq_len, K)` tensor of token ids padded with `-1`, is the support each token was sampled
     from: the tokens left after top-k/top-p truncation. Given, the log-probabilities are normalized over that set
     rather than the whole vocabulary, as the sampler's were. It is aligned with `input_ids` and shifted like `labels`.
+    `query_ids`, in the same format, are tokens whose log-probabilities are also returned, as `query_log_probs`.
 
     Args:
         model ([`~transformers.PreTrainedModel`]):
@@ -1751,6 +1756,7 @@ def add_fused_lm_head(
         shift_labels=None,
         num_items_in_batch=None,
         support_ids=None,
+        query_ids=None,
         **kwargs,
     ):
         if not fused_lm_head:
@@ -1773,6 +1779,8 @@ def add_fused_lm_head(
             labels = labels[:, 1:]
             if support_ids is not None:
                 support_ids = support_ids[:, 1:]
+            if query_ids is not None:
+                query_ids = query_ids[:, 1:]
         else:
             hidden_states = backbone_outputs.last_hidden_state
             labels = shift_labels
@@ -1807,6 +1815,9 @@ def add_fused_lm_head(
             support_ids = (
                 support_ids[mask] if compact else support_ids.masked_fill(~mask.unsqueeze(-1), 0).flatten(0, 1)
             )
+        if query_ids is not None:
+            query_ids = query_ids.to(lm_head.weight.device)
+            query_ids = query_ids[mask] if compact else query_ids.masked_fill(~mask.unsqueeze(-1), -1).flatten(0, 1)
         with autocast_ctx, maybe_gather_lm_head_ctx(weight, bias):
             per_token = _ChunkedLogProbFunction.apply(
                 hidden_states,
@@ -1819,13 +1830,21 @@ def add_fused_lm_head(
                 logit_scale,
                 outputs,
                 support_ids,
+                query_ids,
             )
+        *per_token, query_log_probs = per_token
         if compact:
             # `masked_scatter` keeps the output connected to the model even when no label is valid. This lets an
             # all-masked microbatch contribute a differentiable zero instead of failing in `backward()`.
             per_token = (None if x is None else x.new_zeros(mask.shape).masked_scatter(mask, x) for x in per_token)
+            if query_log_probs is not None:
+                query_log_probs = query_log_probs.new_zeros(*mask.shape, query_log_probs.size(-1)).masked_scatter(
+                    mask.unsqueeze(-1), query_log_probs
+                )
         else:
             per_token = (None if x is None else x.view(mask.shape).masked_fill(~mask, 0) for x in per_token)
+            if query_log_probs is not None:
+                query_log_probs = query_log_probs.view(*mask.shape, -1).masked_fill(~mask.unsqueeze(-1), 0)
         log_probs, entropy, log_sum_sq_probs, mean_logits, is_top1 = per_token
         loss = -log_probs.sum() / (mask.sum().clamp(min=1) if num_items_in_batch is None else num_items_in_batch)
 
@@ -1859,6 +1878,7 @@ def add_fused_lm_head(
             log_sum_sq_probs=log_sum_sq_probs,
             mean_logits=mean_logits,
             is_top1=is_top1,
+            query_log_probs=query_log_probs,
             label_mask=mask,
             aux_loss=aux_loss,
         )
