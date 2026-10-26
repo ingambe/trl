@@ -710,7 +710,7 @@ $$
 \mathcal{L}(\theta) = - A \left( w(y_t) \log \pi_\theta(y_t) - \sum_{v} \mu(v) \, w(v) \log \pi_\theta(v) \right),
 $$
 
-with  \\( w \\) the token's truncated (TIS) or masked (MIS) ratio  \\( \pi_\theta / \mu \\), or  \\( 1 \\). The sum runs over the sampler's top-k head, with its tail modeled as the policy's rescaled to the sampler's tail mass (`"head_tail"`), or over the whole top-k support of the sampler, to which the policy is renormalized (`"support_replay"`).
+with  \\( w \\) the token's truncated (TIS) or masked (MIS) ratio  \\( \pi_\theta / \mu \\), or  \\( 1 \\). The sum runs over the sampler's top-k head, with its tail modeled as the policy's rescaled to the sampler's tail mass (`"head_tail"`), or over the whole top-k support of the sampler, to which the policy is renormalized (`"support_replay"`). `trl.trainer.utils.score_centering_coefficients` computes the coefficients.
 
 ```python
 from trl import GRPOConfig
