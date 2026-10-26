@@ -2879,6 +2879,8 @@ def test_score_centering_vanishes_when_the_sampler_matches(
         ({"loss_type": "reinforce", "num_iterations": 2}, "`num_iterations=1`"),
         ({"loss_type": "reinforce", "score_centering": "head_tail", "top_k": 50}, "untruncated sampling"),
         ({"loss_type": "reinforce", "score_centering": "support_replay"}, "`top_k > 0`"),
+        ({"vllm_importance_sampling_clip_min": 2.0, "vllm_importance_sampling_clip_max": 1.0}, "must be less than"),
+        ({"vllm_importance_sampling_clip_max": None}, "At least one of"),
     ],
 )
 def test_score_centering_rejects_unsupported_configs(tmp_path, kwargs, match):
