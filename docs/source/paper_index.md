@@ -752,6 +752,8 @@ training_args = GRPOConfig(
 )
 ```
 
+[`RLOOConfig`] takes the same options, with REINFORCE summed over each completion's tokens and averaged over completions.
+
 ## Optimal Advantage Regression
 
 Papers relating to the [`experimental.a2po.A2POTrainer`].
