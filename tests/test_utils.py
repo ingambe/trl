@@ -357,6 +357,18 @@ class TestGetPEFTConfig(TrlTestCase):
 
             assert getattr(peft_config, arg) == value
 
+    @pytest.mark.parametrize(
+        "lora_target_modules",
+        [["q_proj"], "q_proj", ["self_attn.q_proj"], [r".*\.q_proj"], ["q_proj", "v_proj"], ["all-linear"]],
+    )
+    def test_lora_target_modules(self, lora_target_modules):
+        # A single value from the CLI or a config file is a module name, a regex or "all-linear" (#7795)
+        model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5")
+        model_args = ModelConfig(use_peft=True, lora_target_modules=lora_target_modules)
+        model = get_peft_model(model, get_peft_config(model_args))
+        targeted = {name.split(".lora_A")[0] for name, _ in model.named_parameters() if ".lora_A." in name}
+        assert any(name.endswith(".q_proj") for name in targeted)
+
 
 class TestGetCallableName(TrlTestCase):
     def test_function(self):
@@ -1526,27 +1538,6 @@ class TestAddFusedLMHead:
         mask = labels[:, 1:] != -100
         torch.testing.assert_close(out["log_probs"][mask], ref[mask], atol=1e-4, rtol=1e-4)
         assert (out["log_probs"][~mask] == 0).all()
-        assert torch.isfinite(model.lm_head.weight.grad).all()
-
-    @pytest.mark.parametrize("device", [torch_device, "cpu"])
-    def test_query_ids_masked_labels(self, device):
-        """`query_log_probs` are the full-vocabulary log-probabilities of `query_ids`, zero at masked positions."""
-        torch.manual_seed(0)
-        model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen3ForCausalLM").to(device)
-        add_fused_lm_head(model)
-        input_ids = torch.randint(0, model.config.vocab_size, (2, 16), device=device)
-        labels = input_ids.masked_fill(torch.arange(16, device=device) < 8, -100)
-        query_ids = torch.randint(0, model.config.vocab_size, (2, 16, 4), device=device)
-        query_ids[..., -1] = -1
-
-        out = model(input_ids=input_ids, labels=labels, query_ids=query_ids, fused_lm_head=True)
-        out["query_log_probs"].sum().backward()
-
-        logps = model(input_ids=input_ids).logits[:, :-1].float().log_softmax(-1)
-        ref = logps.gather(-1, query_ids[:, 1:].clamp(min=0)).masked_fill(query_ids[:, 1:] < 0, 0.0)
-        mask = labels[:, 1:] != -100
-        torch.testing.assert_close(out["query_log_probs"][mask], ref[mask], atol=1e-4, rtol=1e-4)
-        assert (out["query_log_probs"][~mask] == 0).all()
         assert torch.isfinite(model.lm_head.weight.grad).all()
 
     def test_outputs(self):
