@@ -108,6 +108,76 @@ def extract_logprobs(all_outputs: list["RequestOutput"]):
     return all_logprobs, all_token_ids
 
 
+def split_sampler_logprobs(
+    completion_ids: list[list[int]],
+    logprobs: list[list[list[float | None]]],
+    logprob_token_ids: list[list[list[int]]],
+    num_logprobs: int,
+    complete_support: bool = False,
+    tolerance: float = 1e-3,
+) -> tuple[list[list[float]], list[list[list[int]]], list[list[list[float]]]]:
+    """
+    Split vLLM logprobs requested with `logprobs=num_logprobs` into the sampled tokens' logprobs and the sampler's
+    evidence for score centering, validating it.
+
+    vLLM returns, for each token, the top-`num_logprobs` tokens, plus the sampled token when it falls outside them. The
+    sampled token's logprob is looked up by its id, and the evidence is either the top-`num_logprobs` head, which never
+    depends on the sampled token, or, with `complete_support=True`, every token the sampler could draw (finite
+    logprob). Logprobs must be `processed_logprobs`, so that the support of a top-k/top-p sampler sums to one.
+
+    Args:
+        completion_ids (`list[list[int]]`):
+            Sampled token ids of each sequence.
+        logprobs (`list[list[list[float | None]]]`):
+            Logprobs of shape `(num_sequences, seq_len, num_logprobs or num_logprobs + 1)`, as returned by
+            [`~generation.vllm_generation.VLLMGeneration.generate`].
+        logprob_token_ids (`list[list[list[int]]]`):
+            Token ids of `logprobs`, same shape.
+        num_logprobs (`int`):
+            Number of top logprobs requested.
+        complete_support (`bool`, *optional*, defaults to `False`):
+            Whether the top-`num_logprobs` tokens cover the whole support of the sampler.
+        tolerance (`float`, *optional*, defaults to `1e-3`):
+            Tolerance on the evidence's probability mass: at most one for a head, and one for a complete support.
+
+    Returns:
+        `tuple` of:
+            - `sampling_logprobs` (`list[list[float]]`): Logprob of each sampled token.
+            - `evidence_ids` (`list[list[list[int]]]`): Ids of the head or support of each token.
+            - `evidence_logprobs` (`list[list[list[float]]]`): Logprobs of `evidence_ids`.
+    """
+    all_sampling_logprobs, all_evidence_ids, all_evidence_logprobs = [], [], []
+    for seq_completion_ids, seq_logprobs, seq_token_ids in zip(
+        completion_ids, logprobs, logprob_token_ids, strict=True
+    ):
+        sampling_logprobs, evidence_ids, evidence_logprobs = [], [], []
+        for token_id, token_logprobs, token_ids in zip(seq_completion_ids, seq_logprobs, seq_token_ids, strict=True):
+            entries = dict(zip(token_ids, token_logprobs, strict=True))
+            # `None` is a NaN logprob
+            if token_id not in entries or None in entries.values():
+                raise ValueError(f"vLLM returned no valid logprob for sampled token {token_id}: {entries}.")
+            sampling_logprobs.append(entries[token_id])
+            if len(entries) == num_logprobs + 1:
+                # The sampled token is outside the head
+                del entries[token_id]
+            if complete_support:
+                # The servers clamp the -inf logprob of tokens outside the support to -9999
+                entries = {i: lp for i, lp in entries.items() if lp > -9999}
+            mass = sum(math.exp(lp) for lp in entries.values())
+            if mass > 1 + tolerance or (complete_support and (mass < 1 - tolerance or token_id not in entries)):
+                raise ValueError(
+                    f"The sampler's {'support' if complete_support else 'head'} of token {token_id} has probability "
+                    f"mass {mass:.6f}. With `complete_support=True`, the sampler's top-k must not exceed "
+                    f"`num_logprobs={num_logprobs}` (ties at the top-k boundary keep more tokens)."
+                )
+            evidence_ids.append(list(entries))
+            evidence_logprobs.append(list(entries.values()))
+        all_sampling_logprobs.append(sampling_logprobs)
+        all_evidence_ids.append(evidence_ids)
+        all_evidence_logprobs.append(evidence_logprobs)
+    return all_sampling_logprobs, all_evidence_ids, all_evidence_logprobs
+
+
 if TYPE_CHECKING:
     from accelerate import Accelerator
     from peft import PeftModel
@@ -485,6 +555,8 @@ class VLLMGeneration:
                 kv_cache_dtype=self.kv_cache_dtype,
                 # Important so temperature scaling/logit tweaking affects the TIS log probs
                 logprobs_mode="processed_logprobs",
+                # Like the bundled server: score centering requests more than the default cap of 20 logprobs
+                max_logprobs=-1,
                 quantization=quantization,
                 trust_remote_code=self.trust_remote_code,
                 hf_overrides=hf_overrides,
