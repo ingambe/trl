@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import math
 import os
 import subprocess
 from types import SimpleNamespace
@@ -28,7 +29,7 @@ from trl.generation.vllm_client import (
     parse_generate_logprobs,
     parse_logprobs,
 )
-from trl.generation.vllm_generation import extract_logprobs
+from trl.generation.vllm_generation import extract_logprobs, split_sampler_logprobs
 from trl.import_utils import is_requests_available, is_vllm_available
 
 from .testing_utils import (
@@ -247,6 +248,41 @@ class TestExtractLogprobs(TrlTestCase):
 
         assert all_logprobs is None
         assert all_token_ids is None
+
+
+class TestSplitSamplerLogprobs(TrlTestCase):
+    def test_head_excludes_a_sampled_token_outside_it(self):
+        log = math.log
+        # Top-2 heads: the first token is sampled inside its head, the second outside, tied with the head's last token
+        logprobs = [[[log(0.5), log(0.3)], [log(0.4), log(0.2), log(0.2)]]]
+        logprob_token_ids = [[[4, 9], [1, 2, 8]]]
+
+        sampling_logprobs, ids, head_logprobs = split_sampler_logprobs([[9, 8]], logprobs, logprob_token_ids, 2)
+
+        assert sampling_logprobs == [[log(0.3), log(0.2)]]
+        assert ids == [[[4, 9], [1, 2]]]
+        assert head_logprobs == [[[log(0.5), log(0.3)], [log(0.4), log(0.2)]]]
+
+    def test_complete_support(self):
+        log = math.log
+        # A top-3 request on a sampler whose support has 2 tokens: the server clamps the third logprob to -9999
+        logprobs = [[[log(0.75), log(0.25), -9999.0]]]
+
+        sampling_logprobs, ids, _ = split_sampler_logprobs([[6]], logprobs, [[[3, 6, 1]]], 3, complete_support=True)
+
+        assert sampling_logprobs == [[log(0.25)]]
+        assert ids == [[[3, 6]]]
+
+    @pytest.mark.parametrize(
+        "logprobs, logprob_token_ids",
+        [
+            ([[[math.log(0.5), math.log(0.3)]]], [[[3, 6]]]),  # a tie at the top-k boundary left mass out
+            ([[[math.log(0.75), None]]], [[[3, 6]]]),  # NaN logprob
+        ],
+    )
+    def test_invalid_complete_support_raises(self, logprobs, logprob_token_ids):
+        with pytest.raises(ValueError):
+            split_sampler_logprobs([[6]], logprobs, logprob_token_ids, 2, complete_support=True)
 
 
 @require_torch_multi_accelerator
