@@ -19,6 +19,7 @@ import hashlib
 import importlib.resources as pkg_resources
 import inspect
 import json
+import math
 import os
 import random
 import re
@@ -705,6 +706,103 @@ def selective_log_softmax_and_entropy(
     if row_mask is not None:
         entropy = entropy.masked_fill(row_mask == 0, 0.0)
     return logprobs, entropy
+
+
+@torch.no_grad()
+def score_centering_coefficients(
+    per_token_logps: torch.Tensor,
+    sampling_per_token_logps: torch.Tensor,
+    query_logps: torch.Tensor,
+    query_sampling_logps: torch.Tensor,
+    query_mask: torch.Tensor,
+    complete_support: bool,
+    weighting: str | None = None,
+    clip_min: float | None = None,
+    clip_max: float | None = None,
+    tail_floor: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Detached coefficients of the score-centered REINFORCE loss of [Score Centering Stabilizes Off-policy Reinforcement
+    Learning](https://huggingface.co/papers/2609.20807).
+
+    For a detached advantage `A`, the loss `-A * (w_a * log p_a - sum_k c_k * log p_k)`, with `w_a` the `token_weight`
+    and `c_k` the `query_coef`, has the gradient `A * (w_a ∇log p_a - sum_v q_v w_v ∇log p_v)`: the weighted score of
+    the sampled token minus its expectation under the sampler `q`. A constant advantage then gives no expected update.
+    The weight `w` of a token is `1`, its ratio `p / q` clamped to `[clip_min, clip_max]` with `weighting="truncate"`,
+    or its ratio inside `[clip_min, clip_max]` and `0` outside with `weighting="mask"`.
+
+    With `complete_support=True`, the queried tokens are the whole support the sampler drew from and every
+    log-probability is normalized over it, so the expectation is an exact finite sum. Otherwise, they are the sampler's
+    top-k head under the full-vocabulary normalization, and the sampler's tail is modeled as the trainer's, rescaled to
+    the sampler's tail mass.
+
+    Args:
+        per_token_logps (`torch.Tensor`):
+            Trainer log-probabilities of the sampled tokens, of shape `(...)`.
+        sampling_per_token_logps (`torch.Tensor`):
+            Sampler log-probabilities of the sampled tokens, of shape `(...)`.
+        query_logps (`torch.Tensor`):
+            Trainer log-probabilities of the queried tokens, of shape `(..., K)`.
+        query_sampling_logps (`torch.Tensor`):
+            Sampler log-probabilities of the queried tokens, of shape `(..., K)`.
+        query_mask (`torch.Tensor`):
+            Boolean mask of the valid queried tokens, of shape `(..., K)`.
+        complete_support (`bool`):
+            Whether the queried tokens are the complete support of the sampler.
+        weighting (`str`, *optional*):
+            `None`, `"truncate"` or `"mask"`.
+        clip_min (`float`, *optional*):
+            Lower bound of the ratio `p / q`.
+        clip_max (`float`, *optional*):
+            Upper bound of the ratio `p / q`.
+        tail_floor (`float`, *optional*, defaults to `1e-6`):
+            Lower bound of the trainer and sampler tail masses outside the head.
+
+    Returns:
+        `tuple` of:
+            - `token_weight` (`torch.Tensor` of shape `(...)`): `w_a`.
+            - `query_coef` (`torch.Tensor` of shape `(..., K)`): Coefficient of each queried log-probability, zero
+              where `query_mask` is `False`.
+            - `tail_floored` (`torch.Tensor` of shape `(...)`): Whether a tail mass was raised to `tail_floor`.
+    """
+    # Bounds and ratios in log space, so that `q * w` never multiplies a zero by an overflowed ratio
+    log_min = math.log(clip_min) if clip_min else -math.inf
+    log_max = math.log(clip_max) if clip_max is not None else math.inf
+    log_p = query_logps.float().masked_fill(~query_mask, 0.0)
+    log_q = query_sampling_logps.float().masked_fill(~query_mask, 0.0)
+    p = log_p.exp().masked_fill(~query_mask, 0.0)
+    q = log_q.exp().masked_fill(~query_mask, 0.0)
+    log_ratio = per_token_logps.float() - sampling_per_token_logps.float()
+    if weighting is None:
+        token_weight = torch.ones_like(log_ratio)
+        mass = q
+    elif weighting == "truncate":
+        token_weight = log_ratio.clamp(log_min, log_max).exp()
+        mass = torch.clamp(log_p, log_q + log_min, log_q + log_max).exp()
+    elif weighting == "mask":
+        accepted = (log_ratio >= log_min) & (log_ratio <= log_max)
+        token_weight = log_ratio.masked_fill(~accepted, -math.inf).exp()
+        mass = p * ((log_p - log_q >= log_min) & (log_p - log_q <= log_max))
+    else:
+        raise ValueError(f"Unknown score centering weighting: {weighting}. Possible values are 'truncate' and 'mask'.")
+
+    if complete_support:
+        return token_weight, mass.masked_fill(~query_mask, 0.0), torch.zeros_like(log_ratio, dtype=torch.bool)
+
+    # The modeled tail q_v = rho * p_v has the single ratio 1 / rho, so its weighted mass is alpha * p_v
+    p_tail = 1 - p.sum(-1)
+    q_tail = 1 - q.sum(-1)
+    tail_floored = (p_tail < tail_floor) | (q_tail < tail_floor)
+    log_rho = q_tail.clamp(min=tail_floor).log() - p_tail.clamp(min=tail_floor).log()
+    if weighting is None:
+        alpha = log_rho.exp()
+    elif weighting == "truncate":
+        alpha = torch.clamp(torch.zeros_like(log_rho), log_rho + log_min, log_rho + log_max).exp()
+    else:
+        alpha = ((-log_rho >= log_min) & (-log_rho <= log_max)).float()
+    # The trainer's scores sum to zero under p, so the tail's expected score is minus the head's
+    query_coef = (mass - alpha.unsqueeze(-1) * p).masked_fill(~query_mask, 0.0)
+    return token_weight, query_coef, tail_floored
 
 
 def print_prompt_completions_sample(
