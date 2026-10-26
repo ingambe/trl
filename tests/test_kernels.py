@@ -184,7 +184,7 @@ class TestChunkedLogProbFunction:
         weight = torch.randn(self.V, self.H, device=torch_device)
         labels = torch.randint(0, self.V, (self.N,), device=torch_device)
 
-        _, _, log_sum_sq_probs, _, _ = ChunkedLogProbFunction.apply(hidden, weight, None, labels, 0.7, self.CHUNK_SIZE)
+        _, _, log_sum_sq_probs, *_ = ChunkedLogProbFunction.apply(hidden, weight, None, labels, 0.7, self.CHUNK_SIZE)
         logits = (hidden @ weight.t()) / 0.7
 
         expected = torch.logsumexp(2 * logits, dim=-1) - 2 * torch.logsumexp(logits, dim=-1)
@@ -205,7 +205,7 @@ class TestChunkedLogProbFunction:
         subset = ChunkedLogProbFunction.apply(hidden, weight, None, labels, 0.7, self.CHUNK_SIZE, None, 1.0, outputs)
         subset[0].sum().backward()
 
-        names = ("log_probs", "entropy", "log_sum_sq_probs", "mean_logits", "is_top1")
+        names = ("log_probs", "entropy", "log_sum_sq_probs", "mean_logits", "is_top1", "query_log_probs")
         for name, x, y in zip(names, full, subset, strict=True):
             if name == "log_probs" or name in outputs:
                 torch.testing.assert_close(y, x)
@@ -220,7 +220,7 @@ class TestChunkedLogProbFunction:
         weight = torch.randn(self.V, self.H, device=torch_device)
         labels = torch.randint(0, self.V, (self.N,), device=torch_device)
 
-        _, _, _, mean_logits, _ = ChunkedLogProbFunction.apply(hidden, weight, None, labels, 0.7, self.CHUNK_SIZE)
+        _, _, _, mean_logits, *_ = ChunkedLogProbFunction.apply(hidden, weight, None, labels, 0.7, self.CHUNK_SIZE)
 
         torch.testing.assert_close(mean_logits, (hidden @ weight.t()).mean(-1) / 0.7, atol=1e-5, rtol=1e-5)
 
@@ -266,7 +266,7 @@ class TestChunkedLogProbFunction:
         labels = torch.where(torch.arange(self.N, device=torch_device) % 2 == 0, argmax, argmax + self.V // 2)
         labels = labels.clamp(max=self.V - 1)
 
-        *_, is_top1 = ChunkedLogProbFunction.apply(hidden, weight, None, labels, 1.0, self.CHUNK_SIZE)
+        *_, is_top1, _ = ChunkedLogProbFunction.apply(hidden, weight, None, labels, 1.0, self.CHUNK_SIZE)
 
         torch.testing.assert_close(is_top1, argmax == labels)
 
@@ -365,6 +365,83 @@ class TestChunkedLogProbFunction:
         torch.testing.assert_close(entropy, entropy_ref, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(grad_hidden, hidden.grad, atol=1e-4, rtol=1e-4)
         torch.testing.assert_close(grad_weight, weight.grad, atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.parametrize("device", [torch_device, "cpu"])
+    @pytest.mark.parametrize("use_support", [False, True])
+    @pytest.mark.parametrize(("logit_scale", "final_logit_softcapping"), [(1.0, None), (0.5, 30.0)])
+    def test_query_ids(self, device, use_support, logit_scale, final_logit_softcapping):
+        # Queried log-probabilities share the targets' normalization, and their gradients add to the others'
+        torch.manual_seed(42)
+        hidden = torch.randn(self.N, self.H, requires_grad=True, device=device)
+        weight = torch.randn(self.V, self.H, requires_grad=True, device=device)
+        labels = torch.randint(0, self.V, (self.N,), device=device)
+        # Ids across every vocabulary tile, with padding
+        query_ids = torch.stack([torch.cat([labels[i : i + 1], torch.randperm(self.V)[:5]]) for i in range(self.N)])
+        query_ids = query_ids.to(device)
+        query_ids[::3, -2:] = -1
+        support_ids = query_ids if use_support else None
+
+        logprobs, entropy, *_, query_logprobs = ChunkedLogProbFunction.apply(
+            hidden,
+            weight,
+            None,
+            labels,
+            0.7,
+            self.CHUNK_SIZE,
+            final_logit_softcapping,
+            logit_scale,
+            ("entropy",),
+            support_ids,
+            query_ids,
+        )
+        query_weight = torch.randn(query_ids.shape, device=device)
+        (logprobs.sum() + 0.3 * entropy.sum() + (query_weight * query_logprobs).sum()).backward()
+        grad_hidden, grad_weight = hidden.grad.clone(), weight.grad.clone()
+        hidden.grad = weight.grad = None
+
+        logits = hidden @ weight.t() * logit_scale
+        if final_logit_softcapping is not None:
+            logits = torch.tanh(logits / final_logit_softcapping) * final_logit_softcapping
+        logits = logits / 0.7
+        log_p = logits.log_softmax(-1)
+        entropy_ref = -(log_p.exp() * log_p).sum(-1)
+        if use_support:
+            keep = F.one_hot(support_ids + 1, self.V + 1)[..., 1:].any(1)
+            log_p = logits.masked_fill(~keep, float("-inf")).log_softmax(-1)
+        logprobs_ref = log_p.gather(-1, labels[:, None]).squeeze(-1)
+        query_ref = log_p.gather(-1, query_ids.clamp(min=0)).masked_fill(query_ids < 0, 0.0)
+        (logprobs_ref.sum() + 0.3 * entropy_ref.sum() + (query_weight * query_ref).sum()).backward()
+
+        torch.testing.assert_close(logprobs, logprobs_ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(query_logprobs, query_ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(grad_hidden, hidden.grad, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(grad_weight, weight.grad, atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.parametrize("device", [torch_device, "cpu"])
+    def test_support_with_dominant_excluded_logit(self, device):
+        # Logits near zero on the support and 1000 on an excluded token: the support's mass must not underflow, and
+        # the excluded token gets no gradient
+        torch.manual_seed(42)
+        logits = 0.1 * torch.randn(4, self.V, device=device)
+        logits[:, 7] = 1000.0
+        hidden = torch.eye(4, device=device, requires_grad=True)
+        weight = logits.t().contiguous().requires_grad_()
+        support_ids = torch.tensor([[3, 40, 100, -1], [0, 1, 2, 3], [64, -1, -1, -1], [127, 5, 9, 33]], device=device)
+        labels = support_ids[:, 0].contiguous()
+
+        logprobs, *_, query_logprobs = ChunkedLogProbFunction.apply(
+            hidden, weight, None, labels, 1.0, self.CHUNK_SIZE, None, 1.0, (), support_ids, support_ids
+        )
+        (logprobs.sum() + query_logprobs.sum()).backward()
+
+        keep = F.one_hot(support_ids + 1, self.V + 1)[..., 1:].any(1)
+        log_p = logits.double().masked_fill(~keep, float("-inf")).log_softmax(-1)
+        torch.testing.assert_close(logprobs.double(), log_p.gather(-1, labels[:, None]).squeeze(-1))
+        torch.testing.assert_close(
+            query_logprobs.double(), log_p.gather(-1, support_ids.clamp(min=0)).masked_fill(support_ids < 0, 0.0)
+        )
+        assert torch.isfinite(weight.grad).all() and torch.isfinite(hidden.grad).all()
+        assert weight.grad[7].abs().max() == 0
 
     @pytest.mark.parametrize("temperature", [1.0, 0.7])
     def test_backward_bfloat16(self, temperature):

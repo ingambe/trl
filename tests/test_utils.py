@@ -1528,6 +1528,27 @@ class TestAddFusedLMHead:
         assert (out["log_probs"][~mask] == 0).all()
         assert torch.isfinite(model.lm_head.weight.grad).all()
 
+    @pytest.mark.parametrize("device", [torch_device, "cpu"])
+    def test_query_ids_masked_labels(self, device):
+        """`query_log_probs` are the full-vocabulary log-probabilities of `query_ids`, zero at masked positions."""
+        torch.manual_seed(0)
+        model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen3ForCausalLM").to(device)
+        add_fused_lm_head(model)
+        input_ids = torch.randint(0, model.config.vocab_size, (2, 16), device=device)
+        labels = input_ids.masked_fill(torch.arange(16, device=device) < 8, -100)
+        query_ids = torch.randint(0, model.config.vocab_size, (2, 16, 4), device=device)
+        query_ids[..., -1] = -1
+
+        out = model(input_ids=input_ids, labels=labels, query_ids=query_ids, fused_lm_head=True)
+        out["query_log_probs"].sum().backward()
+
+        logps = model(input_ids=input_ids).logits[:, :-1].float().log_softmax(-1)
+        ref = logps.gather(-1, query_ids[:, 1:].clamp(min=0)).masked_fill(query_ids[:, 1:] < 0, 0.0)
+        mask = labels[:, 1:] != -100
+        torch.testing.assert_close(out["query_log_probs"][mask], ref[mask], atol=1e-4, rtol=1e-4)
+        assert (out["query_log_probs"][~mask] == 0).all()
+        assert torch.isfinite(model.lm_head.weight.grad).all()
+
     def test_outputs(self):
         """Only the requested per-token fields are computed; the others are `None`."""
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen3ForCausalLM").to(torch_device)
