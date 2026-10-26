@@ -107,6 +107,31 @@ class AsyncGRPOConfig(_BaseConfig):
         epsilon_high (`float`, *optional*):
             Upper-bound epsilon value for clipping. If not specified, it defaults to the same value as the lower-bound
             specified in argument `epsilon`. Paper [DAPO](https://huggingface.co/papers/2503.14476) recommends `0.28`.
+        loss_type (`str`, *optional*, defaults to `"ppo"`):
+            Objective, normalized by the trained tokens of the optimizer step. Possible values are:
+
+            - `"ppo"`: The clipped objective `-min(r * A, clip(r, 1 - ε, 1 + ε_high) * A)`, with `r = p / q` the ratio
+              of the policy's probability to the sampler's.
+            - `"reinforce"`: REINFORCE, `-A * log p`, with each token weighted by its `vllm_importance_sampling_mode`
+              ratio `p / q`. Combine it with `score_centering`.
+        vllm_importance_sampling_correction (`bool`, *optional*, defaults to `True`):
+            Whether `loss_type="reinforce"` weights each token by its importance sampling ratio `p / q`.
+        vllm_importance_sampling_mode (`str`, *optional*, defaults to `"token_truncate"`):
+            How the ratios are constrained: `"token_truncate"` clips them to [C_min, C_max], `"token_mask"` sets those
+            outside [C_min, C_max] to zero.
+        vllm_importance_sampling_clip_max (`float`, *optional*, defaults to `3.0`):
+            Importance sampling upper bound C_max.
+        vllm_importance_sampling_clip_min (`float`, *optional*):
+            Importance sampling lower bound C_min.
+        score_centering (`str`, *optional*, defaults to `"off"`):
+            Score centering, from [Score Centering Stabilizes Off-policy Reinforcement
+            Learning](https://huggingface.co/papers/2609.20807), for `loss_type="reinforce"`: subtracts from each
+            token's weighted score its expectation under the sampler. Possible values are:
+
+            - `"off"`: No score centering.
+            - `"support_replay"`: Records the sampler's probability of every token of the support each token was
+              sampled from, over which the policy is already normalized, for an exact expectation. Requires a positive
+              `top_k`, `min_p=None`, and the vLLM server started with `--logprobs-mode processed_logprobs`.
         token_budget (`int`, *optional*):
             Maximum number of tokens forwarded in a single row (one DP rank's forward) for dynamic token-budgeted
             micro-batching. When `> 0`, a `TokenBudgetBatcher` forms attention-cost-balanced micro-batches whose rows
@@ -330,6 +355,44 @@ class AsyncGRPOConfig(_BaseConfig):
             "lower-bound specified in argument `epsilon`. Paper DAPO recommends `0.28`."
         },
     )
+    loss_type: str = field(
+        default="ppo",
+        metadata={
+            "help": "Objective, normalized by the trained tokens of the optimizer step. 'ppo': the clipped objective "
+            "with the ratio `p / q` of the policy's probability to the sampler's. 'reinforce': `-A * log p`, with "
+            "each token weighted by its `vllm_importance_sampling_mode` ratio `p / q`."
+        },
+    )
+    vllm_importance_sampling_correction: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether `loss_type='reinforce'` weights each token by its importance sampling ratio `p / q`."
+        },
+    )
+    vllm_importance_sampling_mode: str = field(
+        default="token_truncate",
+        metadata={
+            "help": "How the ratios are constrained: 'token_truncate' clips them to [C_min, C_max], 'token_mask' sets "
+            "those outside [C_min, C_max] to zero."
+        },
+    )
+    vllm_importance_sampling_clip_max: float | None = field(
+        default=3.0,
+        metadata={"help": "Importance sampling upper bound C_max."},
+    )
+    vllm_importance_sampling_clip_min: float | None = field(
+        default=None,
+        metadata={"help": "Importance sampling lower bound C_min."},
+    )
+    score_centering: str = field(
+        default="off",
+        metadata={
+            "help": "Score centering for `loss_type='reinforce'`: subtracts from each token's weighted score its "
+            "expectation under the sampler. 'off': none. 'support_replay': records the sampler's probability of every "
+            "token of each support, for an exact expectation; requires `top_k > 0`, `min_p=None` and a vLLM server "
+            "started with `--logprobs-mode processed_logprobs`."
+        },
+    )
     token_budget: int | None = field(
         default=None,
         metadata={
@@ -404,6 +467,24 @@ class AsyncGRPOConfig(_BaseConfig):
                 f"`repetition_penalty={self.repetition_penalty}` is not supported: the trainer cannot replay the "
                 "penalty on its log-probabilities, so every importance ratio would be biased."
             )
+
+        if self.loss_type not in ("ppo", "reinforce"):
+            raise ValueError(f"`loss_type` must be 'ppo' or 'reinforce', got '{self.loss_type}'.")
+        if self.vllm_importance_sampling_mode not in ("token_truncate", "token_mask"):
+            raise ValueError(
+                "`vllm_importance_sampling_mode` must be 'token_truncate' or 'token_mask', got "
+                f"'{self.vllm_importance_sampling_mode}'."
+            )
+        if self.score_centering not in ("off", "support_replay"):
+            raise ValueError(f"`score_centering` must be 'off' or 'support_replay', got '{self.score_centering}'.")
+        if self.score_centering != "off":
+            if self.loss_type != "reinforce":
+                raise ValueError("`score_centering` requires `loss_type='reinforce'`.")
+            if self.top_k <= 0 or self.min_p:
+                raise ValueError(
+                    "`score_centering='support_replay'` records the sampler's whole support, so it requires "
+                    "`top_k > 0` (the support's size bound) and `min_p=None`."
+                )
 
         if self.parallelism_config is not None and (
             self.parallelism_config.cp_enabled or self.parallelism_config.sp_enabled

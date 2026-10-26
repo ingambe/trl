@@ -53,6 +53,7 @@ from ...trainer.utils import (
     nanmax,
     nanmin,
     pad,
+    score_centering_coefficients,
 )
 from .async_grpo_config import AsyncGRPOConfig
 from .async_rollout_worker import AsyncRolloutWorker, RolloutSample
@@ -403,6 +404,7 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
                 "completion_mask": sample.completion_mask,
                 "old_log_probs": sample.old_log_probs,
                 "sampling_mask": sample.sampling_mask,
+                "support_log_probs": sample.support_log_probs,
                 "advantage": sample.advantage,
                 "group_id": sample.group_id,
                 "metrics": sample.metrics,  # per-sample rewards; aggregated by the collator, never sent to the model
@@ -1077,6 +1079,12 @@ class AsyncGRPOTrainer(_BaseTrainer):
         # Training arguments
         self.epsilon_low = args.epsilon
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
+        self.loss_type = args.loss_type
+        self.vllm_importance_sampling_correction = args.vllm_importance_sampling_correction
+        self.vllm_importance_sampling_mode = args.vllm_importance_sampling_mode
+        self.vllm_importance_sampling_clip_min = args.vllm_importance_sampling_clip_min
+        self.vllm_importance_sampling_clip_max = args.vllm_importance_sampling_clip_max
+        self.score_centering = args.score_centering
         self.temperature = args.temperature
 
         register_tree_attention()
@@ -1403,6 +1411,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     top_k=self.args.top_k,
                     min_p=self.args.min_p,
                     repetition_penalty=self.args.repetition_penalty,
+                    score_centering=self.args.score_centering,
                     request_timeout=self.args.request_timeout,
                     chat_template_kwargs=self.args.chat_template_kwargs,
                     max_tool_calling_iterations=self.args.max_tool_calling_iterations,
@@ -1504,6 +1513,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 "token_index",
                 "old_log_probs",
                 "sampling_mask",
+                "support_log_probs",
                 "advantages",
                 "segment_id",
                 "global_n_tokens",
@@ -1525,6 +1535,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
         old_log_probs = inputs["old_log_probs"][selected]
         advantages = inputs["advantages"][selected]
         segment_id = inputs["segment_id"][selected]
+        support_log_probs = inputs["support_log_probs"][selected]
         sampling_mask = inputs["sampling_mask"][mask_bool].unsqueeze(0)
         if sampling_mask.shape[-1] == 0:
             sampling_mask = None
@@ -1541,6 +1552,8 @@ class AsyncGRPOTrainer(_BaseTrainer):
             position_ids=position_ids,
             shift_labels=shift_labels,
             support_ids=sampling_mask,
+            # Score centering also scores every token of the support
+            query_ids=sampling_mask if self.score_centering != "off" else None,
             fused_lm_head=True,
             **router_kwargs,
             **tree_kwargs,
@@ -1551,10 +1564,55 @@ class AsyncGRPOTrainer(_BaseTrainer):
 
         log_ratio = log_probs - old_log_probs
         coef_1 = torch.exp(log_ratio)
-        coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
-        per_token_loss1 = coef_1 * advantages
-        per_token_loss2 = coef_2 * advantages
-        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        if self.loss_type == "ppo":
+            coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
+            per_token_loss1 = coef_1 * advantages
+            per_token_loss2 = coef_2 * advantages
+            per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        else:
+            per_token_loss = -advantages * log_probs
+            # Weight each token by its ratio of the current policy over the sampler
+            if self.vllm_importance_sampling_correction:
+                is_ratio = coef_1.detach()
+                if self.vllm_importance_sampling_mode == "token_truncate":
+                    is_ratio = torch.clamp(
+                        is_ratio,
+                        min=self.vllm_importance_sampling_clip_min,
+                        max=self.vllm_importance_sampling_clip_max,
+                    )
+                else:
+                    min_val = self.vllm_importance_sampling_clip_min or 0.0
+                    max_val = (
+                        self.vllm_importance_sampling_clip_max
+                        if self.vllm_importance_sampling_clip_max is not None
+                        else math.inf
+                    )
+                    is_ratio = is_ratio.masked_fill((is_ratio < min_val) | (is_ratio > max_val), 0.0)
+                per_token_loss = per_token_loss * is_ratio
+
+            if self.score_centering != "off":
+                # Subtract the expected weighted score under the sampler, so that a constant advantage gives no
+                # update. Kept for tokens the MIS mask rejects: their expectation is still nonzero.
+                if sampling_mask is None or (sampling_mask.flatten(0, 1)[token_index, 0] < 0).any():
+                    raise ValueError("`score_centering` needs the sampler's support of every trained token.")
+                query_ids = sampling_mask.flatten(0, 1)[token_index]
+                query_log_probs = outputs.query_log_probs.flatten(0, 1)[token_index]
+                query_mask = query_ids >= 0
+                weighting = None
+                if self.vllm_importance_sampling_correction:
+                    weighting = "truncate" if self.vllm_importance_sampling_mode == "token_truncate" else "mask"
+                _, query_coef, _ = score_centering_coefficients(
+                    log_probs,
+                    old_log_probs,
+                    query_log_probs,
+                    support_log_probs,
+                    query_mask,
+                    complete_support=True,
+                    weighting=weighting,
+                    clip_min=self.vllm_importance_sampling_clip_min,
+                    clip_max=self.vllm_importance_sampling_clip_max,
+                )
+                per_token_loss = per_token_loss + advantages * (query_coef * query_log_probs).sum(-1)
 
         # DDP/FSDP averages gradients across ranks, and `num_items_in_batch` counts the whole step's tokens
         loss = per_token_loss.sum()
@@ -1578,14 +1636,24 @@ class AsyncGRPOTrainer(_BaseTrainer):
             local_entropy_sum = entropy.sum()
 
             # Compute the clipped probability ratios
-            is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages < 0)
-            is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages > 0)
+            if self.loss_type == "ppo":
+                is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages < 0)
+                is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages > 0)
+            else:
+                # The ratios outside the importance sampling bounds, truncated or masked
+                is_low_clipped = coef_1 < (self.vllm_importance_sampling_clip_min or 0.0)
+                clip_max = self.vllm_importance_sampling_clip_max
+                is_high_clipped = coef_1 > (clip_max if clip_max is not None else math.inf)
             is_region_clipped = is_low_clipped | is_high_clipped
             local_low_clip_sum = is_low_clipped.float().sum()
             local_high_clip_sum = is_high_clipped.float().sum()
             local_region_clip_sum = is_region_clipped.float().sum()
+            local_support_sum = (
+                query_mask.sum().float() if self.score_centering != "off" else torch.zeros_like(local_count)
+            )
 
-            # Batch all-reduce: [ratio_sum, kl_sum, entropy_sum, low_clip_sum, high_clip_sum, region_clip_sum, count]
+            # Batch all-reduce: [ratio_sum, kl_sum, entropy_sum, low_clip_sum, high_clip_sum, region_clip_sum,
+            # support_sum, count]
             stats = torch.stack(
                 [
                     local_ratio_sum,
@@ -1594,6 +1662,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     local_low_clip_sum,
                     local_high_clip_sum,
                     local_region_clip_sum,
+                    local_support_sum,
                     local_count,
                 ]
             )
@@ -1605,6 +1674,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 global_low_clip_sum,
                 global_high_clip_sum,
                 global_region_clip_sum,
+                global_support_sum,
                 global_count,
             ) = stats.unbind(0)
             self._metrics["train"]["ratio"].append((global_ratio_sum / global_count).item())
@@ -1613,6 +1683,10 @@ class AsyncGRPOTrainer(_BaseTrainer):
             self._metrics["train"]["clip_ratio/low_mean"].append((global_low_clip_sum / global_count).item())
             self._metrics["train"]["clip_ratio/high_mean"].append((global_high_clip_sum / global_count).item())
             self._metrics["train"]["clip_ratio/region_mean"].append((global_region_clip_sum / global_count).item())
+            if self.score_centering != "off":
+                self._metrics["train"]["score_centering/support_size"].append(
+                    (global_support_sum / global_count).item()
+                )
 
             num_seq = int(segment_id.max()) + 1  # completions in this rank's row
 

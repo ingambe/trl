@@ -107,10 +107,38 @@ def async_grpo_loss_trainer():
     )
     trainer.aux_loss_enabled = False
     trainer.epsilon_low = trainer.epsilon_high = 0.2
+    trainer.loss_type = "ppo"
+    trainer.score_centering = "off"
     trainer._metrics = {"train": defaultdict(list)}
     trainer._step_forward_tokens = 0.0
     trainer._step_trained_tokens = 0.0
     trainer._step_seq_len_weighted = 0.0
     trainer._step_samples = 0.0
     trainer._step_forward_s = 0.0
+    return trainer, theta
+
+
+@pytest.fixture
+def async_grpo_support_loss_trainer(async_grpo_loss_trainer):
+    """Provide the trainer above with a model that normalizes the logits `theta`, the same at every position, over
+    each position's support, as the fused LM head does."""
+    trainer, _ = async_grpo_loss_trainer
+    theta = torch.randn(8, generator=torch.Generator().manual_seed(0)).requires_grad_()
+
+    def model(input_ids, shift_labels, support_ids, query_ids=None, **kwargs):
+        in_support = (support_ids.unsqueeze(-1) == torch.arange(theta.numel())).any(-2)
+        in_support |= ~in_support.any(-1, keepdim=True)  # positions without a support see the whole vocabulary
+        log_probs = theta.masked_fill(~in_support, -torch.inf).log_softmax(-1)
+        query_log_probs = None
+        if query_ids is not None:
+            query_log_probs = log_probs.gather(-1, query_ids.clamp(min=0)).masked_fill(query_ids < 0, 0.0)
+        label_log_probs = log_probs.gather(-1, shift_labels.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+        return SimpleNamespace(
+            log_probs=label_log_probs, entropy=torch.zeros_like(label_log_probs), query_log_probs=query_log_probs
+        )
+
+    trainer.model = model
+    trainer.loss_type = "reinforce"
+    trainer.vllm_importance_sampling_clip_min = None
+    trainer.vllm_importance_sampling_clip_max = 1.0
     return trainer, theta

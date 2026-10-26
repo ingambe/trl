@@ -129,6 +129,7 @@ class _StubRolloutWorker:
                     completion_mask=np.array([0] * len(prompt_ids) + [1] * len(completion_ids), dtype=np.int64),
                     old_log_probs=np.array([0.0] * len(prompt_ids) + [-0.5] * len(completion_ids), dtype=np.float32),
                     sampling_mask=[[] for _ in prompt_ids + completion_ids],
+                    support_log_probs=[[] for _ in prompt_ids + completion_ids],
                     advantage=float(advantages[idx]),
                     model_version=self._model_version,
                     group_id=group_id,
@@ -881,6 +882,7 @@ class TestAsyncRolloutWorkerEnvironments(TrlTestCase):
                 completion_mask=[0, 1, 1],
                 old_log_probs=[0.0, -0.1, -0.1],
                 sampling_mask=[[], [], []],
+                support_log_probs=[[], [], []],
                 rollout_id="r",
             )
             return [{"role": "assistant", "content": "x"}], [2, 3], [sequence], 0, 0, None
@@ -958,7 +960,7 @@ class TestAsyncRolloutWorkerEnvironments(TrlTestCase):
 
         async def _generate_one_turn(prompt_ids, max_tokens):
             ids = final if "<tool_response>" in loop.tokenizer.decode(prompt_ids) else tool_call
-            return ids, [-0.1] * len(ids), None
+            return ids, [-0.1] * len(ids), None, None
 
         loop._generate_one_turn = _generate_one_turn
         PartialState()
@@ -1020,6 +1022,7 @@ def _rollout_sample(length: int, advantage: float = 0.0, reward: float = 0.0) ->
         "completion_mask": np.array([0] + [1] * (length - 1), dtype=np.int64),
         "old_log_probs": np.zeros(length, dtype=np.float32),
         "sampling_mask": [[] for _ in range(length)],
+        "support_log_probs": [[] for _ in range(length)],
         "advantage": advantage,
         "group_id": int(input_ids[0]),
         "metrics": {"reward": reward},
@@ -1223,12 +1226,44 @@ class TestPackingAwareBatching(TrlTestCase):
         assert grads == pytest.approx([180 / 220, 180 / 220])
 
 
+class TestScoreCentering(TrlTestCase):
+    @pytest.mark.parametrize(
+        "correction, mode", [(False, "token_truncate"), (True, "token_truncate"), (True, "token_mask")]
+    )
+    @pytest.mark.parametrize("score_centering", ["off", "support_replay"])
+    def test_constant_advantage_gives_no_expected_update(
+        self, async_grpo_support_loss_trainer, correction, mode, score_centering
+    ):
+        trainer, theta = async_grpo_support_loss_trainer
+        trainer.vllm_importance_sampling_correction = correction
+        trainer.vllm_importance_sampling_mode = mode
+        trainer.score_centering = score_centering
+        support = [1, 2, 3, 5]
+        sampler_log_probs = torch.tensor([-0.3, -2.0, -1.2, -3.0]).log_softmax(-1).tolist()
+        collator = DataCollatorForRollout(pad_token_id=0, num_processes=1)
+        # Expected gradient over the sampler's draws, with a truncation (C_max = 1) that a plain ratio does not undo
+        theta.grad = None
+        for token, sampler_log_prob in zip(support, sampler_log_probs, strict=True):
+            sample = _tree_sample([7, token], n_prompt=1, advantage=1.0)
+            sample["old_log_probs"] = np.array([0.0, sampler_log_prob], dtype=np.float32)
+            sample["sampling_mask"] = [[], support]
+            sample["support_log_probs"] = [[], sampler_log_probs]
+            inputs = collator([[_tree_row([sample])]])
+            loss = trainer.compute_loss(trainer.model, inputs, num_items_in_batch=torch.tensor(1.0))
+            (math.exp(sampler_log_prob) * loss).backward()
+        if score_centering == "off":
+            assert theta.grad.norm() > 1e-2
+        else:
+            torch.testing.assert_close(theta.grad, torch.zeros_like(theta.grad), atol=1e-6, rtol=0)
+
+
 def _tree_sample(tokens: list[int], n_prompt: int, advantage: float = 0.0, group_id: int = 0):
     return {
         "input_ids": np.array(tokens, dtype=np.int64),
         "completion_mask": np.array([0] * n_prompt + [1] * (len(tokens) - n_prompt), dtype=np.int64),
         "old_log_probs": np.array([0.0] * n_prompt + [-0.5] * (len(tokens) - n_prompt), dtype=np.float32),
         "sampling_mask": [[] for _ in tokens],
+        "support_log_probs": [[] for _ in tokens],
         "advantage": advantage,
         "group_id": group_id,
         "metrics": {"reward": 0.0},
@@ -1307,6 +1342,20 @@ class TestTreePacking(TrlTestCase):
 
         assert packed["input_ids"].tolist() == [1, 2, 3, 1, 2, 3]
         assert packed["sampling_mask"][packed["token_index"]].tolist() == [[2, 5], [3, -1], [2, 6], [3, -1]]
+
+    def test_a_shared_position_keeps_the_sampler_probabilities_of_each_term(self):
+        # Samples from two policy versions share every position, but each loss term keeps its own q
+        a, b = (_tree_sample([1, 2, 3], n_prompt=1) for _ in range(2))
+        a["sampling_mask"] = b["sampling_mask"] = [[], [2, 5], [3]]
+        a["support_log_probs"] = [[], [-0.1, -2.4], [0.0]]
+        b["support_log_probs"] = [[], [-0.3, -1.4], [0.0]]
+        packed = _tree_row([a, b]).pack()
+
+        assert packed["input_ids"].tolist() == [1, 2, 3]
+        assert packed["token_index"].tolist() == [0, 1, 0, 1]
+        torch.testing.assert_close(
+            packed["support_log_probs"], torch.tensor([[-0.1, -2.4], [0.0, 0.0], [-0.3, -1.4], [0.0, 0.0]])
+        )
 
     def test_groups_share_a_common_prefix(self):
         rows = [_tree_sample([1, 2, 3, last], n_prompt=1, group_id=g) for g, last in ((0, 4), (1, 5))]
@@ -1778,7 +1827,7 @@ def _run(*, turns, max_iters=None, max_tokens=32):
 
     async def _generate_one_turn(prompt_ids, max_tokens):
         ids = outputs.pop(0)[:max_tokens]
-        return ids, [-0.1] * len(ids), None
+        return ids, [-0.1] * len(ids), None, None
 
     loop._generate_one_turn = _generate_one_turn
 
@@ -1800,7 +1849,7 @@ class TestGenerateOneTurn(TrlTestCase):
     def test_full_vocabulary_sampling_uses_the_completions_endpoint(self):
         loop = _rollout_loop()
         response = {"choices": [{"token_ids": [4, 5], "logprobs": {"token_logprobs": [-0.1, -0.2]}}]}
-        requests, (ids, logprobs, sampling_mask) = self._generate(loop, response)
+        requests, (ids, logprobs, sampling_mask, _) = self._generate(loop, response)
         assert requests[0][0] == "/v1/completions"
         assert requests[0][1]["prompt"] == [1, 2, 3]
         assert (ids, logprobs, sampling_mask) == ([4, 5], [-0.1, -0.2], None)
@@ -1818,12 +1867,39 @@ class TestGenerateOneTurn(TrlTestCase):
                 }
             ]
         }
-        requests, (ids, logprobs, sampling_mask) = self._generate(loop, response)
+        requests, (ids, logprobs, sampling_mask, _) = self._generate(loop, response)
         assert requests[0][0] == "/inference/v1/generate"
         assert requests[0][1]["token_ids"] == [1, 2, 3]
         assert requests[0][1]["sampling_params"]["top_p"] == 0.9
         assert requests[0][1]["sampling_params"]["top_k"] == 4
         assert (ids, logprobs, sampling_mask) == ([4, 5], [-0.1, -0.2], [[4, 7], [5]])
+
+    def test_score_centering_returns_the_support_probabilities(self):
+        loop = _rollout_loop(top_k=3, score_centering="support_replay")
+        # The sampled token first, then the top-k in rank order; -9999 is outside the top-p support
+        top_logprobs = [
+            [(7, math.log(0.4)), (4, math.log(0.6)), (9, -9999.0)],
+            [(5, 0.0), (6, -9999.0), (8, -9999.0)],
+        ]
+        content = [
+            {
+                "token_id": top[0][0],
+                "logprob": top[0][1],
+                "top_logprobs": [{"token_id": i, "logprob": lp} for i, lp in top],
+            }
+            for top in top_logprobs
+        ]
+        response = {
+            "choices": [{"token_ids": [7, 5], "logprobs": {"content": content}, "sampling_mask": [[4, 7], [5]]}]
+        }
+        requests, (ids, _, sampling_mask, support_log_probs) = self._generate(loop, response)
+        assert requests[0][1]["sampling_params"]["logprobs"] == 3
+        assert (ids, sampling_mask) == ([7, 5], [[4, 7], [5]])
+        assert support_log_probs == [[math.log(0.6), math.log(0.4)], [0.0]]
+
+        response["choices"][0]["sampling_mask"] = [[4, 7, 9], [5]]
+        with pytest.raises(ValueError, match="sampling mask"):
+            self._generate(loop, response)
 
     def test_client_error_is_not_retried(self):
         PartialState()
@@ -1886,11 +1962,31 @@ class TestGenerateOneTurn(TrlTestCase):
         loop.session = None
         asyncio.run(loop._check_sampling_replay())
 
+    def test_score_centering_checks_the_logprobs_mode_up_front(self):
+        loop = _rollout_loop(top_k=4, score_centering="support_replay")
+        replay = {"return_sampling_mask": True, "max_logprobs": 20}
+        paths = {"/inference/v1/generate": {}}
+        self._check(loop, {**replay, "logprobs_mode": "processed_logprobs"}, paths)
+        with pytest.raises(RuntimeError, match="--logprobs-mode processed_logprobs"):
+            self._check(loop, {**replay, "logprobs_mode": "raw_logprobs"}, paths)
+
     @pytest.mark.parametrize(
         "kwargs", [{"top_p": 0.9}, {"top_p": 0.9, "top_k": -1}, {"min_p": 0.1}, {"repetition_penalty": 1.1}]
     )
     def test_sampling_the_trainer_cannot_replay_is_rejected(self, kwargs):
         with pytest.raises(ValueError, match="top_k|repetition_penalty"):
+            AsyncGRPOConfig(**kwargs)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"score_centering": "support_replay", "top_k": 4},
+            {"loss_type": "reinforce", "score_centering": "support_replay"},
+            {"loss_type": "reinforce", "score_centering": "head_tail"},
+        ],
+    )
+    def test_score_centering_rejects_unsupported_configs(self, kwargs):
+        with pytest.raises(ValueError, match="score_centering"):
             AsyncGRPOConfig(**kwargs)
 
 
@@ -1966,9 +2062,11 @@ class TestScoreGroupOptionThree(TrlTestCase):
 
     def test_one_advantage_per_conversation_stamped_on_every_row(self):
         # conv 0: one row; conv 1: two rows (a fork).
-        seq_a = TrainingSequence([1, 2, 3, 10, 11], [0, 0, 0, 1, 1], [0, 0, 0, -0.1, -0.2], [[]] * 5, "c0")
-        seq_b1 = TrainingSequence([1, 2, 3, 20, 21], [0, 0, 0, 1, 1], [0, 0, 0, -0.3, -0.4], [[]] * 5, "c1")
-        seq_b2 = TrainingSequence([1, 2, 3, 20, 99, 30], [0, 0, 0, 0, 0, 1], [0, 0, 0, 0, 0, -0.5], [[]] * 6, "c1")
+        seq_a = TrainingSequence([1, 2, 3, 10, 11], [0, 0, 0, 1, 1], [0, 0, 0, -0.1, -0.2], [[]] * 5, [[]] * 5, "c0")
+        seq_b1 = TrainingSequence([1, 2, 3, 20, 21], [0, 0, 0, 1, 1], [0, 0, 0, -0.3, -0.4], [[]] * 5, [[]] * 5, "c1")
+        seq_b2 = TrainingSequence(
+            [1, 2, 3, 20, 99, 30], [0, 0, 0, 0, 0, 1], [0, 0, 0, 0, 0, -0.5], [[]] * 6, [[]] * 6, "c1"
+        )
         group = _group([[seq_a], [seq_b1, seq_b2]], completions_ids=[[10, 11], [20, 21, 30]])
 
         samples = asyncio.run(_rollout_loop(reward_funcs=[two_reward])._score_group(group))
@@ -1995,8 +2093,8 @@ class TestScoreGroupOptionThree(TrlTestCase):
         assert all(s.model_version == 7 for s in samples)
 
     def test_async_callable_class_reward_func_is_awaited(self):
-        seq_a = TrainingSequence([1, 2, 10], [0, 0, 1], [0, 0, -0.1], [[]] * 3, "c0")
-        seq_b = TrainingSequence([1, 2, 20], [0, 0, 1], [0, 0, -0.2], [[]] * 3, "c1")
+        seq_a = TrainingSequence([1, 2, 10], [0, 0, 1], [0, 0, -0.1], [[]] * 3, [[]] * 3, "c0")
+        seq_b = TrainingSequence([1, 2, 20], [0, 0, 1], [0, 0, -0.2], [[]] * 3, [[]] * 3, "c1")
         group = _group([[seq_a], [seq_b]], completions_ids=[[10], [20]])
 
         samples = asyncio.run(_rollout_loop(reward_funcs=[AsyncTwoReward()])._score_group(group))
@@ -2008,9 +2106,9 @@ class TestScoreGroupOptionThree(TrlTestCase):
         assert samples[1].advantage == pytest.approx(1.0)
 
     def test_metrics_are_per_conversation_and_independent(self):
-        seq_a = TrainingSequence([1, 2, 10], [0, 0, 1], [0, 0, -0.1], [[]] * 3, "c0")
-        seq_b1 = TrainingSequence([1, 2, 20], [0, 0, 1], [0, 0, -0.2], [[]] * 3, "c1")
-        seq_b2 = TrainingSequence([1, 2, 20, 30], [0, 0, 0, 1], [0, 0, 0, -0.3], [[]] * 4, "c1")
+        seq_a = TrainingSequence([1, 2, 10], [0, 0, 1], [0, 0, -0.1], [[]] * 3, [[]] * 3, "c0")
+        seq_b1 = TrainingSequence([1, 2, 20], [0, 0, 1], [0, 0, -0.2], [[]] * 3, [[]] * 3, "c1")
+        seq_b2 = TrainingSequence([1, 2, 20, 30], [0, 0, 0, 1], [0, 0, 0, -0.3], [[]] * 4, [[]] * 4, "c1")
         group = _group([[seq_a], [seq_b1, seq_b2]], completions_ids=[[10], [20, 30]])
 
         samples = asyncio.run(_rollout_loop(reward_funcs=[two_reward])._score_group(group))
@@ -2027,8 +2125,8 @@ class TestScoreGroupOptionThree(TrlTestCase):
         def maybe_none(completions, **kwargs):
             return [None, 2.0]
 
-        seq_a = TrainingSequence([1, 2, 10], [0, 0, 1], [0, 0, -0.1], [[]] * 3, "c0")
-        seq_b = TrainingSequence([1, 2, 20], [0, 0, 1], [0, 0, -0.2], [[]] * 3, "c1")
+        seq_a = TrainingSequence([1, 2, 10], [0, 0, 1], [0, 0, -0.1], [[]] * 3, [[]] * 3, "c0")
+        seq_b = TrainingSequence([1, 2, 20], [0, 0, 1], [0, 0, -0.2], [[]] * 3, [[]] * 3, "c1")
         group = _group([[seq_a], [seq_b]], completions_ids=[[10], [20]])
 
         samples = asyncio.run(_rollout_loop(reward_funcs=[maybe_none])._score_group(group))

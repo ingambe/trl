@@ -126,6 +126,16 @@ config = AsyncGRPOConfig(top_p=0.95, top_k=512)
 
 `--return-sampling-mask` makes vLLM record the candidate set (on its V2 model runner: `VLLM_USE_V2_MODEL_RUNNER=1` if the server refuses the flag), `--enable-scale-out` exposes the token-in-token-out endpoint that returns it. The worker checks both on the server when it starts.
 
+## REINFORCE and score centering
+
+`loss_type="reinforce"` replaces the clipped objective with REINFORCE, `-A * log p`, each token weighted by its ratio `p / q` of the policy's probability to the sampler's, truncated (`vllm_importance_sampling_mode="token_truncate"`) or masked (`"token_mask"`) to `[vllm_importance_sampling_clip_min, vllm_importance_sampling_clip_max]`. The loss keeps the clipped objective's normalization by the trained tokens of the optimizer step. With `score_centering="support_replay"`, it also subtracts each token's expected weighted score under the sampler, over the candidate set the token was drawn from, so that a constant advantage gives no expected update ([Score Centering Stabilizes Off-policy Reinforcement Learning](https://huggingface.co/papers/2609.20807)). The worker then asks the server for the probability of every candidate, which needs the setup of the previous section and `--max-logprobs` of at least `top_k` (or `-1`):
+
+```python
+config = AsyncGRPOConfig(top_k=64, loss_type="reinforce", score_centering="support_replay")
+```
+
+Each sample then carries one sampler probability per candidate of each trained token, as much memory as the candidate sets themselves, so a large `top_k` may call for a lower `queue_maxsize`. `score_centering/support_size` logs the mean candidate set size, and `clip_ratio/*` the fraction of ratios outside the bounds.
+
 ## LoRA
 
 Pass a `peft_config` to train a LoRA adapter instead of the full model:

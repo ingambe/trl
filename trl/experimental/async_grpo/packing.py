@@ -107,6 +107,9 @@ class TreeRow:
                 - `token_index` (`M`): position whose prediction is each trained token. A shared position serves every
                   sample that shares it, so there are more loss terms than labelled positions.
                 - `old_log_probs` (`M`), `advantages` (`M`): generator log-probability and advantage of each target.
+                - `support_log_probs` (`M`, `C'`): generator log-probability of each token of the target's candidate
+                  set, padded with `0`; `C'` is `0` without score centering. Kept per loss term, since samples that
+                  share a position can come from different policy versions.
                 - `segment_id` (`M`): index of the sample each target came from.
         """
         input_ids, position_ids, offsets, paths, kv_index, cu_seqlens_k = [], [], [0], [], [], [0]
@@ -132,7 +135,7 @@ class TreeRow:
 
         shift_labels = [-100] * len(input_ids)
         sampling_mask = [[] for _ in input_ids]
-        token_index, old_log_probs, advantages, segment_id = [], [], [], []
+        token_index, old_log_probs, support_log_probs, advantages, segment_id = [], [], [], [], []
         for i, (sample, nodes) in enumerate(zip(self.samples, self.sample_nodes, strict=True)):
             ids, mask, logps = (sample[key].tolist() for key in ("input_ids", "completion_mask", "old_log_probs"))
             for p in range(1, len(nodes)):
@@ -141,9 +144,11 @@ class TreeRow:
                     sampling_mask[packed[nodes[p - 1]]] = sample["sampling_mask"][p]
                     token_index.append(packed[nodes[p - 1]])
                     old_log_probs.append(logps[p])
+                    support_log_probs.append(sample["support_log_probs"][p])
                     advantages.append(sample["advantage"])
                     segment_id.append(i)
         width = max(map(len, sampling_mask))
+        support_width = max(map(len, support_log_probs), default=0)
         return {
             "input_ids": torch.tensor(input_ids),
             "position_ids": torch.tensor(position_ids),
@@ -159,6 +164,9 @@ class TreeRow:
             ),
             "token_index": torch.tensor(token_index, dtype=torch.long),
             "old_log_probs": torch.tensor(old_log_probs, dtype=torch.float32),
+            "support_log_probs": torch.tensor(
+                [logps + [0.0] * (support_width - len(logps)) for logps in support_log_probs], dtype=torch.float32
+            ).view(len(token_index), support_width),
             "advantages": torch.tensor(advantages, dtype=torch.float32),
             "segment_id": torch.tensor(segment_id, dtype=torch.long),
         }
