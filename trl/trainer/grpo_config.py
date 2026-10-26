@@ -415,13 +415,13 @@ class GRPOConfig(_BaseConfig):
             each token's weighted score its expectation under the sampler, so that the sampler's mismatch with the
             policy adds no drift. Possible values are:
 
-                - `"off"`: No score centering.
-                - `"head_tail"`: Records the sampler's top-`score_centering_topk` probabilities and models the rest as
-                the policy's, rescaled to the sampler's remaining mass. Requires untruncated sampling (`top_k=0`,
-                `top_p=1.0`, `min_p=0.0`).
-                - `"support_replay"`: Records every token of the sampler's top-k support, and normalizes the policy
-                over that support, as [`AsyncGRPOTrainer`] does, for an exact expectation. Requires `top_k > 0` and
-                `beta=0.0`.
+            - `"off"`: No score centering.
+            - `"head_tail"`: Records the sampler's top-`score_centering_topk` probabilities and models the rest as the
+              policy's, rescaled to the sampler's remaining mass. Requires untruncated sampling (`top_k=0`,
+              `top_p=1.0`, `min_p=0.0`).
+            - `"support_replay"`: Records every token of the sampler's top-k support, and normalizes the policy over
+              that support, as [`AsyncGRPOTrainer`] does, for an exact expectation. Requires `top_k > 0` and
+              `beta=0.0`.
 
             The weight `w` of the sampled token and of the expectation is `1`, or with
             `vllm_importance_sampling_correction`, the `token_truncate` or `token_mask` ratio `p / q`.
@@ -488,10 +488,12 @@ class GRPOConfig(_BaseConfig):
 
             </Deprecated>
 
-    > [!NOTE] > These parameters have default values different from [`~transformers.TrainingArguments`]: > -
-    `logging_steps`: Defaults to `10` instead of `500`. > - `gradient_checkpointing`: Defaults to `True` instead of
-    `False`. > - `bf16`: Defaults to `True` if `fp16` is not set, instead of `False`. > - `learning_rate`: Defaults to
-    `1e-6` instead of `5e-5`.
+    > [!NOTE]
+    > These parameters have default values different from [`~transformers.TrainingArguments`]:
+    > - `logging_steps`: Defaults to `10` instead of `500`.
+    > - `gradient_checkpointing`: Defaults to `True` instead of `False`.
+    > - `bf16`: Defaults to `True` if `fp16` is not set, instead of `False`.
+    > - `learning_rate`: Defaults to `1e-6` instead of `5e-5`.
     """
 
     _VALID_DICT_FIELDS = _BaseConfig._VALID_DICT_FIELDS + [
