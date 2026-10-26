@@ -56,6 +56,7 @@ def quantize_rowwise(x: torch.Tensor, scale_dtype: torch.dtype = torch.float32) 
     return (x.to(scale_dtype) / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn), scale.float()
 
 
+@torch.compile(dynamic=True)
 def _quantize_tokens(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Like `quantize_rowwise`, but without its scale floor, so tiny activations or gradients keep their value."""
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
