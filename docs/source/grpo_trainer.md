@@ -167,6 +167,8 @@ They recommend using asymmetric temperatures,  \\( \tau_{\text{neg}} > \tau_{\te
 
 To use this formulation, set `loss_type="sapo"` in the [`GRPOConfig`].
 
+Finally, `loss_type="reinforce"` drops the clipping:  \\( l_{i,t} = \hat{A}_{i,t} \log \pi_\theta(o_{i,t} \mid q, o_{i,< t}) \\), normalized like DAPO and weighted only by the vLLM importance sampling ratio. It updates on each completion once (`num_iterations=1`), and supports [score centering](paper_index#score-centering-stabilizes-off-policy-reinforcement-learning).
+
 ## Logged metrics
 
 While training and evaluating, we record the following metrics:
@@ -192,6 +194,9 @@ While training and evaluating, we record the following metrics:
 - `sampling/importance_sampling_ratio/min`: The smallest importance sampling ratio used to correct the train-inference mismatch, **after** the constraint selected by `vllm_importance_sampling_mode` has been applied (clipped to `[C_min, C_max]` for `*_truncate` modes, set to zero for `*_mask` modes). Computed over completion tokens, or over sequences for the `sequence_*` modes. Logged only when `use_vllm=True` and `vllm_importance_sampling_correction=True`.
 - `sampling/importance_sampling_ratio/mean`: The average constrained importance sampling ratio. Logged only when `use_vllm=True` and `vllm_importance_sampling_correction=True`.
 - `sampling/importance_sampling_ratio/max`: The largest constrained importance sampling ratio. Logged only when `use_vllm=True` and `vllm_importance_sampling_correction=True`.
+- `score_centering/head_mass`: The average probability mass, under the training model, of the sampler's recorded top-k head. Logged only when `score_centering="head_tail"`.
+- `score_centering/tail_floored`: The fraction of completion tokens whose tail mass, outside the head, was raised to `1e-6`. Logged only when `score_centering="head_tail"`.
+- `score_centering/support_size`: The average size of the sampler's support. Logged only when `score_centering="support_replay"`.
 - `policy_loss`: The policy gradient loss value (before any entropy bonus). Logged when `entropy_coef` is nonzero or `use_adaptive_entropy=True`.
 - `entropy`: Average entropy of token predictions across generated completions. (If `mask_truncated_completions=True`, masked sequences tokens are excluded.)
 - `entropy_coef`: The current entropy regularization coefficient. Logged when `entropy_coef` is nonzero or `use_adaptive_entropy=True`. Updated once per optimizer step when `use_adaptive_entropy=True`.
@@ -309,6 +314,8 @@ The original [TIS paper](https://huggingface.co/papers/1606.02647) proposed a si
 Note that in IcePop, the bounds are labelled as  \\( \alpha \\) and  \\( \beta \\) while in TRL we use  \\( C_{\min} \\) and  \\( C_{\max} \\).
 
 Under MIS, ratios outside of this range are set to zero, so those samples do not contribute to the gradient. In other words, outlier samples are downweighted under TIS and discarded under MIS. The configuration flag `vllm_importance_sampling_mode` chooses both the IS variant (masking or truncation) and the granularity (token level or sequence level).
+
+Even with these weights, the REINFORCE gradient of a constant advantage no longer averages to zero under the sampler. With `loss_type="reinforce"`, [score centering](paper_index#score-centering-stabilizes-off-policy-reinforcement-learning) (`score_centering`) subtracts that average, computed from the sampler's top-k probabilities.
 
 Importance sampling is the principled algorithmic response to the training–inference mismatch. However, there are also more direct approaches that attempt to reduce the mismatch between the two engines themselves. Most of these are engineering solutions. For example, [MiniMax M1 uses an FP32 language model head](https://huggingface.co/papers/2506.13585) in the inference engine. Thinking Machines has explored [deterministic inference kernels](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/), although this comes with a significant efficiency cost. vLLM has shown [bitwise consistent policies](https://blog.vllm.ai/2025/11/10/bitwise-consistent-train-inference.html) by building on the batch invariant deterministic kernels from Thinking Machines, but as of November 2025 there remains a substantial throughput penalty relative to standard vLLM inference.
 

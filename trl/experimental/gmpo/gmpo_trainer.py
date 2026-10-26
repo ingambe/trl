@@ -37,6 +37,10 @@ class GMPOTrainer(GRPOTrainer):
         if args is None:
             model_name = model if isinstance(model, str) else get_config_model_id(model.config)
             args = GMPOConfig(f"{model_name.split('/')[-1]}-GMPO")
+        if args.loss_type == "reinforce" or args.score_centering != "off":
+            raise ValueError(
+                "GMPO computes its own loss: `loss_type='reinforce'` and `score_centering` are not supported."
+            )
 
         super().__init__(model, reward_funcs, args=args, **kwargs)
 
@@ -50,7 +54,7 @@ class GMPOTrainer(GRPOTrainer):
         mask = completion_mask if "tool_mask" not in inputs else completion_mask * inputs["tool_mask"]
 
         # Compute the per_token_logps and the entropy at each position in the completion
-        per_token_logps, entropies, aux_loss = self._get_per_token_logps_and_entropies(
+        per_token_logps, entropies, aux_loss, _ = self._get_per_token_logps_and_entropies(
             model,
             input_ids,
             attention_mask,
