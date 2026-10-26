@@ -574,9 +574,11 @@ class ChunkedLogProbFunction(torch.autograd.Function):
                         if _use_triton(hidden.device)
                         else _backward_tile
                     )
+                    # The queried indicator terms cancel the softmax term near p = 1, so both are summed in fp32
+                    grad_tile = tile.float() if grad_query_logprobs is not None else tile
                     fold(
-                        tile,
-                        tile.stride(0),
+                        grad_tile,
+                        grad_tile.stride(0),
                         targets[token_start:token_end],
                         log_z[token_start:token_end],
                         support_log_z[token_start:token_end],
@@ -594,7 +596,7 @@ class ChunkedLogProbFunction(torch.autograd.Function):
                         **ctx.kernel_args,
                     )
                     if grad_query_logprobs is not None:
-                        tile.scatter_add_(1, local, query_grad.to(tile.dtype))
+                        tile.copy_(grad_tile.scatter_add_(1, local, query_grad))
                     if grad_hidden is not None:
                         _addmm_fp32(grad_hidden[token_start:token_end], tile, w_chunk)
                     if grad_weight is not None:
