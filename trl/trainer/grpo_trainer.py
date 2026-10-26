@@ -72,7 +72,7 @@ from ..chat_template_utils import (
 from ..data_utils import apply_chat_template, is_conversational, prepare_multimodal_messages
 from ..distributed import DistributedBackend
 from ..extras.profiling import profiling_context, profiling_decorator
-from ..generation.vllm_generation import VLLMGeneration
+from ..generation.vllm_generation import VLLMGeneration, split_sampler_logprobs
 from ..import_utils import is_jmespath_available
 from ..models import prepare_deepspeed, prepare_fsdp, unwrap_model_for_generation
 from ..models.fp8 import convert_to_fp8_training, requantize_fp8_layers
@@ -96,6 +96,7 @@ from .utils import (
     pad,
     print_prompt_completions_sample,
     repeat_iterable_dataset,
+    score_centering_coefficients,
     select_sequence_dict,
     shuffle_sequence_dict,
     shutdown_event_loop_in_daemon,
@@ -857,6 +858,13 @@ class GRPOTrainer(_BaseTrainer):
         self.vllm_importance_sampling_clip_max = args.vllm_importance_sampling_clip_max
         self.vllm_importance_sampling_clip_min = args.vllm_importance_sampling_clip_min
         self.loss_type = args.loss_type
+        self.score_centering = args.score_centering
+        # Sampler probabilities recorded per token for score centering: the head, or the whole top-k support
+        self.score_centering_num_logprobs = (
+            args.score_centering_topk if args.score_centering == "head_tail" else args.top_k
+        )
+        if self.score_centering != "off" and rollout_func is not None:
+            raise ValueError("`score_centering` is not supported with a `rollout_func`.")
         self.multi_objective_aggregation = args.multi_objective_aggregation
 
         # MoE load-balancing auxiliary loss. `output_router_logits` in the config means the model returns its router
@@ -1234,17 +1242,29 @@ class GRPOTrainer(_BaseTrainer):
                 top_k=self.top_k,
                 min_p=self.min_p,
                 max_completion_length=self.max_completion_length,
-                logprobs=0,  # we only need the generated token logprobs for the importance sampling correction
+                # The importance sampling correction needs the sampled tokens' logprobs, score centering the
+                # sampler's head or support
+                logprobs=0 if self.score_centering == "off" else self.score_centering_num_logprobs,
                 generation_kwargs=args.generation_kwargs,
             )
             self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
             # The importance sampling correction needs logprobs after temperature scaling and logit processing.
             if (
                 self.vllm_mode == "server"
-                and self.vllm_importance_sampling_correction
+                and (self.vllm_importance_sampling_correction or self.score_centering != "off")
                 and self.accelerator.is_main_process
             ):
-                logprobs_mode = self.vllm_generation.vllm_client.get_server_info()["model_config"]["logprobs_mode"]
+                model_config = self.vllm_generation.vllm_client.get_server_info()["model_config"]
+                logprobs_mode = model_config["logprobs_mode"]
+                if self.score_centering != "off" and (
+                    logprobs_mode != "processed_logprobs"
+                    or 0 <= model_config["max_logprobs"] < self.score_centering_num_logprobs
+                ):
+                    raise ValueError(
+                        "`score_centering` needs the sampler's probabilities: restart the vLLM server with "
+                        f"`--logprobs-mode processed_logprobs --max-logprobs -1` (it runs with `--logprobs-mode "
+                        f"{logprobs_mode} --max-logprobs {model_config['max_logprobs']}`)."
+                    )
                 if logprobs_mode != "processed_logprobs":
                     logger.warning(
                         f"The vLLM server runs with `--logprobs-mode {logprobs_mode}`, which biases the importance "
@@ -1546,12 +1566,18 @@ class GRPOTrainer(_BaseTrainer):
         token_type_ids=None,
         mm_token_type_ids=None,
         image_position_ids=None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        """Compute log-probs, (optionally) entropies, and (optionally) the MoE load-balancing aux loss."""
+        query_ids=None,
+        support_ids=None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """
+        Compute log-probs, (optionally) entropies, (optionally) the MoE load-balancing aux loss, and (optionally) the
+        log-probs of the completion's `query_ids`. With `support_ids`, the log-probs are normalized over that support.
+        """
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
         all_entropies = []
         all_aux_losses = []
+        all_query_logps = []
         for start in range(0, input_ids.size(0), batch_size):
             end = min(start + batch_size, input_ids.size(0))  # the last chunk can be smaller than batch_size
             input_ids_batch = input_ids[start:end]
@@ -1607,6 +1633,18 @@ class GRPOTrainer(_BaseTrainer):
             # Only the completion tokens are scored
             labels = input_ids_batch.masked_fill(attention_mask_batch == 0, -100)
             labels[:, :-logits_to_keep] = -100
+
+            # The queried ids and supports are aligned with the completion tokens; the prompt queries nothing
+            for key, ids in (("query_ids", query_ids), ("support_ids", support_ids)):
+                if ids is not None:
+                    ids = ids[start:end].long()
+                    prompt = ids.new_full((ids.size(0), input_ids_batch.size(1) - logits_to_keep, ids.size(2)), -1)
+                    model_inputs[key] = torch.cat([prompt, ids], dim=1)
+            if support_ids is not None:
+                # Tokens without a support (tool outputs) were not sampled, so they are not scored
+                labels[:, -logits_to_keep:] = labels[:, -logits_to_keep:].masked_fill(
+                    support_ids[start:end, :, 0] < 0, -100
+                )
             with self.accelerator.autocast():
                 outputs = model(**model_inputs, labels=labels, fused_lm_head=True)
             all_logps.append(outputs.log_probs[:, -logits_to_keep:])
@@ -1614,11 +1652,14 @@ class GRPOTrainer(_BaseTrainer):
                 all_entropies.append(outputs.entropy[:, -logits_to_keep:])
             if compute_aux_loss:
                 all_aux_losses.append(outputs.aux_loss)
+            if query_ids is not None:
+                all_query_logps.append(outputs.query_log_probs[:, -logits_to_keep:])
 
         logps = torch.cat(all_logps, dim=0)
         entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
         aux_loss = torch.stack(all_aux_losses).mean() if compute_aux_loss else None
-        return logps, entropies, aux_loss
+        query_logps = torch.cat(all_query_logps, dim=0) if query_ids is not None else None
+        return logps, entropies, aux_loss, query_logps
 
     def training_step(self, model, inputs, num_items_in_batch):
         time_before = time.perf_counter()
@@ -1718,6 +1759,8 @@ class GRPOTrainer(_BaseTrainer):
                         "tool_mask",
                         "old_per_token_logps",
                         "sampling_per_token_logps",
+                        "sampling_query_ids",
+                        "sampling_query_logps",
                         "ref_per_token_logps",
                     ]:
                         if key in batch:
@@ -2025,14 +2068,28 @@ class GRPOTrainer(_BaseTrainer):
                 self._last_loaded_step = self.state.global_step
 
             # Generate using vLLM with raw token IDs
-            _, completion_ids, logprobs, _ = self.vllm_generation.generate(
+            _, completion_ids, logprobs, logprob_token_ids = self.vllm_generation.generate(
                 prompts=prompt_ids,
                 images=images,
                 num_generations=num_generations,
                 profiler=profiling_context(self, "vLLM.generate"),
             )
-            # vLLM returns per-token top-k logprobs; keep only the top-1 (sampled token) logprob
-            logprobs = [[lp[0] for lp in seq] for seq in logprobs]
+            if self.score_centering == "off":
+                # vLLM returns per-token top-k logprobs; keep only the top-1 (sampled token) logprob
+                logprobs = [[lp[0] for lp in seq] for seq in logprobs]
+                evidence = None
+            else:
+                logprobs, evidence_ids, evidence_logprobs = split_sampler_logprobs(
+                    completion_ids,
+                    logprobs,
+                    logprob_token_ids,
+                    self.score_centering_num_logprobs,
+                    complete_support=self.score_centering == "support_replay",
+                )
+                # Per token, the ids and logprobs of the sampler's head or support
+                evidence = [
+                    list(zip(ids, lps, strict=True)) for ids, lps in zip(evidence_ids, evidence_logprobs, strict=True)
+                ]
 
         elif self.use_transformers_continuous_batching:
             with (
@@ -2062,6 +2119,7 @@ class GRPOTrainer(_BaseTrainer):
                 unwrapped_model.train()
             completion_ids = [output.generated_tokens for output in all_outputs.values()]
             logprobs = None
+            evidence = None
 
         else:
             # Regular generation path: left-pad token IDs into tensors. A rank without prompts generates from a dummy
@@ -2142,8 +2200,9 @@ class GRPOTrainer(_BaseTrainer):
                 c[m].tolist() for c, m in zip(completion_ids.cpu(), completion_mask.bool().cpu(), strict=True)
             ][:num_prompts]
             logprobs = None  # not used in this case
+            evidence = None
 
-        return completion_ids, logprobs
+        return completion_ids, logprobs, evidence
 
     def _get_tool_suffix_ids(self, tool_messages):
         """Get token IDs for tool result formatting by using a minimal dummy conversation."""
@@ -2197,7 +2256,9 @@ class GRPOTrainer(_BaseTrainer):
             raise ValueError("Unexpected tokenization: the EOS-trimmed prefix IDs are not a prefix of the full IDs.")
         return full_ids[len(prefix_ids) :]
 
-    def _tool_call_loop(self, prompts, prompt_ids, completion_ids, completions, logprobs, images, multimodal_fields):
+    def _tool_call_loop(
+        self, prompts, prompt_ids, completion_ids, completions, logprobs, evidence, images, multimodal_fields
+    ):
         # Tool execution loop: execute tools, then regenerate completions with tool results appended to the prompt
         tool_calls = [completion[0].get("tool_calls") for completion in completions]
         idxs_with_tool = [idx for idx, tool_call in enumerate(tool_calls) if tool_call]
@@ -2381,7 +2442,7 @@ class GRPOTrainer(_BaseTrainer):
                 loop_multimodal_fields = {}
 
             # Generate new completions after tool execution (using concatenated IDs, no re-tokenization)
-            post_tool_ids, post_tool_logprobs = self._generate_single_turn(
+            post_tool_ids, post_tool_logprobs, post_tool_evidence = self._generate_single_turn(
                 prompt_completion_tool_ids,
                 loop_images,
                 loop_multimodal_fields,
@@ -2402,6 +2463,8 @@ class GRPOTrainer(_BaseTrainer):
                     post_tool_ids[idx] = post_tool_ids[idx][:new_len]
                     if logprobs is not None:
                         post_tool_logprobs[idx] = post_tool_logprobs[idx][:new_len]
+                    if evidence is not None:
+                        post_tool_evidence[idx] = post_tool_evidence[idx][:new_len]
 
             # Update tool_mask: the tool result should be 0 and the post-tool 1
             for idx in range(len(idxs_with_tool)):
@@ -2414,6 +2477,8 @@ class GRPOTrainer(_BaseTrainer):
                 tool_mask[idx_with_tool] += [0] * tool_length + [1] * post_tool_length
                 if logprobs is not None:
                     logprobs[idx_with_tool] += [0.0] * tool_length + post_tool_logprobs[idx]
+                if evidence is not None:
+                    evidence[idx_with_tool] += [([], [])] * tool_length + post_tool_evidence[idx]
 
             # Update completion_ids with the new completions (after tool execution)
             for idx in range(len(idxs_with_tool)):
@@ -2456,6 +2521,7 @@ class GRPOTrainer(_BaseTrainer):
             completions,
             completion_ids,
             logprobs,
+            evidence,
             tool_call_count,
             tool_failure_count,
             tool_images,
@@ -2487,12 +2553,13 @@ class GRPOTrainer(_BaseTrainer):
                 raise ValueError(f"rollout_func must return keys {missing_keys_list} in its output dict.")
             extra_fields = {k: v for k, v in output.items() if k not in required_keys}
             prompt_ids, completion_ids, logprobs = output["prompt_ids"], output["completion_ids"], output["logprobs"]
+            evidence = None
             images = None
             multimodal_fields = {}
         else:
             prompt_ids, images, multimodal_fields = self._tokenize_prompts(prompts)
             num_generations = self.num_generations if mode == "train" else self.num_generations_eval
-            completion_ids, logprobs = self._generate_single_turn(
+            completion_ids, logprobs, evidence = self._generate_single_turn(
                 prompt_ids, images, multimodal_fields, num_generations
             )
             extra_fields = {}
@@ -2527,12 +2594,13 @@ class GRPOTrainer(_BaseTrainer):
                 completions,
                 completion_ids,
                 logprobs,
+                evidence,
                 tool_call_count,
                 tool_failure_count,
                 tool_images,
                 tool_truncated,
             ) = self._tool_call_loop(
-                prompts, prompt_ids, completion_ids, completions, logprobs, images, multimodal_fields
+                prompts, prompt_ids, completion_ids, completions, logprobs, evidence, images, multimodal_fields
             )
             # Merge tool response images into the images list for the forward pass
             if any(imgs for imgs in tool_images):
@@ -2602,6 +2670,7 @@ class GRPOTrainer(_BaseTrainer):
             tool_mask,
             completions,
             logprobs,
+            evidence,
             extra_fields,
             images,
             tool_images,
@@ -2717,6 +2786,7 @@ class GRPOTrainer(_BaseTrainer):
             tool_mask_list,
             completions,
             sampling_per_token_logps_list,
+            evidence_list,
             extra_fields,
             images,
             tool_images,
@@ -2766,6 +2836,23 @@ class GRPOTrainer(_BaseTrainer):
             ).to(device=device)
         else:
             sampling_per_token_logps = None
+        if evidence_list is not None:
+            # The sampler's head or support of each token, padded with id -1 (tool tokens have an empty one)
+            tokens = [token for seq in evidence_list for token in seq]
+            sizes = torch.tensor([len(ids) for ids, _ in tokens], dtype=torch.long)
+            in_token = torch.arange(max(sizes.tolist(), default=1)) < sizes.unsqueeze(-1)
+            lengths = torch.tensor([len(seq) for seq in evidence_list], dtype=torch.long)
+            is_token = torch.arange(completion_ids.size(1)) < lengths.unsqueeze(-1)
+            sampling_query_ids = torch.full((*is_token.shape, in_token.size(-1)), -1, dtype=torch.int32)
+            sampling_query_logps = torch.zeros(sampling_query_ids.shape)
+            sampling_query_ids[is_token] = torch.full(in_token.shape, -1, dtype=torch.int32).masked_scatter(
+                in_token, torch.tensor([i for ids, _ in tokens for i in ids], dtype=torch.int32)
+            )
+            sampling_query_logps[is_token] = torch.zeros(in_token.shape).masked_scatter(
+                in_token, torch.tensor([lp for _, logps in tokens for lp in logps])
+            )
+            sampling_query_ids = sampling_query_ids.to(device)
+            sampling_query_logps = sampling_query_logps.to(device)
         if tool_mask_list is not None:
             tool_mask = [torch.tensor(mask) for mask in tool_mask_list]
             tool_mask = pad(
@@ -2931,8 +3018,9 @@ class GRPOTrainer(_BaseTrainer):
             # for importance sampling. If the steps are aligned, importance sampling isn't necessary and we set
             # old_per_token_logps to None.
             generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
-            if self.args.gradient_accumulation_steps % generate_every != 0:
-                old_per_token_logps, _, _ = self._get_per_token_logps_and_entropies(
+            # REINFORCE weights the sampled tokens by the current policy, with no old one
+            if self.args.gradient_accumulation_steps % generate_every != 0 and self.loss_type != "reinforce":
+                old_per_token_logps, _, _, _ = self._get_per_token_logps_and_entropies(
                     self.model,
                     prompt_completion_ids,
                     attention_mask,
@@ -2948,7 +3036,7 @@ class GRPOTrainer(_BaseTrainer):
             # Compute the per-token log probabilities for the reference model
             if self.beta != 0.0:
                 if self.ref_model is not None:
-                    ref_per_token_logps, _, _ = self._get_per_token_logps_and_entropies(
+                    ref_per_token_logps, _, _, _ = self._get_per_token_logps_and_entropies(
                         self.ref_model,
                         prompt_completion_ids,
                         attention_mask,
@@ -2964,7 +3052,7 @@ class GRPOTrainer(_BaseTrainer):
                     # - Re-training an existing adapter: an initial copy is loaded under the name "ref".
                     model = self.accelerator.unwrap_model(self.model)
                     with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
-                        ref_per_token_logps, _, _ = self._get_per_token_logps_and_entropies(
+                        ref_per_token_logps, _, _, _ = self._get_per_token_logps_and_entropies(
                             self.model,
                             prompt_completion_ids,
                             attention_mask,
@@ -3109,6 +3197,9 @@ class GRPOTrainer(_BaseTrainer):
             output["old_per_token_logps"] = old_per_token_logps
         if sampling_per_token_logps is not None:
             output["sampling_per_token_logps"] = sampling_per_token_logps
+        if evidence_list is not None:
+            output["sampling_query_ids"] = sampling_query_ids
+            output["sampling_query_logps"] = sampling_query_logps
         if ref_per_token_logps is not None:
             output["ref_per_token_logps"] = ref_per_token_logps
         if "pixel_values" in forward_kwargs:
@@ -3226,8 +3317,12 @@ class GRPOTrainer(_BaseTrainer):
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         mask = completion_mask if "tool_mask" not in inputs else completion_mask * inputs["tool_mask"]
 
+        # Under score centering, also score the sampler's head (or, normalized over it, its complete support)
+        query_ids = inputs.get("sampling_query_ids")
+        support_ids = query_ids if self.score_centering == "support_replay" else None
+
         # Compute the per_token_logps and the entropy at each position in the completion
-        per_token_logps, entropies, aux_loss = self._get_per_token_logps_and_entropies(
+        per_token_logps, entropies, aux_loss, query_logps = self._get_per_token_logps_and_entropies(
             model,
             input_ids,
             attention_mask,
@@ -3244,6 +3339,8 @@ class GRPOTrainer(_BaseTrainer):
             token_type_ids=inputs.get("token_type_ids"),
             mm_token_type_ids=inputs.get("mm_token_type_ids"),
             image_position_ids=inputs.get("image_position_ids"),
+            query_ids=query_ids,
+            support_ids=support_ids,
         )
 
         if self.top_entropy_quantile < 1.0:
@@ -3379,6 +3476,8 @@ class GRPOTrainer(_BaseTrainer):
                 lambda_neg=self.args.vespo_lambda_neg,
             )
             per_token_loss = -phi_seq * advantages * per_token_logps
+        elif self.loss_type == "reinforce":
+            per_token_loss = -advantages * per_token_logps
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
 
@@ -3391,13 +3490,33 @@ class GRPOTrainer(_BaseTrainer):
         if self.use_vllm and self.vllm_importance_sampling_correction and self.loss_type != "vespo":
             per_token_loss = per_token_loss * vllm_importance_sampling_ratio
 
-        if self.beta != 0.0:
-            per_token_loss = per_token_loss + self.beta * per_token_kl
-
         mode = "train" if self.model.training else "eval"
 
         def log_metric(key, reduction, value):
             self._pending_loss_metrics[mode][key, reduction].append(value.detach())
+
+        if self.score_centering != "off":
+            # Subtract the expected weighted score under the sampler, so that a constant advantage gives no update.
+            # Kept for tokens the MIS mask rejects: their expectation is still nonzero.
+            weighting = None
+            if self.vllm_importance_sampling_correction:
+                weighting = "truncate" if self.vllm_importance_sampling_mode == "token_truncate" else "mask"
+            query_mask = query_ids >= 0
+            _, query_coef, tail_floored = score_centering_coefficients(
+                per_token_logps,
+                inputs["sampling_per_token_logps"],
+                query_logps,
+                inputs["sampling_query_logps"],
+                query_mask,
+                complete_support=self.score_centering == "support_replay",
+                weighting=weighting,
+                clip_min=self.vllm_importance_sampling_clip_min,
+                clip_max=self.vllm_importance_sampling_clip_max,
+            )
+            per_token_loss = per_token_loss + advantages * (query_coef * query_logps).sum(-1)
+
+        if self.beta != 0.0:
+            per_token_loss = per_token_loss + self.beta * per_token_kl
 
         # Count the rows skipped for their zero advantage too
         num_sequences = inputs.get("num_sequences", per_token_loss.size(0))
@@ -3416,7 +3535,7 @@ class GRPOTrainer(_BaseTrainer):
             normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0  # no accum in eval
             policy_loss = loss.detach()
             loss = loss / normalizer
-        elif self.loss_type in ["cispo", "dapo", "vespo"]:
+        elif self.loss_type in ["cispo", "dapo", "vespo", "reinforce"]:
             # `num_items_in_batch` counts the loss tokens of the whole optimizer step
             normalizer = inputs["num_items_in_batch"].clamp(min=1.0) / self.accelerator.num_processes
             loss = (per_token_loss * mask).sum() / normalizer
@@ -3530,6 +3649,13 @@ class GRPOTrainer(_BaseTrainer):
             log_metric("sampling/importance_sampling_ratio/min", "min", min_is_ratio)
             log_metric("sampling/importance_sampling_ratio/mean", "mean", mean_is_ratio)
             log_metric("sampling/importance_sampling_ratio/max", "max", masked_is_ratio.max())
+
+        if self.score_centering == "head_tail":
+            head_mass = (query_logps.detach().exp() * query_mask).sum(-1)
+            log_metric("score_centering/head_mass", "ratio", masked_sum_and_count(head_mass))
+            log_metric("score_centering/tail_floored", "ratio", masked_sum_and_count(tail_floored.float()))
+        elif self.score_centering == "support_replay":
+            log_metric("score_centering/support_size", "ratio", masked_sum_and_count(query_mask.sum(-1).float()))
 
         if self.loss_type in ["grpo", "bnpo", "dr_grpo", "dapo", "luspo"]:
             # Compute the clipped probability ratios

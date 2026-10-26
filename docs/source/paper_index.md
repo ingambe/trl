@@ -700,6 +700,30 @@ training_args = GRPOConfig(
 )
 ```
 
+### Score Centering Stabilizes Off-policy Reinforcement Learning
+
+**📜 Paper**: https://huggingface.co/papers/2609.20807
+
+When completions are sampled from a policy  \\( \mu \\) other than the trained one (vLLM's train-inference mismatch), the weighted REINFORCE gradient  \\( A \, w(y_t) \nabla_\theta \log \pi_\theta(y_t) \\) no longer averages to zero for a constant advantage, so the update drifts. Score centering subtracts the score's expectation under the sampler, with detached coefficients:
+
+$$
+\mathcal{L}(\theta) = - A \left( w(y_t) \log \pi_\theta(y_t) - \sum_{v} \mu(v) \, w(v) \log \pi_\theta(v) \right),
+$$
+
+with  \\( w \\) the token's truncated (TIS) or masked (MIS) ratio  \\( \pi_\theta / \mu \\), or  \\( 1 \\). The sum runs over the sampler's top-k head, with its tail modeled as the policy's rescaled to the sampler's tail mass (`"head_tail"`), or over the whole top-k support of the sampler, to which the policy is renormalized (`"support_replay"`).
+
+```python
+from trl import GRPOConfig
+
+training_args = GRPOConfig(
+    loss_type="reinforce",
+    use_vllm=True,
+    vllm_importance_sampling_mode="token_mask",  # or "token_truncate"
+    score_centering="head_tail",  # requires untruncated sampling; "support_replay" requires top_k > 0
+    score_centering_topk=128,
+)
+```
+
 ## Optimal Advantage Regression
 
 Papers relating to the [`experimental.a2po.A2POTrainer`].
