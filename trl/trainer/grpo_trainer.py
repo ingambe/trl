@@ -3540,11 +3540,16 @@ class GRPOTrainer(_BaseTrainer):
                     clip_min=self.vllm_importance_sampling_clip_min,
                     clip_max=self.vllm_importance_sampling_clip_max,
                 )
-                query_ratio = torch.exp(query_logps.detach() - old_query_logps)
+                query_log_ratio = query_logps.detach() - old_query_logps
                 gate = ppo_clip_gate(
-                    query_ratio, advantages.unsqueeze(-1), self.epsilon_low, self.epsilon_high, self.args.delta
+                    query_log_ratio.exp(),
+                    advantages.unsqueeze(-1),
+                    self.epsilon_low,
+                    self.epsilon_high,
+                    self.args.delta,
                 )
-                query_coef = query_coef * query_ratio * gate
+                # In log space, so that a clipped token whose ratio overflows contributes zero rather than inf * 0
+                query_coef = torch.where(gate > 0, gate * torch.exp(query_coef.log() + query_log_ratio), 0.0)
             per_token_loss = per_token_loss + advantages * (query_coef * query_logps).sum(-1)
 
         if self.beta != 0.0:
