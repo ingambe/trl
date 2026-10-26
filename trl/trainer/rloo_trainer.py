@@ -406,6 +406,27 @@ class RLOOTrainer(_BaseTrainer):
                     "peft, or load the model with `device_map=None`. See "
                     "https://github.com/huggingface/peft/issues/2821."
                 )
+            # With transformers v5, peft<0.19 doesn't apply `target_modules` to the fused MoE routed experts (#7765)
+            if (
+                isinstance(peft_config, LoraConfig)
+                and Version(transformers.__version__) >= Version("5.0.0")
+                and Version(peft.__version__) < Version("0.19.0")
+                and not peft_config.target_parameters
+                and any(param.ndim == 3 for name, param in model.named_parameters() if ".experts." in name)
+                and (
+                    peft_config.target_modules == "all-linear"
+                    or any(
+                        name.rsplit(".", 1)[-1] in {"gate_proj", "up_proj", "down_proj", "w1", "w2", "w3"}
+                        for name in peft_config.target_modules or []
+                    )
+                )
+            ):
+                raise ValueError(
+                    "With transformers v5, LoRA `target_modules` only reach the routed experts of MoE models from "
+                    "`peft>=0.19.0`. Upgrade peft, or also target the expert parameters with `target_parameters` "
+                    "(e.g. `target_parameters=['mlp.experts.gate_up_proj', 'mlp.experts.down_proj']`). See "
+                    "https://github.com/huggingface/trl/issues/7765."
+                )
             # With transformers v5, peft 0.19 to 0.21.2 skip the MoE dense and shared layers (#7767)
             if (
                 isinstance(peft_config, LoraConfig)
@@ -1054,18 +1075,18 @@ class RLOOTrainer(_BaseTrainer):
         token_type_ids=None,
         mm_token_type_ids=None,
         image_position_ids=None,
-        query_ids=None,
+        score_ids=None,
         support_ids=None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """
         Compute log-probs, (optionally) entropies, (optionally) the MoE load-balancing aux loss, and (optionally) the
-        log-probs of the completion's `query_ids`. With `support_ids`, the log-probs are normalized over that support.
+        log-probs of the completion's `score_ids`. With `support_ids`, the log-probs are normalized over that support.
         """
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
         all_entropies = []
         all_aux_losses = []
-        all_query_logps = []
+        all_score_logps = []
         for start in range(0, input_ids.size(0), batch_size):
             end = min(start + batch_size, input_ids.size(0))  # the last chunk can be smaller than batch_size
             input_ids_batch = input_ids[start:end]
@@ -1122,8 +1143,8 @@ class RLOOTrainer(_BaseTrainer):
             labels = input_ids_batch.masked_fill(attention_mask_batch == 0, -100)
             labels[:, :-logits_to_keep] = -100
 
-            # The queried ids and supports are aligned with the completion tokens; the prompt queries nothing
-            for key, ids in (("query_ids", query_ids), ("support_ids", support_ids)):
+            # The scored ids and supports are aligned with the completion tokens; the prompt scores nothing
+            for key, ids in (("score_ids", score_ids), ("support_ids", support_ids)):
                 if ids is not None:
                     ids = ids[start:end].long()
                     prompt = ids.new_full((ids.size(0), input_ids_batch.size(1) - logits_to_keep, ids.size(2)), -1)
@@ -1140,14 +1161,14 @@ class RLOOTrainer(_BaseTrainer):
                 all_entropies.append(outputs.entropy[:, -logits_to_keep:])
             if compute_aux_loss:
                 all_aux_losses.append(outputs.aux_loss)
-            if query_ids is not None:
-                all_query_logps.append(outputs.query_log_probs[:, -logits_to_keep:])
+            if score_ids is not None:
+                all_score_logps.append(outputs.score_log_probs[:, -logits_to_keep:])
 
         logps = torch.cat(all_logps, dim=0)
         entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
         aux_loss = torch.stack(all_aux_losses).mean() if compute_aux_loss else None
-        query_logps = torch.cat(all_query_logps, dim=0) if query_ids is not None else None
-        return logps, entropies, aux_loss, query_logps
+        score_logps = torch.cat(all_score_logps, dim=0) if score_ids is not None else None
+        return logps, entropies, aux_loss, score_logps
 
     def training_step(self, model, inputs, num_items_in_batch):
         time_before = time.perf_counter()
