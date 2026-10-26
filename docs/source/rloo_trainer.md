@@ -118,6 +118,14 @@ $$
 
 In a fully online, single-step setting (default),  \\( \frac{\pi_\theta(o_i \mid q)}{\pi_{\theta_\text{old}}(o_i \mid q)} = 1 \\) and this reduces to standard REINFORCE.
 
+With `loss_type="reinforce"`, the loss is that standard REINFORCE, without the clipping, and with vLLM each token's term is weighted by its truncated (`vllm_importance_sampling_mode="token_truncate"`, the default) or masked (`"token_mask"`) ratio of the current policy's probability over the sampler's, \\( w_{i,t} \\):
+
+$$
+\mathcal{L}_{\text{RLOO}}(\theta) = - \frac{1}{G} \sum_{i=1}^G \hat{A}_i \sum_{t=1}^{|o_i|} w_{i,t} \log \pi_\theta(o_{i,t} \mid q, o_{i,<t})
+$$
+
+It supports [score centering](paper_index#score-centering-stabilizes-off-policy-reinforcement-learning) (`score_centering`), which subtracts from each token's term its expectation under the sampler.
+
 > [!NOTE]
 > Unlike GRPO, RLOO does not backpropagate gradients through the KL term. Here the KL is purely used for reward shaping: it is computed under `no_grad` and folded into the scalar reward  \\( r_i \\), which becomes the detached advantage  \\( \hat{A}_i \\).
 >
@@ -146,6 +154,10 @@ While training and evaluating, we record the following metrics:
 - `entropy`: Average entropy of token predictions across generated completions. (If `mask_truncated_completions=True`, masked sequences tokens are excluded.)
 - `aux_loss`: The load-balancing auxiliary loss of a Mixture-of-Experts model, before it is scaled by `router_aux_loss_coef` and added to the loss. Logged only when the model is a MoE model and `router_aux_loss_coef` is nonzero.
 - `kl`: The average KL divergence between the model and the reference model, calculated over generated completions. Logged only if `beta` is nonzero.
+- `sampling/importance_sampling_ratio/mean`: The average constrained importance sampling ratio over completion tokens. Logged only when `loss_type="reinforce"`, `use_vllm=True` and `vllm_importance_sampling_correction=True`.
+- `score_centering/head_mass`: The average probability mass, under the training model, of the sampler's recorded top-k head. Logged only when `score_centering="head_tail"`.
+- `score_centering/tail_floored`: The fraction of completion tokens whose tail mass, outside the head, was raised to `1e-6`. Logged only when `score_centering="head_tail"`.
+- `score_centering/support_size`: The average size of the sampler's support. Logged only when `score_centering="support_replay"`.
 - `clip_ratio/region_mean`: The ratio of sequence probabilities where the RLOO objective is clipped to stay within the trust region:  \\( \text{clip}\left( r_{i}(\theta), 1 - \epsilon_\mathrm{low}, 1 + \epsilon_\mathrm{high} \right)\,, \quad r_{i}(\theta) = \frac{\pi_\theta(o_{i} \mid q)}{\pi_{\theta_{\text{old}}}(o_{i} \mid q)} \\). A higher value means more samples are clipped, which constrains how much the policy $\pi_\theta$ can change.
 - `clip_ratio/low_mean`: The average ratio of sequence probabilities that were clipped on the lower bound of the trust region:  \\(r_{i,t}(\theta) < 1 - \epsilon_\mathrm{low}\\).
 - `clip_ratio/low_min`: The smallest per-completion clip indicator on the lower bound of the trust region:  \\(r_{i,t}(\theta) < 1 - \epsilon_\mathrm{low}\\).

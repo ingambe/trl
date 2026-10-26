@@ -55,7 +55,7 @@ from transformers.utils import is_peft_available, is_rich_available
 from ..data_utils import apply_chat_template, is_conversational, prepare_multimodal_messages
 from ..distributed import DistributedBackend
 from ..extras.profiling import profiling_context, profiling_decorator
-from ..generation.vllm_generation import VLLMGeneration
+from ..generation.vllm_generation import VLLMGeneration, split_sampler_logprobs
 from ..models import prepare_deepspeed, prepare_fsdp, unwrap_model_for_generation
 from ..models.utils import disable_gradient_checkpointing
 from .base_trainer import _BaseTrainer
@@ -77,6 +77,7 @@ from .utils import (
     pad,
     print_prompt_completions_sample,
     repeat_iterable_dataset,
+    score_centering_coefficients,
     select_sequence_dict,
     shuffle_sequence_dict,
     shutdown_event_loop_in_daemon,
@@ -668,6 +669,16 @@ class RLOOTrainer(_BaseTrainer):
         self.num_iterations = args.num_iterations
         self.epsilon_low = args.epsilon
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
+        self.loss_type = args.loss_type
+        self.vllm_importance_sampling_correction = args.vllm_importance_sampling_correction
+        self.vllm_importance_sampling_mode = args.vllm_importance_sampling_mode
+        self.vllm_importance_sampling_clip_max = args.vllm_importance_sampling_clip_max
+        self.vllm_importance_sampling_clip_min = args.vllm_importance_sampling_clip_min
+        self.score_centering = args.score_centering
+        # Sampler probabilities recorded per token for score centering: the head, or the whole top-k support
+        self.score_centering_num_logprobs = (
+            args.score_centering_topk if args.score_centering == "head_tail" else args.top_k
+        )
 
         # MoE load-balancing auxiliary loss. `output_router_logits` in the config means the model returns its router
         # logits; `router_aux_loss_coef` is the architecture's own coefficient, 0.0 when the config declares none.
@@ -850,10 +861,40 @@ class RLOOTrainer(_BaseTrainer):
                 top_k=self.top_k,
                 min_p=self.min_p,
                 max_completion_length=self.max_completion_length,
-                logprobs=None,  # we don't need logprobs from vLLM in RLOO
+                # The clipped objective needs no logprobs from vLLM, REINFORCE the sampled tokens' ones for the
+                # importance sampling correction, and score centering the sampler's head or support
+                logprobs=None
+                if self.loss_type == "ppo"
+                else 0
+                if self.score_centering == "off"
+                else self.score_centering_num_logprobs,
                 generation_kwargs=args.generation_kwargs,
             )
             self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
+            # The importance sampling correction needs logprobs after temperature scaling and logit processing.
+            if (
+                self.vllm_mode == "server"
+                and self.loss_type == "reinforce"
+                and (self.vllm_importance_sampling_correction or self.score_centering != "off")
+                and self.accelerator.is_main_process
+            ):
+                model_config = self.vllm_generation.vllm_client.get_server_info()["model_config"]
+                logprobs_mode = model_config["logprobs_mode"]
+                if self.score_centering != "off" and (
+                    logprobs_mode != "processed_logprobs"
+                    or 0 <= model_config["max_logprobs"] < self.score_centering_num_logprobs
+                ):
+                    raise ValueError(
+                        "`score_centering` needs the sampler's probabilities: restart the vLLM server with "
+                        f"`--logprobs-mode processed_logprobs --max-logprobs -1` (it runs with `--logprobs-mode "
+                        f"{logprobs_mode} --max-logprobs {model_config['max_logprobs']}`)."
+                    )
+                if logprobs_mode != "processed_logprobs":
+                    logger.warning(
+                        f"The vLLM server runs with `--logprobs-mode {logprobs_mode}`, which biases the importance "
+                        "sampling correction. Restart it with `--logprobs-mode processed_logprobs`, or set "
+                        "`vllm_importance_sampling_correction=False`."
+                    )
         else:
             generation_kwargs = {
                 "max_new_tokens": self.max_completion_length,
@@ -1223,8 +1264,15 @@ class RLOOTrainer(_BaseTrainer):
                         completion_length = (
                             math.ceil(completion_length / self.pad_to_multiple_of) * self.pad_to_multiple_of
                         )
-                    for key in ["completion_ids", "completion_mask"]:
-                        batch[key] = batch[key][:, :completion_length]
+                    for key in [
+                        "completion_ids",
+                        "completion_mask",
+                        "sampling_per_token_logps",
+                        "sampling_score_ids",
+                        "sampling_score_logps",
+                    ]:
+                        if key in batch:
+                            batch[key] = batch[key][:, :completion_length]
                     for key in ["token_type_ids", "mm_token_type_ids"]:  # span the prompt and the completion
                         if key in batch:
                             batch[key] = batch[key][:, : batch["prompt_ids"].size(1) + completion_length]
@@ -1443,14 +1491,34 @@ class RLOOTrainer(_BaseTrainer):
                     self.vllm_generation.sync_weights()
                 self._last_loaded_step = self.state.global_step
 
-            # Generate using vLLM (note: RLOO doesn't use logprobs from generation, so we ignore them)
+            # Generate using vLLM with raw token IDs
             num_generations = self.num_generations if mode == "train" else self.num_generations_eval
-            _, completion_ids, _, _ = self.vllm_generation.generate(
+            _, completion_ids, logprobs, logprob_token_ids = self.vllm_generation.generate(
                 prompts=prompt_ids,
                 images=images,
                 num_generations=num_generations,
                 profiler=profiling_context(self, "vLLM.generate"),
             )
+            if self.loss_type == "ppo":
+                # The clipped objective doesn't use logprobs from generation
+                logprobs = None
+                evidence = None
+            elif self.score_centering == "off":
+                # vLLM returns per-token top-k logprobs; keep only the top-1 (sampled token) logprob
+                logprobs = [[lp[0] for lp in seq] for seq in logprobs]
+                evidence = None
+            else:
+                logprobs, evidence_ids, evidence_logprobs = split_sampler_logprobs(
+                    completion_ids,
+                    logprobs,
+                    logprob_token_ids,
+                    self.score_centering_num_logprobs,
+                    complete_support=self.score_centering == "support_replay",
+                )
+                # Per token, the ids and logprobs of the sampler's head or support
+                evidence = [
+                    list(zip(ids, lps, strict=True)) for ids, lps in zip(evidence_ids, evidence_logprobs, strict=True)
+                ]
 
         elif self.use_transformers_continuous_batching:
             with (
@@ -1477,6 +1545,8 @@ class RLOOTrainer(_BaseTrainer):
                 )
                 unwrapped_model.train()
             completion_ids = [output.generated_tokens for output in all_outputs.values()]
+            logprobs = None
+            evidence = None
 
         else:
             # Regular generation path: left-pad token IDs into tensors
@@ -1538,8 +1608,10 @@ class RLOOTrainer(_BaseTrainer):
             completion_ids = [
                 c[m].tolist() for c, m in zip(completion_ids.cpu(), completion_mask.bool().cpu(), strict=True)
             ]
+            logprobs = None
+            evidence = None
 
-        return completion_ids
+        return completion_ids, logprobs, evidence
 
     def _generate(self, prompts: list):
         device = self.accelerator.device
@@ -1549,7 +1621,7 @@ class RLOOTrainer(_BaseTrainer):
         prompts = copy.deepcopy(prompts)
 
         prompt_ids, images, multimodal_fields = self._tokenize_prompts(prompts)
-        completion_ids = self._generate_single_turn(prompt_ids, images, multimodal_fields)
+        completion_ids, logprobs, evidence = self._generate_single_turn(prompt_ids, images, multimodal_fields)
 
         # Decode completions. It's important to use `parse_response` when possible, because it handles tool calls.
         if is_conversational({"prompt": prompts[0]}):
@@ -1593,7 +1665,7 @@ class RLOOTrainer(_BaseTrainer):
         self._metrics[mode]["completions/min_terminated_length"].append(term_completion_lengths.float().min().item())
         self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
 
-        return prompt_ids, completion_ids, completions
+        return prompt_ids, completion_ids, completions, logprobs, evidence
 
     def _generate_and_score_completions(
         self, inputs: list[dict[str, torch.Tensor | Any]]
@@ -1629,7 +1701,9 @@ class RLOOTrainer(_BaseTrainer):
                 for prompt, image_list in zip(prompts, images, strict=True)
             ]
 
-        prompt_ids_list, completion_ids_list, completions = self._generate(prompts)
+        prompt_ids_list, completion_ids_list, completions, sampling_per_token_logps_list, evidence_list = (
+            self._generate(prompts)
+        )
         if self.use_vllm:
             self.vllm_generation.sleep()
 
@@ -1656,7 +1730,39 @@ class RLOOTrainer(_BaseTrainer):
         completion_mask = pad(
             completion_mask, padding_value=0, padding_side="right", pad_to_multiple_of=self.pad_to_multiple_of
         ).to(device=device)
-
+        if sampling_per_token_logps_list is not None:
+            # vLLM replaces a NaN token logprob with `None` (see `extract_logprobs`); map it back to NaN so the
+            # tensor builds (`torch.tensor([..., None, ...])` raises "Could not infer dtype of NoneType"). The NaN
+            # positions are neutralized in the importance-sampling ratio below so they contribute no correction.
+            sampling_per_token_logps = [
+                torch.tensor([float("nan") if x is None else x for x in logps])
+                for logps in sampling_per_token_logps_list
+            ]
+            sampling_per_token_logps = pad(
+                sampling_per_token_logps,
+                padding_value=0.0,
+                padding_side="right",
+                pad_to_multiple_of=self.pad_to_multiple_of,
+            ).to(device=device)
+        else:
+            sampling_per_token_logps = None
+        if evidence_list is not None:
+            # The sampler's head or support of each token, padded with id -1
+            tokens = [token for seq in evidence_list for token in seq]
+            sizes = torch.tensor([len(ids) for ids, _ in tokens], dtype=torch.long)
+            in_token = torch.arange(max(sizes.tolist(), default=1)) < sizes.unsqueeze(-1)
+            lengths = torch.tensor([len(seq) for seq in evidence_list], dtype=torch.long)
+            is_token = torch.arange(completion_ids.size(1)) < lengths.unsqueeze(-1)
+            sampling_score_ids = torch.full((*is_token.shape, in_token.size(-1)), -1, dtype=torch.int32)
+            sampling_score_logps = torch.zeros(sampling_score_ids.shape)
+            sampling_score_ids[is_token] = torch.full(in_token.shape, -1, dtype=torch.int32).masked_scatter(
+                in_token, torch.tensor([i for ids, _ in tokens for i in ids], dtype=torch.int32)
+            )
+            sampling_score_logps[is_token] = torch.zeros(in_token.shape).masked_scatter(
+                in_token, torch.tensor([lp for _, logps in tokens for lp in logps])
+            )
+            sampling_score_ids = sampling_score_ids.to(device)
+            sampling_score_logps = sampling_score_logps.to(device)
         # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
         if self.mask_truncated_completions:
             eos_and_pad = [*self.eos_token_ids, self._tokenizer.pad_token_id]
@@ -1911,6 +2017,11 @@ class RLOOTrainer(_BaseTrainer):
             "old_logps": old_logps,
             "advantages": advantages,
         }
+        if sampling_per_token_logps is not None:
+            output["sampling_per_token_logps"] = sampling_per_token_logps
+        if evidence_list is not None:
+            output["sampling_score_ids"] = sampling_score_ids
+            output["sampling_score_logps"] = sampling_score_logps
         if "pixel_values" in forward_kwargs:
             output["pixel_values"] = forward_kwargs["pixel_values"]
         if "image_grid_thw" in forward_kwargs:
@@ -1947,8 +2058,12 @@ class RLOOTrainer(_BaseTrainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
+        # Under score centering, also score the sampler's head (or, normalized over it, its complete support)
+        score_ids = inputs.get("sampling_score_ids")
+        support_ids = score_ids if self.score_centering == "support_replay" else None
+
         # Compute the per_token_logps and the entropy at each position in the completion
-        per_token_logps, entropies, aux_loss, _ = self._get_per_token_logps_and_entropies(
+        per_token_logps, entropies, aux_loss, score_logps = self._get_per_token_logps_and_entropies(
             model,
             input_ids,
             attention_mask,
@@ -1965,24 +2080,10 @@ class RLOOTrainer(_BaseTrainer):
             token_type_ids=inputs.get("token_type_ids"),
             mm_token_type_ids=inputs.get("mm_token_type_ids"),
             image_position_ids=inputs.get("image_position_ids"),
+            score_ids=score_ids,
+            support_ids=support_ids,
         )
 
-        logps = (per_token_logps * completion_mask).sum(1)  # mask out padding and tokens after EOS
-        old_logps = inputs["old_logps"]
-        log_ratio = logps - old_logps
-
-        # Compute the loss
-        advantages = inputs["advantages"]
-        coef_1 = torch.exp(log_ratio)
-        coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
-        per_sequence_loss1 = coef_1 * advantages
-        per_sequence_loss2 = coef_2 * advantages
-        per_sequence_loss = -torch.min(per_sequence_loss1, per_sequence_loss2)
-        # Count the rows skipped for their zero advantage too
-        num_sequences = inputs.get("num_sequences", per_sequence_loss.size(0))
-        loss = per_sequence_loss.sum() / num_sequences
-
-        # Log the metrics
         mode = "train" if self.model.training else "eval"
 
         def log_metric(key, reduction, value):
@@ -1990,6 +2091,79 @@ class RLOOTrainer(_BaseTrainer):
 
         def sum_and_count(x):
             return torch.stack([x.sum(), x.new_full((), x.numel())])
+
+        def masked_sum_and_count(x):
+            return torch.stack([(x * completion_mask).sum(), completion_mask.sum().float()])
+
+        # Compute the loss
+        advantages = inputs["advantages"]
+        # Count the rows skipped for their zero advantage too
+        num_sequences = inputs.get("num_sequences", advantages.size(0))
+        if self.loss_type == "ppo":
+            logps = (per_token_logps * completion_mask).sum(1)  # mask out padding and tokens after EOS
+            old_logps = inputs["old_logps"]
+            log_ratio = logps - old_logps
+            coef_1 = torch.exp(log_ratio)
+            coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
+            per_sequence_loss1 = coef_1 * advantages
+            per_sequence_loss2 = coef_2 * advantages
+            per_sequence_loss = -torch.min(per_sequence_loss1, per_sequence_loss2)
+            loss = per_sequence_loss.sum() / num_sequences
+        else:
+            advantages = advantages.unsqueeze(1)
+            per_token_loss = -advantages * per_token_logps
+            # Weight each token by its ratio of the current policy (the old one, updated once) over the sampler
+            if self.use_vllm and self.vllm_importance_sampling_correction:
+                log_ratio = per_token_logps.detach() - inputs["sampling_per_token_logps"]
+                # Tokens vLLM could not score (NaN) get a neutral ratio of 1
+                log_ratio = torch.nan_to_num(log_ratio * completion_mask, nan=0.0)
+                is_ratio = torch.exp(log_ratio)
+                if self.vllm_importance_sampling_mode == "token_truncate":
+                    is_ratio = torch.clamp(
+                        is_ratio,
+                        min=self.vllm_importance_sampling_clip_min,
+                        max=self.vllm_importance_sampling_clip_max,
+                    )
+                else:
+                    min_val = self.vllm_importance_sampling_clip_min or 0.0
+                    max_val = (
+                        self.vllm_importance_sampling_clip_max
+                        if self.vllm_importance_sampling_clip_max is not None
+                        else math.inf
+                    )
+                    is_ratio = is_ratio.masked_fill((is_ratio < min_val) | (is_ratio > max_val), 0.0)
+                per_token_loss = per_token_loss * is_ratio
+                log_metric("sampling/importance_sampling_ratio/mean", "ratio", masked_sum_and_count(is_ratio))
+
+            if self.score_centering != "off":
+                # Subtract the expected weighted score under the sampler, so that a constant advantage gives no
+                # update. Kept for tokens the MIS mask rejects: their expectation is still nonzero.
+                weighting = None
+                if self.vllm_importance_sampling_correction:
+                    weighting = "truncate" if self.vllm_importance_sampling_mode == "token_truncate" else "mask"
+                score_mask = score_ids >= 0
+                _, score_coef, tail_floored = score_centering_coefficients(
+                    per_token_logps,
+                    inputs["sampling_per_token_logps"],
+                    score_logps,
+                    inputs["sampling_score_logps"],
+                    score_mask,
+                    complete_support=self.score_centering == "support_replay",
+                    weighting=weighting,
+                    clip_min=self.vllm_importance_sampling_clip_min,
+                    clip_max=self.vllm_importance_sampling_clip_max,
+                )
+                per_token_loss = per_token_loss + advantages * (score_coef * score_logps).sum(-1)
+                if self.score_centering == "head_tail":
+                    head_mass = (score_logps.detach().exp() * score_mask).sum(-1)
+                    log_metric("score_centering/head_mass", "ratio", masked_sum_and_count(head_mass))
+                    log_metric("score_centering/tail_floored", "ratio", masked_sum_and_count(tail_floored.float()))
+                else:
+                    support_size = score_mask.sum(-1).float()
+                    log_metric("score_centering/support_size", "ratio", masked_sum_and_count(support_size))
+
+            # Sum over each completion's tokens and average over completions, like the clipped objective
+            loss = (per_token_loss * completion_mask).sum() / num_sequences
 
         # RLOO returns an unscaled loss (the HF Trainer divides by gradient accumulation), so add the aux term unscaled
         if self.aux_loss_enabled:
@@ -2002,14 +2176,15 @@ class RLOOTrainer(_BaseTrainer):
         )
 
         # Compute the clipped probability ratios
-        is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages < 0)
-        is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages > 0)
-        is_region_clipped = is_low_clipped | is_high_clipped
-        log_metric("clip_ratio/low_mean", "ratio", sum_and_count(is_low_clipped.float()))
-        log_metric("clip_ratio/low_min", "min", is_low_clipped.float())
-        log_metric("clip_ratio/high_mean", "ratio", sum_and_count(is_high_clipped.float()))
-        log_metric("clip_ratio/high_max", "max", is_high_clipped.float())
-        log_metric("clip_ratio/region_mean", "ratio", sum_and_count(is_region_clipped.float()))
+        if self.loss_type == "ppo":
+            is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages < 0)
+            is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages > 0)
+            is_region_clipped = is_low_clipped | is_high_clipped
+            log_metric("clip_ratio/low_mean", "ratio", sum_and_count(is_low_clipped.float()))
+            log_metric("clip_ratio/low_min", "min", is_low_clipped.float())
+            log_metric("clip_ratio/high_mean", "ratio", sum_and_count(is_high_clipped.float()))
+            log_metric("clip_ratio/high_max", "max", is_high_clipped.float())
+            log_metric("clip_ratio/region_mean", "ratio", sum_and_count(is_region_clipped.float()))
         return loss
 
     # During eval, Trainer calls prediction_step. If no labels are present in the inputs, it only runs forward and
