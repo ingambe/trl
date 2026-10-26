@@ -376,8 +376,9 @@ class TestChunkedLogProbFunction:
         weight = torch.randn(self.V, self.H, requires_grad=True, device=device)
         labels = torch.randint(0, self.V, (self.N,), device=device)
         # Ids across every vocabulary tile, with padding
-        query_ids = torch.stack([torch.cat([labels[i : i + 1], torch.randperm(self.V)[:5]]) for i in range(self.N)])
-        query_ids = query_ids.to(device)
+        query_ids = torch.stack(
+            [torch.cat([labels[i : i + 1], torch.randperm(self.V, device=device)[:5]]) for i in range(self.N)]
+        )
         query_ids[::3, -2:] = -1
         support_ids = query_ids if use_support else None
 
@@ -416,6 +417,19 @@ class TestChunkedLogProbFunction:
         torch.testing.assert_close(query_logprobs, query_ref, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(grad_hidden, hidden.grad, atol=1e-4, rtol=1e-4)
         torch.testing.assert_close(grad_weight, weight.grad, atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.parametrize("device", [torch_device, "cpu"])
+    def test_query_gradient_near_one_bfloat16(self, device):
+        # Logits [8, 0]: the queried token's gradient 1 - p is far below bf16's resolution of p
+        hidden = torch.ones(1, 1, dtype=torch.bfloat16, device=device, requires_grad=True)
+        weight = torch.tensor([[8.0], [0.0]], dtype=torch.bfloat16, device=device)
+        query_ids = torch.tensor([[0]], device=device)
+        *_, query_logprobs = ChunkedLogProbFunction.apply(
+            hidden, weight, None, query_ids[:, 0], 1.0, self.CHUNK_SIZE, None, 1.0, (), None, query_ids
+        )
+        query_logprobs.sum().backward()
+        # d/dh log p_0 = 8 (1 - p_0)
+        torch.testing.assert_close(hidden.grad.float(), 8 * torch.sigmoid(torch.tensor([[-8.0]], device=device)))
 
     @pytest.mark.parametrize("device", [torch_device, "cpu"])
     def test_support_with_dominant_excluded_logit(self, device):
