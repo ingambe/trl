@@ -224,8 +224,8 @@ class GRPOConfig(_BaseConfig):
             `per_device_train_batch_size` is the number of rows per device in an optimizer step, and each step's rows
             are split into micro-batches that fit the budget, the same number on every process. A row longer than the
             budget gets a micro-batch of its own. Requires `gradient_accumulation_steps=1`, a `loss_type` of `"dapo"`,
-            `"cispo"` or `"vespo"`, and no entropy bonus. Not supported with DeepSpeed, LOMO or layer-wise optimizers,
-            or a router auxiliary loss.
+            `"cispo"`, `"vespo"` or `"reinforce"`, and no entropy bonus. Not supported with DeepSpeed, LOMO or
+            layer-wise optimizers, or a router auxiliary loss.
         epsilon (`float`, *optional*, defaults to `0.2`):
             Epsilon value for clipping.
         delta (`float`, *optional*):
@@ -316,10 +316,15 @@ class GRPOConfig(_BaseConfig):
             - `"vespo"`: Variational Sequence-Level Soft Policy Optimization. Replaces hard clipping with a smooth,
               asymmetric Gamma weighting function applied directly to sequence-level importance weights. Introduced in
               the [VESPO paper](https://huggingface.co/papers/2602.10693).
+            - `"reinforce"`: REINFORCE with the group-centered advantages, `-A * log p` per token, normalized like
+              `"dapo"`. Its vLLM importance sampling ratio is the current policy's over the sampler's, `p / q`, and it
+              requires `num_iterations=1` and a `token_*` `vllm_importance_sampling_mode`. Combine it with
+              `score_centering`.
 
-            `"dapo"`, `"cispo"` and `"vespo"` normalize by the loss tokens of the optimizer step. When a step spans
-            several generation batches (`gradient_accumulation_steps` > `steps_per_generation`), each generation batch
-            is normalized by its own token count scaled to the step, so the normalization is approximate.
+            `"dapo"`, `"cispo"`, `"vespo"` and `"reinforce"` normalize by the loss tokens of the optimizer step. When a
+            step spans several generation batches (`gradient_accumulation_steps` > `steps_per_generation`), each
+            generation batch is normalized by its own token count scaled to the step, so the normalization is
+            approximate.
         mask_truncated_completions (`bool`, *optional*, defaults to `False`):
             When enabled, truncated completions are excluded from the loss calculation, preventing them from being
             incorrectly penalized and introducing noise during training. According to the
@@ -404,6 +409,24 @@ class GRPOConfig(_BaseConfig):
             Importance sampling lower bound C_min used by `vllm_importance_sampling_mode`. For `*_truncate` modes,
             ratios are clipped from below at C_min. For `*_mask` modes, ratios below C_min are set to zero. To strictly
             mask ratios below C_min without upper bound, set `vllm_importance_sampling_clip_max=None`.
+        score_centering (`str`, *optional*, defaults to `"off"`):
+            Score centering, from [Score Centering Stabilizes Off-policy Reinforcement
+            Learning](https://huggingface.co/papers/2609.20807), for `loss_type="reinforce"` with vLLM: subtracts from
+            each token's weighted score its expectation under the sampler, so that the sampler's mismatch with the
+            policy adds no drift. Possible values are:
+
+            - `"off"`: No score centering.
+            - `"head_tail"`: Records the sampler's top-`score_centering_topk` probabilities and models the rest as the
+              policy's, rescaled to the sampler's remaining mass. Requires untruncated sampling (`top_k=0`,
+              `top_p=1.0`, `min_p=0.0`).
+            - `"support_replay"`: Records every token of the sampler's top-k support, and normalizes the policy over
+              that support, as [`AsyncGRPOTrainer`] does, for an exact expectation. Requires `top_k > 0` and
+              `beta=0.0`.
+
+            The weight `w` of the sampled token and of the expectation is `1`, or with
+            `vllm_importance_sampling_correction`, the `token_truncate` or `token_mask` ratio `p / q`.
+        score_centering_topk (`int`, *optional*, defaults to `128`):
+            Number of sampler probabilities recorded per token with `score_centering="head_tail"`.
         off_policy_mask_threshold (`float`, *optional*):
             Threshold for off-policy sequence masking. If `None`, off-policy sequence masking is disabled. When set,
             sequences with negative advantages and high KL divergence are masked out to stabilize training. This
@@ -844,8 +867,8 @@ class GRPOConfig(_BaseConfig):
             "When set, `per_device_train_batch_size` is the number of rows per device in an optimizer step, and each "
             "step's rows are split into micro-batches that fit the budget, the same number on every process. A row "
             "longer than the budget gets a micro-batch of its own. Requires `gradient_accumulation_steps=1`, a "
-            "`loss_type` of 'dapo', 'cispo' or 'vespo', and no entropy bonus. Not supported with DeepSpeed, LOMO "
-            "or layer-wise optimizers, or a router auxiliary loss."
+            "`loss_type` of 'dapo', 'cispo', 'vespo' or 'reinforce', and no entropy bonus. Not supported with "
+            "DeepSpeed, LOMO or layer-wise optimizers, or a router auxiliary loss."
         },
     )
     epsilon: float = field(
@@ -960,7 +983,7 @@ class GRPOConfig(_BaseConfig):
         default="dapo",
         metadata={
             "help": "Specifies the loss formulation to use. Supported values are 'grpo', 'dr_grpo', 'dapo', "
-            "'bnpo', 'cispo', 'sapo', 'luspo', and 'vespo'. "
+            "'bnpo', 'cispo', 'sapo', 'luspo', 'vespo', and 'reinforce'. "
             "'grpo': Aggregates token-level losses by normalizing over sequence length. Not recommended due to length "
             "bias—this approach tends to prefer shorter completions with positive advantages and longer ones with "
             "negative advantages. "
@@ -989,9 +1012,14 @@ class GRPOConfig(_BaseConfig):
             "'vespo': Variational Sequence-Level Soft Policy Optimization. Replaces hard clipping with a smooth, "
             "asymmetric Gamma weighting function applied directly to sequence-level importance weights. Introduced in "
             "the [VESPO paper](https://huggingface.co/papers/2602.10693). "
-            "'dapo', 'cispo' and 'vespo' normalize by the loss tokens of the optimizer step. When a step spans "
-            "several generation batches (`gradient_accumulation_steps` > `steps_per_generation`), each generation "
-            "batch is normalized by its own token count scaled to the step, so the normalization is approximate."
+            "'reinforce': REINFORCE with the group-centered advantages, `-A * log p` per token, normalized like "
+            "'dapo'. Its vLLM importance sampling ratio is the current policy's over the sampler's, `p / q`, and it "
+            "requires `num_iterations=1` and a `token_*` `vllm_importance_sampling_mode`. Combine it with "
+            "`score_centering`. "
+            "'dapo', 'cispo', 'vespo' and 'reinforce' normalize by the loss tokens of the optimizer step. When a step "
+            "spans several generation batches (`gradient_accumulation_steps` > `steps_per_generation`), each "
+            "generation batch is normalized by its own token count scaled to the step, so the normalization is "
+            "approximate."
         },
     )
     mask_truncated_completions: bool = field(
@@ -1131,6 +1159,20 @@ class GRPOConfig(_BaseConfig):
             "modes, ratios are clipped from below at C_min. For `*_mask` modes, ratios below C_min are set to "
             "zero. To strictly mask ratios below C_min without upper bound, set `vllm_importance_sampling_clip_max=None`."
         },
+    )
+    score_centering: str = field(
+        default="off",
+        metadata={
+            "help": "Score centering for `loss_type='reinforce'` with vLLM: subtracts from each token's weighted "
+            "score its expectation under the sampler. 'off': none. 'head_tail': records the sampler's top "
+            "`score_centering_topk` probabilities and models the rest as the policy's, rescaled to the sampler's "
+            "remaining mass; requires `top_k=0`, `top_p=1.0` and `min_p=0.0`. 'support_replay': records the sampler's "
+            "whole top-k support and normalizes the policy over it; requires `top_k > 0` and `beta=0.0`."
+        },
+    )
+    score_centering_topk: int = field(
+        default=128,
+        metadata={"help": "Number of sampler probabilities recorded per token with `score_centering='head_tail'`."},
     )
     off_policy_mask_threshold: float | None = field(
         default=None,
@@ -1290,7 +1332,7 @@ class GRPOConfig(_BaseConfig):
         # Token-level losses normalize by the tokens of each optimizer step, so a step and a generation batch must
         # not straddle each other's boundaries
         if (
-            self.loss_type in ["cispo", "dapo", "vespo"]
+            self.loss_type in ["cispo", "dapo", "vespo", "reinforce"]
             and self.steps_per_generation % self.gradient_accumulation_steps != 0
             and self.gradient_accumulation_steps % self.steps_per_generation != 0
         ):
@@ -1325,15 +1367,60 @@ class GRPOConfig(_BaseConfig):
                     "`per_device_train_batch_size` to the rows per device of an optimizer step instead."
                 )
             if (
-                self.loss_type not in ["cispo", "dapo", "vespo"]
+                self.loss_type not in ["cispo", "dapo", "vespo", "reinforce"]
                 or self.top_entropy_quantile < 1.0
                 or self.entropy_coef != 0.0
                 or self.use_adaptive_entropy
             ):
                 raise ValueError(
-                    "`max_tokens_per_microbatch` requires `loss_type` 'dapo', 'cispo' or 'vespo', "
+                    "`max_tokens_per_microbatch` requires `loss_type` 'dapo', 'cispo', 'vespo' or 'reinforce', "
                     "`top_entropy_quantile=1.0` and no entropy bonus, so the loss doesn't depend on how a step is "
                     "split."
+                )
+
+        if self.loss_type == "reinforce":
+            if self.num_iterations != 1:
+                raise ValueError("`loss_type='reinforce'` updates on each completion once: set `num_iterations=1`.")
+            if self.vllm_importance_sampling_correction and not self.vllm_importance_sampling_mode.startswith("token"):
+                raise ValueError(
+                    "`loss_type='reinforce'` weights each token by its own ratio: set `vllm_importance_sampling_mode` "
+                    "to 'token_truncate' or 'token_mask'."
+                )
+
+        if self.score_centering not in ("off", "head_tail", "support_replay"):
+            raise ValueError(
+                f"`score_centering` must be 'off', 'head_tail' or 'support_replay', got '{self.score_centering}'."
+            )
+        if self.score_centering != "off":
+            if self.loss_type != "reinforce" or not self.use_vllm:
+                raise ValueError("`score_centering` requires `loss_type='reinforce'` and `use_vllm=True`.")
+            # The trainer's distribution must be the sampler's, up to the recorded truncation
+            overridden = {"top_k", "top_p", "min_p", "repetition_penalty", "logprobs"} & set(
+                self.generation_kwargs or {}
+            )
+            if overridden:
+                raise ValueError(
+                    f"`score_centering` checks the sampling options set by their own arguments: pass "
+                    f"{sorted(overridden)} as arguments rather than in `generation_kwargs`."
+                )
+            if self.repetition_penalty != 1.0 or self.off_policy_mask_threshold is not None:
+                raise ValueError("`score_centering` requires `repetition_penalty=1.0` and no off-policy mask.")
+            if self.top_entropy_quantile < 1.0:
+                raise ValueError("`score_centering` requires `top_entropy_quantile=1.0`.")
+            if self.score_centering == "head_tail" and (
+                self.top_k not in (0, -1) or self.top_p != 1.0 or self.min_p not in (None, 0.0)
+            ):
+                raise ValueError(
+                    "`score_centering='head_tail'` models the sampler's tail, so it requires untruncated sampling: "
+                    "`top_k=0`, `top_p=1.0` and `min_p=0.0`."
+                )
+            if self.score_centering == "support_replay" and (
+                self.top_k <= 0 or self.min_p not in (None, 0.0) or self.beta != 0.0
+            ):
+                raise ValueError(
+                    "`score_centering='support_replay'` records the sampler's whole support, so it requires "
+                    "`top_k > 0` (the support's size bound) and `min_p=0.0`. It normalizes the policy over that "
+                    "support, which the KL term doesn't, so it also requires `beta=0.0`."
                 )
 
         if self.num_generations < 2:

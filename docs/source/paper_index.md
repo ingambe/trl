@@ -738,6 +738,20 @@ training_args = AsyncGRPOConfig(
 )
 ```
 
+The [`GRPOTrainer`] supports it with `loss_type="reinforce"` and truncated (TIS) or masked (MIS) weights. The expectation is taken over the sampler's top-k head with the same tail model (`"head_tail"`), or over the whole top-k support of the sampler, to which the policy is renormalized (`"support_replay"`):
+
+```python
+from trl import GRPOConfig
+
+training_args = GRPOConfig(
+    loss_type="reinforce",
+    use_vllm=True,
+    vllm_importance_sampling_mode="token_mask",  # or "token_truncate"
+    score_centering="head_tail",  # requires untruncated sampling; "support_replay" requires top_k > 0
+    score_centering_topk=128,
+)
+```
+
 ## Optimal Advantage Regression
 
 Papers relating to the [`experimental.a2po.A2POTrainer`].
