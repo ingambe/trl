@@ -700,6 +700,18 @@ training_args = GRPOConfig(
 )
 ```
 
+### Score Centering Stabilizes Off-policy Reinforcement Learning
+
+**📜 Paper**: https://huggingface.co/papers/2609.20807
+
+When completions are sampled from a policy  \\( \mu \\) other than the trained one (vLLM's train-inference mismatch), the weighted REINFORCE gradient  \\( A \, w(y_t) \nabla_\theta \log \pi_\theta(y_t) \\) no longer averages to zero for a constant advantage, so the update drifts. Score centering subtracts the score's expectation under the sampler, with detached coefficients:
+
+$$
+\mathcal{L}(\theta) = - A \left( w(y_t) \log \pi_\theta(y_t) - \sum_{v} \mu(v) \, w(v) \log \pi_\theta(v) \right),
+$$
+
+with  \\( w \\) the token's truncated (TIS) or masked (MIS) ratio  \\( \pi_\theta / \mu \\), or  \\( 1 \\). The sum runs over the sampler's top-k head, with its tail modeled as the policy's rescaled to the sampler's tail mass, or over the whole top-k support of the sampler, to which the policy is renormalized. `trl.trainer.utils.score_centering_coefficients` computes the coefficients.
+
 ## Optimal Advantage Regression
 
 Papers relating to the [`experimental.a2po.A2POTrainer`].
