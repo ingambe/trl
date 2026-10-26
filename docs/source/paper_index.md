@@ -765,6 +765,8 @@ training_args = GRPOConfig(
 )
 ```
 
+[`RLOOConfig`] takes the same options, with REINFORCE summed over each completion's tokens and averaged over completions.
+
 ### s3: Simple Scaling of Swarms via Cooperative Multi-agent RL
 
 **📜 Paper**: https://huggingface.co/papers/2611.08615
