@@ -359,6 +359,18 @@ class TestGetPEFTConfig(TrlTestCase):
 
             assert getattr(peft_config, arg) == value
 
+    @pytest.mark.parametrize(
+        "lora_target_modules",
+        [["q_proj"], "q_proj", ["self_attn.q_proj"], [r".*\.q_proj"], ["q_proj", "v_proj"], ["all-linear"]],
+    )
+    def test_lora_target_modules(self, lora_target_modules):
+        # A single value from the CLI or a config file is a module name, a regex or "all-linear" (#7795)
+        model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5")
+        model_args = ModelConfig(use_peft=True, lora_target_modules=lora_target_modules)
+        model = get_peft_model(model, get_peft_config(model_args))
+        targeted = {name.split(".lora_A")[0] for name, _ in model.named_parameters() if ".lora_A." in name}
+        assert any(name.endswith(".q_proj") for name in targeted)
+
 
 class TestGetCallableName(TrlTestCase):
     def test_function(self):
@@ -748,26 +760,26 @@ class TestEntropyFromLogits(TrlTestCase):
 
 def _expected_score_centered_gradient(logits, q, advantages, head=None, union_head=False, centered=True, **kwargs):
     """
-    `sum_a q_a ∇loss_a` with respect to the logits, enumerating the sampled action `a`. Without `head`, the queried
+    `sum_a q_a ∇loss_a` with respect to the logits, enumerating the sampled action `a`. Without `head`, the scored
     tokens are the whole support.
     """
     expected = torch.zeros_like(logits)
     for action in range(len(logits)):
-        query_ids = torch.arange(len(logits)) if head is None else torch.tensor(head)
+        score_ids = torch.arange(len(logits)) if head is None else torch.tensor(head)
         if union_head and action not in head:
-            query_ids = torch.cat([query_ids, torch.tensor([action])])
+            score_ids = torch.cat([score_ids, torch.tensor([action])])
         logits_ = logits.clone().requires_grad_()
         logps = logits_.log_softmax(-1)
-        token_weight, query_coef, _ = score_centering_coefficients(
+        token_weight, score_coef, _ = score_centering_coefficients(
             logps[action],
             q[action].log(),
-            logps[query_ids],
-            q[query_ids].log(),
-            torch.ones_like(query_ids, dtype=torch.bool),
+            logps[score_ids],
+            q[score_ids].log(),
+            torch.ones_like(score_ids, dtype=torch.bool),
             complete_support=head is None,
             **kwargs,
         )
-        loss = -advantages[action] * (token_weight * logps[action] - centered * (query_coef * logps[query_ids]).sum())
+        loss = -advantages[action] * (token_weight * logps[action] - centered * (score_coef * logps[score_ids]).sum())
         loss.backward()
         expected += q[action] * logits_.grad
     return expected
@@ -871,17 +883,17 @@ class TestPPOClipGate(TrlTestCase):
             logps = logits_.log_softmax(-1)
             # The sampled token's surrogate, as in `GRPOTrainer`, and its correction
             ratio = torch.exp(logps[action] - old_logps[action])
-            token_weight, query_coef, _ = score_centering_coefficients(
+            token_weight, score_coef, _ = score_centering_coefficients(
                 old_logps[action], q[action].log(), old_logps, q.log(), support, complete_support=True, **kwargs
             )
             unclipped = ratio if delta is None else torch.clamp(ratio, max=delta)
             loss = -token_weight * torch.min(unclipped * advantage, torch.clamp(ratio, 0.8, 1.2) * advantage)
-            query_ratio = torch.exp(logps.detach() - old_logps)
-            query_coef = (
-                query_coef * query_ratio * ppo_clip_gate(query_ratio, torch.tensor(advantage), 0.2, 0.2, delta)
+            score_ratio = torch.exp(logps.detach() - old_logps)
+            score_coef = (
+                score_coef * score_ratio * ppo_clip_gate(score_ratio, torch.tensor(advantage), 0.2, 0.2, delta)
             )
             uncentered += q[action] * torch.autograd.grad(loss, logits_, retain_graph=True)[0]
-            loss = loss + advantage * (query_coef * logps).sum()
+            loss = loss + advantage * (score_coef * logps).sum()
             expected += q[action] * torch.autograd.grad(loss, logits_)[0]
         torch.testing.assert_close(expected, torch.zeros(4), atol=1e-6, rtol=0)
         assert uncentered.abs().max() > 0.01
@@ -1669,27 +1681,6 @@ class TestAddFusedLMHead:
         mask = labels[:, 1:] != -100
         torch.testing.assert_close(out["log_probs"][mask], ref[mask], atol=1e-4, rtol=1e-4)
         assert (out["log_probs"][~mask] == 0).all()
-        assert torch.isfinite(model.lm_head.weight.grad).all()
-
-    @pytest.mark.parametrize("device", [torch_device, "cpu"])
-    def test_query_ids_masked_labels(self, device):
-        """`query_log_probs` are the full-vocabulary log-probabilities of `query_ids`, zero at masked positions."""
-        torch.manual_seed(0)
-        model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen3ForCausalLM").to(device)
-        add_fused_lm_head(model)
-        input_ids = torch.randint(0, model.config.vocab_size, (2, 16), device=device)
-        labels = input_ids.masked_fill(torch.arange(16, device=device) < 8, -100)
-        query_ids = torch.randint(0, model.config.vocab_size, (2, 16, 4), device=device)
-        query_ids[..., -1] = -1
-
-        out = model(input_ids=input_ids, labels=labels, query_ids=query_ids, fused_lm_head=True)
-        out["query_log_probs"].sum().backward()
-
-        logps = model(input_ids=input_ids).logits[:, :-1].float().log_softmax(-1)
-        ref = logps.gather(-1, query_ids[:, 1:].clamp(min=0)).masked_fill(query_ids[:, 1:] < 0, 0.0)
-        mask = labels[:, 1:] != -100
-        torch.testing.assert_close(out["query_log_probs"][mask], ref[mask], atol=1e-4, rtol=1e-4)
-        assert (out["query_log_probs"][~mask] == 0).all()
         assert torch.isfinite(model.lm_head.weight.grad).all()
 
     def test_outputs(self):
