@@ -712,9 +712,9 @@ def selective_log_softmax_and_entropy(
 def score_centering_coefficients(
     per_token_logps: torch.Tensor,
     sampling_per_token_logps: torch.Tensor,
-    query_logps: torch.Tensor,
-    query_sampling_logps: torch.Tensor,
-    query_mask: torch.Tensor,
+    score_logps: torch.Tensor,
+    score_sampling_logps: torch.Tensor,
+    score_mask: torch.Tensor,
     complete_support: bool,
     weighting: str | None = None,
     clip_min: float | None = None,
@@ -726,12 +726,12 @@ def score_centering_coefficients(
     Learning](https://huggingface.co/papers/2609.20807).
 
     For a detached advantage `A`, the loss `-A * (w_a * log p_a - sum_k c_k * log p_k)`, with `w_a` the `token_weight`
-    and `c_k` the `query_coef`, has the gradient `A * (w_a ∇log p_a - sum_v q_v w_v ∇log p_v)`: the weighted score of
+    and `c_k` the `score_coef`, has the gradient `A * (w_a ∇log p_a - sum_v q_v w_v ∇log p_v)`: the weighted score of
     the sampled token minus its expectation under the sampler `q`. A constant advantage then gives no expected update.
     The weight `w` of a token is `1`, its ratio `p / q` clamped to `[clip_min, clip_max]` with `weighting="truncate"`,
     or its ratio inside `[clip_min, clip_max]` and `0` outside with `weighting="mask"`.
 
-    With `complete_support=True`, the queried tokens are the whole support the sampler drew from and every
+    With `complete_support=True`, the scored tokens are the whole support the sampler drew from and every
     log-probability is normalized over it, so the expectation is an exact finite sum. Otherwise, they are the sampler's
     top-k head under the full-vocabulary normalization, and the sampler's tail is modeled as the trainer's, rescaled to
     the sampler's tail mass.
@@ -741,14 +741,14 @@ def score_centering_coefficients(
             Trainer log-probabilities of the sampled tokens, of shape `(...)`.
         sampling_per_token_logps (`torch.Tensor`):
             Sampler log-probabilities of the sampled tokens, of shape `(...)`.
-        query_logps (`torch.Tensor`):
-            Trainer log-probabilities of the queried tokens, of shape `(..., K)`.
-        query_sampling_logps (`torch.Tensor`):
-            Sampler log-probabilities of the queried tokens, of shape `(..., K)`.
-        query_mask (`torch.Tensor`):
-            Boolean mask of the valid queried tokens, of shape `(..., K)`.
+        score_logps (`torch.Tensor`):
+            Trainer log-probabilities of the scored tokens, of shape `(..., K)`.
+        score_sampling_logps (`torch.Tensor`):
+            Sampler log-probabilities of the scored tokens, of shape `(..., K)`.
+        score_mask (`torch.Tensor`):
+            Boolean mask of the valid scored tokens, of shape `(..., K)`.
         complete_support (`bool`):
-            Whether the queried tokens are the complete support of the sampler.
+            Whether the scored tokens are the complete support of the sampler.
         weighting (`str`, *optional*):
             `None`, `"truncate"` or `"mask"`.
         clip_min (`float`, *optional*):
@@ -761,17 +761,17 @@ def score_centering_coefficients(
     Returns:
         `tuple` of:
             - `token_weight` (`torch.Tensor` of shape `(...)`): `w_a`.
-            - `query_coef` (`torch.Tensor` of shape `(..., K)`): Coefficient of each queried log-probability, zero
-              where `query_mask` is `False`.
+            - `score_coef` (`torch.Tensor` of shape `(..., K)`): Coefficient of each scored log-probability, zero where
+              `score_mask` is `False`.
             - `tail_floored` (`torch.Tensor` of shape `(...)`): Whether a tail mass was raised to `tail_floor`.
     """
     # Bounds and ratios in log space, so that `q * w` never multiplies a zero by an overflowed ratio
     log_min = math.log(clip_min) if clip_min else -math.inf
     log_max = math.log(clip_max) if clip_max is not None else math.inf
-    log_p = query_logps.float().masked_fill(~query_mask, 0.0)
-    log_q = query_sampling_logps.float().masked_fill(~query_mask, 0.0)
-    p = log_p.exp().masked_fill(~query_mask, 0.0)
-    q = log_q.exp().masked_fill(~query_mask, 0.0)
+    log_p = score_logps.float().masked_fill(~score_mask, 0.0)
+    log_q = score_sampling_logps.float().masked_fill(~score_mask, 0.0)
+    p = log_p.exp().masked_fill(~score_mask, 0.0)
+    q = log_q.exp().masked_fill(~score_mask, 0.0)
     log_ratio = per_token_logps.float() - sampling_per_token_logps.float()
     if weighting is None:
         token_weight = torch.ones_like(log_ratio)
@@ -787,7 +787,7 @@ def score_centering_coefficients(
         raise ValueError(f"Unknown score centering weighting: {weighting}. Possible values are 'truncate' and 'mask'.")
 
     if complete_support:
-        return token_weight, mass.masked_fill(~query_mask, 0.0), torch.zeros_like(log_ratio, dtype=torch.bool)
+        return token_weight, mass.masked_fill(~score_mask, 0.0), torch.zeros_like(log_ratio, dtype=torch.bool)
 
     # The modeled tail q_v = rho * p_v has the single ratio 1 / rho, so its weighted mass is alpha * p_v
     p_tail = 1 - p.sum(-1)
@@ -801,8 +801,8 @@ def score_centering_coefficients(
     else:
         alpha = ((-log_rho >= log_min) & (-log_rho <= log_max)).float()
     # The trainer's scores sum to zero under p, so the tail's expected score is minus the head's
-    query_coef = (mass - alpha.unsqueeze(-1) * p).masked_fill(~query_mask, 0.0)
-    return token_weight, query_coef, tail_floored
+    score_coef = (mass - alpha.unsqueeze(-1) * p).masked_fill(~score_mask, 0.0)
+    return token_weight, score_coef, tail_floored
 
 
 def print_prompt_completions_sample(
@@ -1671,6 +1671,9 @@ class FusedCausalLMOutput(ModelOutput):
             Mean of the temperature-scaled next-token logits over the vocabulary, without gradient.
         is_top1 (`torch.Tensor`, same shape as `log_probs`):
             Whether the label is the most likely next token.
+        score_log_probs (`torch.Tensor` of shape `(*log_probs.shape, K)`):
+            Log-probability of each token of the `score_ids` given to the forward, normalized like `log_probs`, `0` at
+            padding.
         label_mask (`torch.Tensor`, same shape as `log_probs`):
             Whether the label is not `-100`. Prompt-learning PEFT pads the labels, so this can count one more token per
             sequence than the caller's labels.
@@ -1684,6 +1687,7 @@ class FusedCausalLMOutput(ModelOutput):
     log_sum_sq_probs: torch.Tensor | None = None
     mean_logits: torch.Tensor | None = None
     is_top1: torch.Tensor | None = None
+    score_log_probs: torch.Tensor | None = None
     label_mask: torch.Tensor | None = None
     aux_loss: torch.Tensor | None = None
 
@@ -1706,6 +1710,10 @@ def add_fused_lm_head(
     `support_ids`, a `(batch, seq_len, K)` tensor of token ids padded with `-1`, is the support each token was sampled
     from: the tokens left after top-k/top-p truncation. Given, the log-probabilities are normalized over that set
     rather than the whole vocabulary, as the sampler's were. It is aligned with `input_ids` and shifted like `labels`.
+
+    `score_ids`, a `(batch, seq_len, K)` tensor of token ids padded with `-1`, asks for the log-probability of those
+    tokens at each position as well, returned as `score_log_probs` and normalized like `log_probs`. It is aligned and
+    shifted like `support_ids`.
 
     Args:
         model ([`~transformers.PreTrainedModel`]):
@@ -1751,6 +1759,7 @@ def add_fused_lm_head(
         shift_labels=None,
         num_items_in_batch=None,
         support_ids=None,
+        score_ids=None,
         **kwargs,
     ):
         if not fused_lm_head:
@@ -1773,6 +1782,8 @@ def add_fused_lm_head(
             labels = labels[:, 1:]
             if support_ids is not None:
                 support_ids = support_ids[:, 1:]
+            if score_ids is not None:
+                score_ids = score_ids[:, 1:]
         else:
             hidden_states = backbone_outputs.last_hidden_state
             labels = shift_labels
@@ -1807,6 +1818,9 @@ def add_fused_lm_head(
             support_ids = (
                 support_ids[mask] if compact else support_ids.masked_fill(~mask.unsqueeze(-1), 0).flatten(0, 1)
             )
+        if score_ids is not None:
+            score_ids = score_ids.to(lm_head.weight.device)
+            score_ids = score_ids[mask] if compact else score_ids.masked_fill(~mask.unsqueeze(-1), 0).flatten(0, 1)
         with autocast_ctx, maybe_gather_lm_head_ctx(weight, bias):
             per_token = _ChunkedLogProbFunction.apply(
                 hidden_states,
@@ -1819,14 +1833,27 @@ def add_fused_lm_head(
                 logit_scale,
                 outputs,
                 support_ids,
+                score_ids,
             )
         if compact:
             # `masked_scatter` keeps the output connected to the model even when no label is valid. This lets an
             # all-masked microbatch contribute a differentiable zero instead of failing in `backward()`.
-            per_token = (None if x is None else x.new_zeros(mask.shape).masked_scatter(mask, x) for x in per_token)
+            per_token = (
+                None
+                if x is None
+                else x.new_zeros(mask.shape + x.shape[1:]).masked_scatter(
+                    mask.view(mask.shape + (1,) * (x.dim() - 1)), x
+                )
+                for x in per_token
+            )
         else:
-            per_token = (None if x is None else x.view(mask.shape).masked_fill(~mask, 0) for x in per_token)
-        log_probs, entropy, log_sum_sq_probs, mean_logits, is_top1 = per_token
+            per_token = (
+                None
+                if x is None
+                else x.view(mask.shape + x.shape[1:]).masked_fill(~mask.view(mask.shape + (1,) * (x.dim() - 1)), 0)
+                for x in per_token
+            )
+        log_probs, entropy, log_sum_sq_probs, mean_logits, is_top1, score_log_probs = per_token
         loss = -log_probs.sum() / (mask.sum().clamp(min=1) if num_items_in_batch is None else num_items_in_batch)
 
         aux_loss = None
@@ -1859,6 +1886,7 @@ def add_fused_lm_head(
             log_sum_sq_probs=log_sum_sq_probs,
             mean_logits=mean_logits,
             is_top1=is_top1,
+            score_log_probs=score_log_probs,
             label_mask=mask,
             aux_loss=aux_loss,
         )

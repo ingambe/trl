@@ -358,6 +358,18 @@ class TestGetPEFTConfig(TrlTestCase):
 
             assert getattr(peft_config, arg) == value
 
+    @pytest.mark.parametrize(
+        "lora_target_modules",
+        [["q_proj"], "q_proj", ["self_attn.q_proj"], [r".*\.q_proj"], ["q_proj", "v_proj"], ["all-linear"]],
+    )
+    def test_lora_target_modules(self, lora_target_modules):
+        # A single value from the CLI or a config file is a module name, a regex or "all-linear" (#7795)
+        model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5")
+        model_args = ModelConfig(use_peft=True, lora_target_modules=lora_target_modules)
+        model = get_peft_model(model, get_peft_config(model_args))
+        targeted = {name.split(".lora_A")[0] for name, _ in model.named_parameters() if ".lora_A." in name}
+        assert any(name.endswith(".q_proj") for name in targeted)
+
 
 class TestGetCallableName(TrlTestCase):
     def test_function(self):
@@ -747,26 +759,26 @@ class TestEntropyFromLogits(TrlTestCase):
 
 def _expected_score_centered_gradient(logits, q, advantages, head=None, union_head=False, centered=True, **kwargs):
     """
-    `sum_a q_a ∇loss_a` with respect to the logits, enumerating the sampled action `a`. Without `head`, the queried
+    `sum_a q_a ∇loss_a` with respect to the logits, enumerating the sampled action `a`. Without `head`, the scored
     tokens are the whole support.
     """
     expected = torch.zeros_like(logits)
     for action in range(len(logits)):
-        query_ids = torch.arange(len(logits)) if head is None else torch.tensor(head)
+        score_ids = torch.arange(len(logits)) if head is None else torch.tensor(head)
         if union_head and action not in head:
-            query_ids = torch.cat([query_ids, torch.tensor([action])])
+            score_ids = torch.cat([score_ids, torch.tensor([action])])
         logits_ = logits.clone().requires_grad_()
         logps = logits_.log_softmax(-1)
-        token_weight, query_coef, _ = score_centering_coefficients(
+        token_weight, score_coef, _ = score_centering_coefficients(
             logps[action],
             q[action].log(),
-            logps[query_ids],
-            q[query_ids].log(),
-            torch.ones_like(query_ids, dtype=torch.bool),
+            logps[score_ids],
+            q[score_ids].log(),
+            torch.ones_like(score_ids, dtype=torch.bool),
             complete_support=head is None,
             **kwargs,
         )
-        loss = -advantages[action] * (token_weight * logps[action] - centered * (query_coef * logps[query_ids]).sum())
+        loss = -advantages[action] * (token_weight * logps[action] - centered * (score_coef * logps[score_ids]).sum())
         loss.backward()
         expected += q[action] * logits_.grad
     return expected
