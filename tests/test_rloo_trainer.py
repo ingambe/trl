@@ -143,7 +143,7 @@ class TestRLOOTrainer(TrlTestCase):
         attention_mask[0, :3] = 0  # left padding
         attention_mask[1, -2:] = 0  # padding after the end of the completion
 
-        logps, entropies, _ = trainer._get_per_token_logps_and_entropies(
+        logps, entropies, _, _ = trainer._get_per_token_logps_and_entropies(
             trainer.model, input_ids, attention_mask, logits_to_keep=10, compute_entropy=True
         )
         with torch.no_grad():

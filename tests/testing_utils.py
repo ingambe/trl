@@ -170,3 +170,37 @@ def quantize_like_fp8_checkpoint(linear: torch.nn.Linear) -> None:
     linear.weight = torch.nn.Parameter(weight, requires_grad=False)
     linear.weight_scale_inv = torch.nn.Parameter(scale, requires_grad=False)
     linear.activation_scheme = "dynamic"
+
+
+def make_vllm_generate(model, num_logprobs, completion_length, scale=1.0, top_k=0, seed=0):
+    """
+    Stand-in for [`~generation.vllm_generation.VLLMGeneration.generate`] sampling from `model` with its logits scaled
+    by `scale` and truncated to `top_k` (if > 0), and returning the processed logprobs of the sampled token and of the
+    top-`num_logprobs` tokens, as vLLM does.
+    """
+    generator = torch.Generator().manual_seed(seed)
+
+    @torch.no_grad()
+    def generate(prompts, images, num_generations, profiler=None):
+        completion_ids, logprobs, logprob_token_ids = [], [], []
+        for prompt in prompts:
+            ids, seq_logprobs, seq_token_ids = list(prompt), [], []
+            for _ in range(completion_length):
+                logits = model(torch.tensor([ids])).logits[0, -1].float() * scale
+                if top_k > 0:
+                    logits = logits.masked_fill(logits < logits.topk(top_k).values[-1], -torch.inf)
+                token_logprobs = logits.log_softmax(-1)
+                token_id = torch.multinomial(token_logprobs.exp(), 1, generator=generator).item()
+                token_ids = [
+                    token_id,
+                    *(i for i in token_logprobs.topk(num_logprobs).indices.tolist() if i != token_id),
+                ]
+                ids.append(token_id)
+                seq_logprobs.append(token_logprobs[token_ids].tolist())
+                seq_token_ids.append(token_ids)
+            completion_ids.append(ids[len(prompt) :])
+            logprobs.append(seq_logprobs)
+            logprob_token_ids.append(seq_token_ids)
+        return prompts, completion_ids, logprobs, logprob_token_ids, None
+
+    return generate

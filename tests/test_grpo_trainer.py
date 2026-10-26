@@ -47,6 +47,7 @@ from .testing_utils import (
     TrlTestCase,
     is_ampere_or_newer,
     is_bf16_supported,
+    make_vllm_generate,
     quantize_like_fp8_checkpoint,
     require_bitsandbytes,
     require_peft,
@@ -458,7 +459,7 @@ class TestGRPOTrainer(TrlTestCase):
         attention_mask[0, :3] = 0  # left padding
         attention_mask[1, -2:] = 0  # padding after the end of the completion
 
-        logps, entropies, _ = trainer._get_per_token_logps_and_entropies(
+        logps, entropies, _, _ = trainer._get_per_token_logps_and_entropies(
             trainer.model, input_ids, attention_mask, logits_to_keep=10, compute_entropy=True
         )
         with torch.no_grad():
@@ -2221,7 +2222,7 @@ class TestGRPOTrainer(TrlTestCase):
         # tolerance regardless of whether the padding fix under test is correct. A small fixed offset from the
         # model's real log-probs keeps both signals in a comparable, well-scaled range.
         with torch.no_grad():
-            baseline_logps, _, _ = trainer._get_per_token_logps_and_entropies(
+            baseline_logps, _, _, _ = trainer._get_per_token_logps_and_entropies(
                 trainer.model,
                 torch.cat([prompt_ids, completion_ids], dim=1),
                 torch.cat([prompt_mask, completion_mask], dim=1),
@@ -2316,7 +2317,7 @@ class TestGRPOTrainer(TrlTestCase):
         # Bonus active (entropy_coef=0.1 sets _entropy_bonus_enabled at init) → entropies must be
         # differentiable so the term contributes gradients.
         assert trainer._entropy_bonus_enabled
-        _, entropies, _ = trainer._get_per_token_logps_and_entropies(
+        _, entropies, _, _ = trainer._get_per_token_logps_and_entropies(
             model, input_ids, attention_mask, logits_to_keep=4, compute_entropy=True
         )
         assert entropies.requires_grad
@@ -5844,3 +5845,90 @@ def test_fp8_recipe_trains_lora_over_a_blockwise_fp8_checkpoint(tiny_llama, tmp_
     for name, param in trainer.model.named_parameters():
         if "lora_B" in name:
             assert not torch.equal(param, previous[name]), name
+
+
+@pytest.mark.parametrize("vllm_importance_sampling_correction", [False, True])
+@pytest.mark.parametrize("score_centering, top_k", [("head_tail", 0), ("support_replay", 32), ("support_replay", 4)])
+def test_score_centering_vanishes_when_the_sampler_matches(
+    tiny_llama, tmp_path, score_centering, top_k, vllm_importance_sampling_correction
+):
+    model, tokenizer = tiny_llama
+    # A distribution with about half its mass in its top 4
+    torch.manual_seed(0)
+    for param in model.parameters():
+        param.data.normal_(std=0.3)
+
+    class RecordGradients(TrainerCallback):
+        def on_pre_optimizer_step(self, args, state, control, model, **kwargs):
+            gradients.append({n: p.grad.clone() for n, p in model.named_parameters()})
+
+    runs = {}
+    for centering, scale in [("off", 1.0), (score_centering, 1.0), ("off", 0.8), (score_centering, 0.8)]:
+        gradients = []
+        with (
+            patch("trl.generation.vllm_generation.is_vllm_available", return_value=True),
+            patch("trl.generation.vllm_generation.LLM", create=True),
+            patch.dict(os.environ),  # colocated vLLM sets RANK, LOCAL_RANK and WORLD_SIZE
+        ):
+            trainer = GRPOTrainer(
+                model=copy.deepcopy(model),
+                processing_class=tokenizer,
+                reward_funcs=lambda completions, **kwargs: [float(i % 2) for i in range(len(completions))],
+                args=GRPOConfig(
+                    output_dir=str(tmp_path),
+                    report_to="none",
+                    bf16=False,
+                    learning_rate=0.0,
+                    max_grad_norm=0.0,
+                    per_device_train_batch_size=4,
+                    num_generations=2,
+                    max_completion_length=3,
+                    max_steps=1,
+                    use_vllm=True,
+                    vllm_mode="colocate",
+                    loss_type="reinforce",
+                    vllm_importance_sampling_correction=vllm_importance_sampling_correction,
+                    vllm_importance_sampling_mode="token_truncate",
+                    vllm_importance_sampling_clip_max=1.0,  # truncates, so the correction is not zero
+                    top_k=top_k,
+                    score_centering=centering,
+                    score_centering_topk=4,
+                ),
+                train_dataset=Dataset.from_dict({"prompt": ["a", "a a"]}),
+                callbacks=[RecordGradients()],
+            )
+        num_logprobs = top_k or 4
+        trainer.vllm_generation = MagicMock()
+        trainer.vllm_generation.generate.side_effect = make_vllm_generate(model, num_logprobs, 3, scale, top_k)
+        trainer.train()
+        runs[centering, scale] = gradients[0]
+        if centering == "support_replay" and scale == 0.8:
+            assert trainer.state.log_history[0]["score_centering/support_size"] == top_k
+
+    if top_k != 4:  # over the whole vocabulary, a sampler that matches the policy needs no correction
+        torch.testing.assert_close(runs[score_centering, 1.0], runs["off", 1.0])
+    assert all(torch.isfinite(gradient).all() for gradient in runs[score_centering, 0.8].values())
+    assert any(not torch.allclose(runs[score_centering, 0.8][n], runs["off", 0.8][n]) for n in runs["off", 0.8])
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"score_centering": "head_tail"}, "requires `loss_type='reinforce'`"),
+        ({"loss_type": "reinforce", "score_centering": "head_tail", "top_k": 50}, "untruncated sampling"),
+        ({"loss_type": "reinforce", "score_centering": "support_replay"}, "`top_k > 0`"),
+        (
+            {"loss_type": "reinforce", "score_centering": "head_tail", "generation_kwargs": {"logprobs": 0}},
+            "rather than in `generation_kwargs`",
+        ),
+        (
+            {"loss_type": "reinforce", "vllm_importance_sampling_mode": "sequence_mask"},
+            "'token_truncate' or 'token_mask'",
+        ),
+    ],
+)
+def test_score_centering_rejects_unsupported_configs(tmp_path, kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        GRPOConfig(
+            output_dir=str(tmp_path), use_vllm=True, **{"vllm_importance_sampling_mode": "token_mask", **kwargs}
+        )

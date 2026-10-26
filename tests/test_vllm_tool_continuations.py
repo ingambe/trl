@@ -32,6 +32,7 @@ def test_ranks_with_uneven_tool_calls_share_each_round(two_rank_server_tool_trai
             completions=completions,
             logprobs=None,
             sampling_mask=None,
+            evidence=None,
             images=None,
             multimodal_fields={},
         )
@@ -63,13 +64,14 @@ def test_tool_loop_marks_rolled_back_tool_call_as_truncated(server_tool_trainer)
     ]
 
     # The first tool result overflows the completion budget and is rolled back
-    _, messages, completion_ids, _, _, _, _, _, tool_truncated = trainer._tool_call_loop(
+    _, messages, completion_ids, _, _, _, _, _, _, tool_truncated = trainer._tool_call_loop(
         prompts=prompts,
         prompt_ids=[[1], [1]],
         completion_ids=[[10, 11, 2], [20]],
         completions=completions,
         logprobs=[[-0.1, -0.1, -0.1], [-0.2]],
         sampling_mask=None,
+        evidence=None,
         images=None,
         multimodal_fields={},
     )
