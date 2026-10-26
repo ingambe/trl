@@ -52,6 +52,7 @@ from trl.trainer.utils import (
     pad,
     print_prompt_completions_sample,
     repeat_iterable_dataset,
+    score_centering_coefficients,
     selective_log_softmax,
     selective_log_softmax_and_entropy,
     shuffle_sequence_dict,
@@ -754,6 +755,102 @@ class TestEntropyFromLogits(TrlTestCase):
             entropy = -(torch.exp(logps) * logps).sum(-1)
         predicted_entropy = entropy_from_logits(logits, chunk_size=chunk_size)
         torch.testing.assert_close(predicted_entropy, entropy, rtol=1e-5, atol=1e-5)
+
+
+def _expected_score_centered_gradient(logits, q, advantages, head=None, union_head=False, centered=True, **kwargs):
+    """
+    `sum_a q_a ∇loss_a` with respect to the logits, enumerating the sampled action `a`. Without `head`, the scored
+    tokens are the whole support.
+    """
+    expected = torch.zeros_like(logits)
+    for action in range(len(logits)):
+        score_ids = torch.arange(len(logits)) if head is None else torch.tensor(head)
+        if union_head and action not in head:
+            score_ids = torch.cat([score_ids, torch.tensor([action])])
+        logits_ = logits.clone().requires_grad_()
+        logps = logits_.log_softmax(-1)
+        token_weight, score_coef, _ = score_centering_coefficients(
+            logps[action],
+            q[action].log(),
+            logps[score_ids],
+            q[score_ids].log(),
+            torch.ones_like(score_ids, dtype=torch.bool),
+            complete_support=head is None,
+            **kwargs,
+        )
+        loss = -advantages[action] * (token_weight * logps[action] - centered * (score_coef * logps[score_ids]).sum())
+        loss.backward()
+        expected += q[action] * logits_.grad
+    return expected
+
+
+class TestScoreCenteringCoefficients(TrlTestCase):
+    # Sampling (0.6, 0.3, 0.1) from (0.5, 0.2, 0.3), TIS at 1.25 truncates the second action and MIS on [0.5, 5]
+    # rejects the last one
+    @pytest.mark.parametrize(
+        "p, q, kwargs",
+        [
+            ((0.6, 0.3, 0.1), (0.5, 0.2, 0.3), {}),
+            ((0.9, 0.1), (0.5, 0.5), {"weighting": "truncate", "clip_max": 1.0}),
+            ((0.6, 0.3, 0.1), (0.5, 0.2, 0.3), {"weighting": "truncate", "clip_max": 1.25}),
+            ((0.6, 0.3, 0.1), (0.5, 0.2, 0.3), {"weighting": "mask", "clip_min": 0.5, "clip_max": 5.0}),
+        ],
+    )
+    def test_complete_support_cancels_drift(self, p, q, kwargs):
+        logits, q = torch.tensor(p).log(), torch.tensor(q)
+        advantages = torch.ones(len(p))
+        centered = _expected_score_centered_gradient(logits, q, advantages, **kwargs)
+        uncentered = _expected_score_centered_gradient(logits, q, advantages, centered=False, **kwargs)
+        torch.testing.assert_close(centered, torch.zeros_like(logits), atol=1e-6, rtol=0)
+        assert uncentered.abs().max() > 0.01
+
+    @pytest.mark.parametrize("head", [None, [2, 0]])
+    @pytest.mark.parametrize(
+        "kwargs", [{}, {"weighting": "truncate", "clip_max": 2.0}, {"weighting": "mask", "clip_min": 0.5}]
+    )
+    def test_correction_vanishes_without_mismatch(self, head, kwargs):
+        logits = torch.tensor([0.5, -1.0, 2.0, 0.0])
+        q = logits.softmax(-1)
+        advantages = torch.tensor([1.0, -2.0, 0.5, 3.0])
+        centered = _expected_score_centered_gradient(logits, q, advantages, head=head, **kwargs)
+        uncentered = _expected_score_centered_gradient(logits, q, advantages, head=head, centered=False, **kwargs)
+        torch.testing.assert_close(centered, uncentered, atol=1e-6, rtol=0)
+
+    @pytest.mark.parametrize("head", [None, [2, 0]])
+    def test_correction_vanishes_with_exact_importance_weights(self, head):
+        logits = torch.tensor([0.5, -1.0, 2.0, 0.0])
+        q = torch.tensor([0.1, 0.4, 0.3, 0.2])
+        advantages = torch.tensor([1.0, -2.0, 0.5, 3.0])
+        kwargs = {"head": head, "weighting": "truncate"}
+        centered = _expected_score_centered_gradient(logits, q, advantages, **kwargs)
+        uncentered = _expected_score_centered_gradient(logits, q, advantages, centered=False, **kwargs)
+        torch.testing.assert_close(centered, uncentered, atol=1e-6, rtol=0)
+
+    @pytest.mark.parametrize(
+        "kwargs", [{}, {"weighting": "truncate", "clip_max": 2.0}, {"weighting": "mask", "clip_min": 0.5}]
+    )
+    def test_head_tail_cancels_drift_under_modeled_tail(self, kwargs):
+        logits = torch.tensor([0.5, -1.0, 2.0, 0.0, 1.0, -0.5])
+        logps = logits.log_softmax(-1)
+        head = torch.tensor([4, 1])
+        q_head = torch.tensor([0.4, 0.25])
+        # The sampler's tail is the trainer's, rescaled to the sampler's tail mass
+        q = logps.exp() * (1 - q_head.sum()) / (1 - logps[head].exp().sum())
+        q[head] = q_head
+        torch.testing.assert_close(
+            _expected_score_centered_gradient(logits, q, torch.ones(6), head=head.tolist(), **kwargs),
+            torch.zeros(6),
+            atol=1e-6,
+            rtol=0,
+        )
+
+    def test_head_tail_head_does_not_depend_on_the_sampled_action(self):
+        logits, q = torch.tensor([0.6, 0.3, 0.1]).log(), torch.tensor([0.5, 0.2, 0.3])
+        advantages = torch.tensor([1.0, -2.5, 0.0])
+        fixed_head = -_expected_score_centered_gradient(logits, q, advantages, head=[0])
+        union_head = -_expected_score_centered_gradient(logits, q, advantages, head=[0], union_head=True)
+        torch.testing.assert_close(fixed_head, torch.tensor([0.5, -0.5, 0.0]))
+        torch.testing.assert_close(union_head, torch.tensor([0.5, -0.5875, 0.0875]))
 
 
 @require_rich
