@@ -84,8 +84,8 @@ class _FP8Matmul(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, x_fp8, x_scale, weight_fp8, weight_scale, weight, fast_accum):
-        ctx.save_for_backward(x if weight is not None else None, weight_fp8, weight_scale)
+    def forward(ctx, x, x_fp8, x_scale, weight_fp8, weight_fp8_t, weight_scale, weight, fast_accum):
+        ctx.save_for_backward(x if weight is not None else None, weight_fp8, weight_fp8_t, weight_scale)
         ctx.input_shape, ctx.weight_dtype, ctx.fast_accum = (
             x.shape,
             None if weight is None else weight.dtype,
@@ -103,14 +103,14 @@ class _FP8Matmul(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, weight_fp8, weight_scale = ctx.saved_tensors
+        x, weight_fp8, weight_fp8_t, weight_scale = ctx.saved_tensors
         grad_output = grad_output.reshape(-1, grad_output.shape[-1])
         # The weight scales run along the reduced dimension, so they are folded into the gradient
         grad_fp8, grad_scale = _quantize_tokens(grad_output.float() * weight_scale.t())
         ones = weight_scale.new_ones(1, weight_fp8.shape[1])
         grad_input = torch._scaled_mm(
             grad_fp8,
-            weight_fp8.t().contiguous().t(),
+            (weight_fp8.t().contiguous() if weight_fp8_t is None else weight_fp8_t).t(),
             grad_scale,
             ones,
             out_dtype=torch.bfloat16,
@@ -120,7 +120,7 @@ class _FP8Matmul(torch.autograd.Function):
         if x is not None:
             x = x.reshape(-1, x.shape[-1])
             grad_weight = (grad_output.t().to(x.dtype) @ x).to(ctx.weight_dtype)
-        return grad_input.to(grad_output.dtype).view(ctx.input_shape), None, None, None, None, grad_weight, None
+        return grad_input.to(grad_output.dtype).view(ctx.input_shape), None, None, None, None, None, grad_weight, None
 
 
 class FP8Linear(nn.Module):
@@ -129,7 +129,8 @@ class FP8Linear(nn.Module):
     vLLM's per-channel FP8.
 
     A frozen layer keeps only the FP8 copy. A trainable one keeps its high-precision weight, which
-    [`requantize_fp8_layers`] requantizes after it changes, and computes its gradient in high precision.
+    [`requantize_fp8_layers`] requantizes after it changes, computes its gradient in high precision, and keeps a
+    transposed FP8 copy for the input-gradient GEMM.
 
     Args:
         linear (`nn.Linear`):
@@ -150,11 +151,16 @@ class FP8Linear(nn.Module):
         weight_fp8, weight_scale = quantize_rowwise(linear.weight.detach(), scale_dtype)
         self.register_buffer("weight_fp8", weight_fp8, persistent=self.weight is None)
         self.register_buffer("weight_scale", weight_scale, persistent=self.weight is None)
+        self.register_buffer(
+            "weight_fp8_t", None if self.weight is None else weight_fp8.t().contiguous(), persistent=False
+        )
         self.bias = linear.bias
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_fp8, x_scale = _quantize_input(x, x.shape[-1])
-        out = _FP8Matmul.apply(x, x_fp8, x_scale, self.weight_fp8, self.weight_scale, self.weight, self.fast_accum)
+        out = _FP8Matmul.apply(
+            x, x_fp8, x_scale, self.weight_fp8, self.weight_fp8_t, self.weight_scale, self.weight, self.fast_accum
+        )
         return out if self.bias is None else out + self.bias.to(out.dtype)
 
 
@@ -239,6 +245,7 @@ def requantize_fp8_layers(model: nn.Module) -> None:
         if isinstance(module, FP8Linear) and module.weight is not None:
             weight_fp8, weight_scale = quantize_rowwise(module.weight)
             module.weight_fp8.copy_(weight_fp8)
+            module.weight_fp8_t.copy_(weight_fp8.t())
             module.weight_scale.copy_(weight_scale)
 
 

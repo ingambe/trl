@@ -1165,7 +1165,12 @@ class GRPOTrainer(_BaseTrainer):
             convert_to_fp8_training(model, args.fp8_recipe, args.fp8_skip_modules, args.fp8_fast_accum)
             # Each rank requantizes its own FP8 copies, which DDP can't broadcast
             DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(
-                model, [name for name, _ in model.named_buffers() if name.endswith((".weight_fp8", ".weight_scale"))]
+                model,
+                [
+                    name
+                    for name, _ in model.named_buffers()
+                    if name.endswith((".weight_fp8", ".weight_fp8_t", ".weight_scale"))
+                ],
             )
             self._fp8_quantized_step = 0
 

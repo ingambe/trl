@@ -5665,6 +5665,7 @@ def test_fp8_recipe_requantizes_after_fused_optimizer_steps_and_ref_syncs(tiny_l
     def check_fresh(module, args):
         weight_fp8, _ = quantize_rowwise(module.weight.detach())
         stale.append(not torch.equal(module.weight_fp8.view(torch.uint8), weight_fp8.view(torch.uint8)))
+        stale.append(not torch.equal(module.weight_fp8_t.view(torch.uint8), weight_fp8.t().view(torch.uint8)))
 
     for model in (trainer.model, trainer.ref_model):
         for module in model.modules():
