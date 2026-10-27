@@ -599,13 +599,19 @@ class VLLMGeneration:
     def _share_weights(self) -> list[tuple[str, torch.Tensor]]:
         """Point the model's parameters at vLLM's weights, and return the parameters that can't be shared."""
         vllm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+        mapper = getattr(vllm_model, "hf_to_vllm_mapper", None)
+        mapper = mapper.get_rename_mapper() if mapper is not None else None
+
+        def trainer_name(name):
+            name = self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", ""))
+            # Match vLLM's namespace, retaining the logical constituents of fused projections.
+            return mapper.map_name(name) if mapper is not None else name
+
         views = {name.replace(".base_layer", ""): param.data for name, param in vllm_model.named_parameters()}
         # Fused layers (e.g. qkv_proj) stack several parameters
         packed = vllm_model.packed_modules_mapping if supports_lora(vllm_model) else {}
         trainer_output_sizes = {
-            self._fix_param_name_to_vllm(
-                name.removeprefix("base_model.model.").replace(".base_layer", "")
-            ): module.out_features
+            trainer_name(name): module.out_features
             for name, module in self.model.named_modules()
             if hasattr(module, "out_features")
         }
@@ -646,17 +652,15 @@ class VLLMGeneration:
         if adapter_prefix and not self.native_lora:
             adapter = self.model.active_adapters[0]
             lora_layers = {
-                self._fix_param_name_to_vllm(name.removeprefix("base_model.model.")) + ".weight": module
+                trainer_name(name) + ".weight": module
                 for name, module in self.model.named_modules()
                 if isinstance(module, BaseTunerLayer)
             }
         fp8_layers = {
-            self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", "")): module
-            for name, module in self.model.named_modules()
-            if isinstance(module, FP8Linear)
+            trainer_name(name): module for name, module in self.model.named_modules() if isinstance(module, FP8Linear)
         }
         params = [
-            (self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", "")), param)
+            (trainer_name(name), param)
             for name, param in self.model.named_parameters()
             if not (adapter_prefix and adapter_prefix in name)
         ]

@@ -23,6 +23,7 @@ from transformers.pytorch_utils import Conv1D
 from transformers.utils import is_peft_available
 
 import trl.generation.vllm_generation as vllm_generation_module
+from trl.import_utils import is_vllm_available
 from trl.models.fp8 import BlockFP8Linear, FP8Linear, quantize_rowwise, requantize_fp8_layers
 
 from .testing_utils import quantize_like_fp8_checkpoint, require_peft
@@ -228,12 +229,22 @@ def fp8_vllm_model(weights):
 
 @require_peft
 @pytest.mark.parametrize("output_sizes", [[16, 16], [8, 8, 16]])
-def test_lora_shares_the_fp8_base_in_any_vllm_layout(vllm_generation, output_sizes):
+@pytest.mark.parametrize(
+    "namespace",
+    ["identity", pytest.param("qwen3_5", marks=pytest.mark.skipif(not is_vllm_available(), reason="requires vLLM"))],
+)
+def test_lora_shares_the_fp8_base_in_any_vllm_layout(vllm_generation, output_sizes, namespace):
+    body = torch.nn.ModuleDict({name: torch.nn.Linear(16, 16) for name in ("q_proj", "k_proj", "o_proj")})
+    base = (
+        torch.nn.ModuleDict({"model": torch.nn.ModuleDict({"language_model": body})})
+        if namespace == "qwen3_5"
+        else body
+    )
     model = get_peft_model(
-        torch.nn.ModuleDict({name: torch.nn.Linear(16, 16) for name in ("q_proj", "k_proj", "o_proj")}),
+        base,
         LoraConfig(r=1, target_modules=["q_proj", "k_proj", "o_proj"]),
     )
-    layers = {name: model.base_model.model[name] for name in ("q_proj", "k_proj", "o_proj")}
+    layers = {name: body[name] for name in ("q_proj", "k_proj", "o_proj")}
     vllm_model = fp8_vllm_model({name: layer.base_layer.weight for name, layer in layers.items()})
     # Qwen3.5's GDN exposes physical q/k/v/z shards for logical qkv/z projections.
     vllm_model.qk_proj.output_sizes = output_sizes
@@ -242,7 +253,19 @@ def test_lora_shares_the_fp8_base_in_any_vllm_layout(vllm_generation, output_siz
     x = torch.randn(3, 16)
     expected = {name: layer(x) for name, layer in layers.items()}
     runner = vllm_generation.llm.llm_engine.model_executor.driver_worker.model_runner
-    runner.model = vllm_model
+    if namespace == "qwen3_5":
+        from vllm.model_executor.models.qwen3_5 import Qwen3_5ForConditionalGeneration
+
+        # Use the dependency's real rename contract, including its distinct VL language-model namespace.
+        runner.model = torch.nn.ModuleDict({"language_model": torch.nn.ModuleDict({"model": vllm_model})})
+        runner.model.hf_to_vllm_mapper = Qwen3_5ForConditionalGeneration.hf_to_vllm_mapper
+        runner.model.packed_modules_mapping = vllm_model.packed_modules_mapping
+        load_weights = vllm_model.load_weights
+        runner.model.load_weights = lambda weights: load_weights(
+            (name.removeprefix("language_model.model."), weight) for name, weight in weights
+        )
+    else:
+        runner.model = vllm_model
     vllm_generation.model = model
     vllm_generation.share_weights = True
     vllm_generation.native_lora = True
