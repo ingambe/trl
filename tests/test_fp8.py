@@ -27,13 +27,13 @@ if is_peft_available():
     from peft import LoraConfig, get_peft_model
 
 
-@pytest.mark.parametrize("trainable", [False, True])
-def test_fp8_linear_matches_its_dequantized_weight_forward_and_backward(trainable):
+@pytest.mark.parametrize("trainable, cache_frozen_transpose", [(False, False), (False, True), (True, False)])
+def test_fp8_linear_matches_its_dequantized_weight_forward_and_backward(trainable, cache_frozen_transpose):
     torch.manual_seed(0)
     linear = torch.nn.Linear(64, 48, dtype=torch.bfloat16).requires_grad_(trainable)
     weight_fp8, weight_scale = quantize_rowwise(linear.weight.detach())
     weight = weight_fp8.float() * weight_scale
-    layer = FP8Linear(linear)
+    layer = FP8Linear(linear, cache_frozen_transpose=cache_frozen_transpose)
     x = torch.randn(2, 5, 64, dtype=torch.bfloat16, requires_grad=True)
     grad = torch.randn(2, 5, 48)
 
@@ -111,13 +111,14 @@ def test_fp8_layers_propagate_small_gradients_to_earlier_layers():
     assert (fp8_grad - expected_grad).norm() / expected_grad.norm() < 0.05
 
 
-def test_block_fp8_linear_matches_its_dequantized_weight_forward_and_backward():
+@pytest.mark.parametrize("cache_frozen_transpose", [False, True])
+def test_block_fp8_linear_matches_its_dequantized_weight_forward_and_backward(cache_frozen_transpose):
     torch.manual_seed(0)
     linear = torch.nn.Linear(256, 384, dtype=torch.bfloat16)
     quantize_like_fp8_checkpoint(linear)
     scale = linear.weight_scale_inv.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
     weight = linear.weight.float() * scale
-    layer = BlockFP8Linear(linear)
+    layer = BlockFP8Linear(linear, cache_frozen_transpose)
     x = torch.randn(2, 5, 256, dtype=torch.bfloat16, requires_grad=True)
     grad = torch.randn(2, 5, 384) * 2.0**-20
 
