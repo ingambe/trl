@@ -65,6 +65,12 @@ def _quantize_tokens(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return (x.float() / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn), scale
 
 
+@torch.compile(dynamic=True)
+def _quantize_scaled_tokens(x: torch.Tensor, column_scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """`_quantize_tokens` of `x` times `column_scale`, in the same fused kernels."""
+    return _quantize_tokens(x.float() * column_scale)
+
+
 _quantized_inputs = WeakTensorKeyDictionary()
 
 
@@ -106,7 +112,7 @@ class _FP8Matmul(torch.autograd.Function):
         x, weight_fp8, weight_fp8_t, weight_scale = ctx.saved_tensors
         grad_output = grad_output.reshape(-1, grad_output.shape[-1])
         # The weight scales run along the reduced dimension, so they are folded into the gradient
-        grad_fp8, grad_scale = _quantize_tokens(grad_output.float() * weight_scale.t())
+        grad_fp8, grad_scale = _quantize_scaled_tokens(grad_output, weight_scale.t())
         ones = weight_scale.new_ones(1, weight_fp8.shape[1])
         grad_input = torch._scaled_mm(
             grad_fp8,
