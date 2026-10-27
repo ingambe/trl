@@ -20,7 +20,7 @@ from transformers.utils import is_peft_available
 
 from trl.models.fp8 import BlockFP8Linear, FP8Linear, dequantize_fp8_layers, quantize_rowwise
 
-from .testing_utils import quantize_like_fp8_checkpoint, require_peft
+from .testing_utils import quantize_like_fp8_checkpoint, require_fp8_cuda, require_peft
 
 
 if is_peft_available():
@@ -51,9 +51,7 @@ def test_fp8_linear_matches_its_dequantized_weight_forward_and_backward(trainabl
         torch.testing.assert_close(linear.weight.grad.float(), expected_weight_grad, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9), reason="test requires FP8 CUDA GEMMs"
-)
+@require_fp8_cuda
 @pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("cache_frozen_transpose", [False, True])
 def test_fp8_linear_backward_accepts_column_major_gradients(compiled, cache_frozen_transpose):
