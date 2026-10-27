@@ -47,12 +47,18 @@ from .vllm_client import VLLMClient
 
 
 if is_vllm_available():
-    from vllm import LLM, RequestOutput, SamplingParams
-    from vllm.config import ModelConfig
-    from vllm.lora.request import LoRARequest
-    from vllm.model_executor.models import ModelRegistry
-    from vllm.model_executor.models.interfaces import supports_lora
-    from vllm.sampling_params import StructuredOutputsParams
+    # Some vLLM attention backends change process-wide Dynamo limits at import time. The colocated trainer
+    # owns its compilation policy, so imports must not silently replace the caller's limits.
+    with torch._dynamo.config.patch(
+        cache_size_limit=torch._dynamo.config.cache_size_limit,
+        accumulated_cache_size_limit=torch._dynamo.config.accumulated_cache_size_limit,
+    ):
+        from vllm import LLM, RequestOutput, SamplingParams
+        from vllm.config import ModelConfig
+        from vllm.lora.request import LoRARequest
+        from vllm.model_executor.models import ModelRegistry
+        from vllm.model_executor.models.interfaces import supports_lora
+        from vllm.sampling_params import StructuredOutputsParams
 
 
 logger = logging.getLogger(__name__)
@@ -404,7 +410,12 @@ class VLLMGeneration:
         # Set during a weight sync, so a failed one is retried before generating
         self._weights_dirty = False
 
-        self._init_vllm()
+        # Engine creation can lazily import those same backends after the imports above have completed.
+        with torch._dynamo.config.patch(
+            cache_size_limit=torch._dynamo.config.cache_size_limit,
+            accumulated_cache_size_limit=torch._dynamo.config.accumulated_cache_size_limit,
+        ):
+            self._init_vllm()
 
     def _init_vllm(self):
         """Initialize vLLM in server or colocate mode."""
