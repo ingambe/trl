@@ -210,6 +210,8 @@ def fp8_vllm_model(weights):
             if module in ("q_proj", "k_proj"):
                 fused = vllm_model.qk_proj.get_parameter(kind).data
                 (fused[:16] if module == "q_proj" else fused[16:]).copy_(weight)
+            elif not module:
+                vllm_model.get_parameter(kind).data.copy_(weight)
             else:
                 vllm_model[module].get_parameter(kind).data.copy_(weight)
 
@@ -235,6 +237,7 @@ def fp8_vllm_model(weights):
 )
 def test_lora_shares_the_fp8_base_in_any_vllm_layout(vllm_generation, output_sizes, namespace):
     body = torch.nn.ModuleDict({name: torch.nn.Linear(16, 16) for name in ("q_proj", "k_proj", "o_proj")})
+    body.register_parameter("A_log", torch.nn.Parameter(torch.tensor([0.25, -0.75], dtype=torch.bfloat16)))
     base = (
         torch.nn.ModuleDict({"model": torch.nn.ModuleDict({"language_model": body})})
         if namespace == "qwen3_5"
@@ -246,6 +249,7 @@ def test_lora_shares_the_fp8_base_in_any_vllm_layout(vllm_generation, output_siz
     )
     layers = {name: body[name] for name in ("q_proj", "k_proj", "o_proj")}
     vllm_model = fp8_vllm_model({name: layer.base_layer.weight for name, layer in layers.items()})
+    vllm_model.register_parameter("A_log", torch.nn.Parameter(body.A_log.float().detach().clone()))
     # Qwen3.5's GDN exposes physical q/k/v/z shards for logical qkv/z projections.
     vllm_model.qk_proj.output_sizes = output_sizes
     for layer in layers.values():
@@ -273,6 +277,9 @@ def test_lora_shares_the_fp8_base_in_any_vllm_layout(vllm_generation, output_siz
     unshared = vllm_generation._share_weights()
 
     assert unshared == []
+    assert body.A_log.dtype == torch.float32
+    assert body.A_log.data_ptr() == vllm_model.A_log.data_ptr()
+    torch.testing.assert_close(body.A_log, torch.tensor([0.25, -0.75]), rtol=0, atol=0)
     for name, layer in layers.items():
         torch.testing.assert_close(layer(x), expected[name], rtol=0, atol=0)
     rows = vllm_model.qk_proj.weight.t()

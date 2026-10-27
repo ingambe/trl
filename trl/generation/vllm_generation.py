@@ -589,11 +589,28 @@ class VLLMGeneration:
                     f"vLLM quantizes `{name}` together with the projections it fuses it with: keep all of them in "
                     "high precision with `fp8_skip_modules`, or none."
                 )
-        # vLLM's fused MoE experts have no trainer counterpart
-        return ["*.experts"] + [
+        ignored = [
             self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", ""))
             for name in ignored
         ]
+        architectures = getattr(getattr(model, "config", None), "architectures", None)
+        if self.mode == "colocate" and self.model_impl != "transformers" and architectures:
+            # Quantization ignore lists address vLLM modules, before the engine exists.
+            from vllm.config import ModelConfig
+            from vllm.model_executor.models import ModelRegistry
+
+            model_config = ModelConfig(
+                model=model.name_or_path,
+                model_impl=self.model_impl,
+                trust_remote_code=self.trust_remote_code,
+                revision=getattr(model.config, "_commit_hash", None),
+            )
+            model_class, _ = ModelRegistry.resolve_model_cls(architectures, model_config)
+            mapper = getattr(model_class, "hf_to_vllm_mapper", None)
+            if mapper is not None:
+                ignored = mapper.get_rename_mapper().apply_list(ignored)
+        # vLLM's fused MoE experts have no trainer counterpart
+        return ["*.experts"] + ignored
 
     @torch.no_grad()
     def _share_weights(self) -> list[tuple[str, torch.Tensor]]:
@@ -679,6 +696,16 @@ class VLLMGeneration:
                 setattr(parent, child_name, child.base_layer)
             for name, param in params:
                 view = views.get(name)
+                if (
+                    view is not None
+                    and view.shape == param.shape
+                    and not param.requires_grad
+                    and param.dtype in (torch.float16, torch.bfloat16)
+                    and view.dtype == torch.float32
+                ):
+                    # vLLM keeps recurrent decay parameters such as Qwen's A_log in FP32.
+                    # Widen a frozen low-precision value exactly before sharing its storage.
+                    param.data = param.data.float()
                 if view is None or view.shape != param.shape or view.dtype != param.dtype:
                     self._unshareable.add(name)
                     continue
