@@ -630,7 +630,7 @@ class VLLMGeneration:
         trainer_output_sizes = {
             trainer_name(name): module.out_features
             for name, module in self.model.named_modules()
-            if hasattr(module, "out_features")
+            if isinstance(module, nn.Linear | FP8Linear)
         }
         fp8_views = {}
         for module_name, module in vllm_model.named_modules():

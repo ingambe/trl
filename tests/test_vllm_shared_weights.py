@@ -29,6 +29,10 @@ from trl.models.fp8 import BlockFP8Linear, FP8Linear, quantize_rowwise, requanti
 from .testing_utils import quantize_like_fp8_checkpoint, require_peft
 
 
+if is_vllm_available():
+    from vllm.model_executor.models.qwen3_5 import Qwen3_5ForConditionalGeneration
+
+
 if is_peft_available():
     from peft import LoraConfig, get_peft_model
 
@@ -250,7 +254,6 @@ def test_lora_shares_the_fp8_base_in_any_vllm_layout(vllm_generation, output_siz
     layers = {name: body[name] for name in ("q_proj", "k_proj", "o_proj")}
     vllm_model = fp8_vllm_model({name: layer.base_layer.weight for name, layer in layers.items()})
     vllm_model.register_parameter("A_log", torch.nn.Parameter(body.A_log.float().detach().clone()))
-    # Qwen3.5's GDN exposes physical q/k/v/z shards for logical qkv/z projections.
     vllm_model.qk_proj.output_sizes = output_sizes
     for layer in layers.values():
         layer.base_layer = FP8Linear(layer.base_layer)
@@ -258,9 +261,7 @@ def test_lora_shares_the_fp8_base_in_any_vllm_layout(vllm_generation, output_siz
     expected = {name: layer(x) for name, layer in layers.items()}
     runner = vllm_generation.llm.llm_engine.model_executor.driver_worker.model_runner
     if namespace == "qwen3_5":
-        from vllm.model_executor.models.qwen3_5 import Qwen3_5ForConditionalGeneration
-
-        # Use the dependency's real rename contract, including its distinct VL language-model namespace.
+        # vLLM's Qwen3.5 namespace differs from the trainer's
         runner.model = torch.nn.ModuleDict({"language_model": torch.nn.ModuleDict({"model": vllm_model})})
         runner.model.hf_to_vllm_mapper = Qwen3_5ForConditionalGeneration.hf_to_vllm_mapper
         runner.model.packed_modules_mapping = vllm_model.packed_modules_mapping
