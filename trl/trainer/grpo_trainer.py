@@ -1181,10 +1181,11 @@ class GRPOTrainer(_BaseTrainer):
                     if name.endswith((".weight_fp8", ".weight_fp8_t", ".weight_scale"))
                 ],
             )
-            # Compiling each decoder layer fuses the activation quantization into the ops around it
+            # Compiling each decoder layer fuses the activation quantization into the ops around it. Inductor's
+            # dynamic-shape kernels give TorchAO's MXFP8 weight gradients infinite values, so "mxfp8" stays eager
             for fp8_model in [model] if self.ref_model is None else [model, self.ref_model]:
                 for module in fp8_model.modules():
-                    if isinstance(module, GradientCheckpointingLayer):
+                    if isinstance(module, GradientCheckpointingLayer) and args.fp8_recipe != "mxfp8":
                         module.compile(dynamic=True)
             self._fp8_quantized_step = 0
 
