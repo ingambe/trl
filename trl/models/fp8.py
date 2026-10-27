@@ -382,6 +382,11 @@ def convert_to_fp8_training(
         )
 
     for name, module in list(model.named_modules()):
+        if getattr(module, "kernel_layer_name", None) == "RMSNormGated" and "forward" in vars(module):
+            # The Hub FLA norm already runs fused Triton kernels. Tracing its Python launcher specializes the
+            # decoder on shape-dependent autotuner grids, exhausting Dynamo's cache as rollout lengths change.
+            # Keep only that launcher outside the graph; FP8 projections around it remain compiled.
+            module.forward = torch.compiler.disable(module.forward)
         if not is_eligible(module, name):
             continue
         if mxfp8:

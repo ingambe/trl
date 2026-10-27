@@ -18,7 +18,7 @@ import pytest
 import torch
 from transformers.utils import is_peft_available
 
-from trl.models.fp8 import BlockFP8Linear, FP8Linear, dequantize_fp8_layers, quantize_rowwise
+from trl.models.fp8 import BlockFP8Linear, FP8Linear, convert_to_fp8_training, dequantize_fp8_layers, quantize_rowwise
 
 from .testing_utils import quantize_like_fp8_checkpoint, require_peft
 
@@ -72,6 +72,63 @@ def test_fp8_linear_backward_accepts_column_major_gradients(compiled, cache_froz
         expected = grad.float() @ weight
         assert torch.isfinite(x.grad).all()
         assert (x.grad.float() - expected).norm() / expected.norm() < 0.05
+
+
+def test_fp8_qwen_gated_norm_accepts_changing_rollout_lengths_without_recompilation_fallback():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("requires native FP8 CUDA matmul")
+    kernels = pytest.importorskip("kernels")
+    qwen = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
+    from torch._dynamo.testing import CompileCounterWithBackend
+    from transformers.integrations.hub_kernels import register_kernel_mapping_transformers
+
+    class GatedNormBlock(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input = torch.nn.Linear(64, 128, bias=False)
+            self.norm = qwen.Qwen3_5RMSNormGated(64)
+            self.output = torch.nn.Linear(64, 64, bias=False)
+            self.lm_head = torch.nn.Linear(64, 1, bias=False)
+
+        def get_output_embeddings(self):
+            return self.lm_head
+
+        def forward(self, x):
+            hidden, gate = self.input(x).chunk(2, dim=-1)
+            return self.output(self.norm(hidden, gate))
+
+    register_kernel_mapping_transformers()
+    block = GatedNormBlock().to(device="cuda", dtype=torch.bfloat16)
+    kernels.kernelize(block, mode=kernels.Mode.TRAINING, device="cuda")
+    convert_to_fp8_training(block, "rowwise_with_gw_hp")
+    backend = CompileCounterWithBackend("inductor")
+    compiled = torch.compile(block, dynamic=True, backend=backend)
+
+    # FLA flattens Qwen's batch/sequence/value-head dimensions into token rows. Crossing its Triton
+    # launch-grid buckets used to produce a new Dynamo variant for every shorter rollout batch.
+    torch._dynamo.reset()
+    try:
+        with torch._dynamo.config.patch(recompile_limit=4, fail_on_recompile_limit_hit=True):
+            for bucket in (2, 4, 6, 8, 10, 12):
+                block.zero_grad(set_to_none=True)
+                x = torch.randn(65536 * bucket + 17, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+                out = compiled(x)
+                assert torch.isfinite(out).all()
+                out.float().square().mean().backward()
+                assert torch.isfinite(x.grad).all()
+                assert all(torch.isfinite(p.grad).all() for p in block.parameters() if p.grad is not None)
+        # A successful run must still compile its surrounding FP8 projections, rather than evade the failure
+        # by running the entire block eagerly.
+        assert backend.frame_count > 0
+        assert any(
+            "_scaled_mm" in str(node.target)
+            for graph in backend.graphs
+            for subgraph in graph.modules()
+            if isinstance(subgraph, torch.fx.GraphModule)
+            for node in subgraph.graph.nodes
+        )
+    finally:
+        torch._dynamo.reset()
 
 
 @pytest.mark.parametrize("trainable, code", [(False, 3.5), (True, 3.25)])
