@@ -48,7 +48,9 @@ from .vllm_client import VLLMClient
 
 if is_vllm_available():
     from vllm import LLM, RequestOutput, SamplingParams
+    from vllm.config import ModelConfig
     from vllm.lora.request import LoRARequest
+    from vllm.model_executor.models import ModelRegistry
     from vllm.model_executor.models.interfaces import supports_lora
     from vllm.sampling_params import StructuredOutputsParams
 
@@ -593,19 +595,12 @@ class VLLMGeneration:
             self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", ""))
             for name in ignored
         ]
-        architectures = getattr(getattr(model, "config", None), "architectures", None)
-        if self.mode == "colocate" and self.model_impl != "transformers" and architectures:
-            # Quantization ignore lists address vLLM modules, before the engine exists.
-            from vllm.config import ModelConfig
-            from vllm.model_executor.models import ModelRegistry
-
+        if self.model_impl != "transformers" and (isinstance(model, PreTrainedModel) or is_peft_model(model)):
+            # vLLM matches the ignore list against its own module names, without mapping it
             model_config = ModelConfig(
-                model=model.name_or_path,
-                model_impl=self.model_impl,
-                trust_remote_code=self.trust_remote_code,
-                revision=getattr(model.config, "_commit_hash", None),
+                model=model.name_or_path, model_impl=self.model_impl, trust_remote_code=self.trust_remote_code
             )
-            model_class, _ = ModelRegistry.resolve_model_cls(architectures, model_config)
+            model_class, _ = ModelRegistry.resolve_model_cls(model.config.architectures, model_config)
             mapper = getattr(model_class, "hf_to_vllm_mapper", None)
             if mapper is not None:
                 ignored = mapper.get_rename_mapper().apply_list(ignored)
@@ -703,8 +698,7 @@ class VLLMGeneration:
                     and param.dtype in (torch.float16, torch.bfloat16)
                     and view.dtype == torch.float32
                 ):
-                    # vLLM keeps recurrent decay parameters such as Qwen's A_log in FP32.
-                    # Widen a frozen low-precision value exactly before sharing its storage.
+                    # vLLM keeps some frozen parameters (e.g. Qwen3.5's A_log) in FP32
                     param.data = param.data.float()
                 if view is None or view.shape != param.shape or view.dtype != param.dtype:
                     self._unshareable.add(name)
