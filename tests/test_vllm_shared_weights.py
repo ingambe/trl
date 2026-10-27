@@ -227,13 +227,16 @@ def fp8_vllm_model(weights):
 
 
 @require_peft
-def test_lora_shares_the_fp8_base_in_any_vllm_layout(vllm_generation):
+@pytest.mark.parametrize("output_sizes", [[16, 16], [8, 8, 16]])
+def test_lora_shares_the_fp8_base_in_any_vllm_layout(vllm_generation, output_sizes):
     model = get_peft_model(
         torch.nn.ModuleDict({name: torch.nn.Linear(16, 16) for name in ("q_proj", "k_proj", "o_proj")}),
         LoraConfig(r=1, target_modules=["q_proj", "k_proj", "o_proj"]),
     )
     layers = {name: model.base_model.model[name] for name in ("q_proj", "k_proj", "o_proj")}
     vllm_model = fp8_vllm_model({name: layer.base_layer.weight for name, layer in layers.items()})
+    # Qwen3.5's GDN exposes physical q/k/v/z shards for logical qkv/z projections.
+    vllm_model.qk_proj.output_sizes = output_sizes
     for layer in layers.values():
         layer.base_layer = FP8Linear(layer.base_layer)
     x = torch.randn(3, 16)

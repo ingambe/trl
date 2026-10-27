@@ -602,6 +602,13 @@ class VLLMGeneration:
         views = {name.replace(".base_layer", ""): param.data for name, param in vllm_model.named_parameters()}
         # Fused layers (e.g. qkv_proj) stack several parameters
         packed = vllm_model.packed_modules_mapping if supports_lora(vllm_model) else {}
+        trainer_output_sizes = {
+            self._fix_param_name_to_vllm(
+                name.removeprefix("base_model.model.").replace(".base_layer", "")
+            ): module.out_features
+            for name, module in self.model.named_modules()
+            if hasattr(module, "out_features")
+        }
         fp8_views = {}
         for module_name, module in vllm_model.named_modules():
             module_name = module_name.replace(".base_layer", "")
@@ -612,11 +619,15 @@ class VLLMGeneration:
             if "weight_scale_inv" in params:
                 # vLLM loaded the blockwise FP8 weights of the checkpoint itself, like the trainer
                 del params["weight"], params["weight_scale_inv"]
+            sizes = module.output_sizes if params and parts and parts != [fused] else None
+            if sizes is not None and len(sizes) != len(parts):
+                # Qwen3.5 GDN packs physical q/k/v/z shards into logical qkv/z projections.
+                sizes = [trainer_output_sizes[f"{prefix}{part}"] for part in parts]
             if "weight" in params and params["weight"].dtype == torch.float8_e4m3fn:
                 # Per-channel FP8: one row and one scale per output channel, whatever layout the kernel uses
                 weight = params.pop("weight").data
                 rows = weight if weight.stride(-1) == 1 else weight.t()
-                sizes = module.output_sizes if parts and parts != [fused] else [rows.size(0)]
+                sizes = sizes or [rows.size(0)]
                 for part, row_view, scale_view in zip(
                     parts or [fused],
                     rows.split(sizes),
@@ -626,7 +637,7 @@ class VLLMGeneration:
                     fp8_views[f"{prefix}{part}"] = (row_view, scale_view)
             if parts and parts != [fused]:
                 for name, param in params.items():
-                    for part, view in zip(parts, param.data.split(module.output_sizes), strict=True):
+                    for part, view in zip(parts, param.data.split(sizes), strict=True):
                         views[f"{prefix}{part}.{name}"] = view
 
         self._unmerge()
