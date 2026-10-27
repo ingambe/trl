@@ -19,6 +19,7 @@ import torch
 from accelerate.utils import is_peft_model
 from packaging.version import Version
 from torch import nn
+from torch.utils.weak import WeakTensorKeyDictionary
 from transformers.utils import is_torchao_available
 
 
@@ -64,6 +65,21 @@ def _quantize_tokens(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return (x.float() / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn), scale
 
 
+_quantized_inputs = WeakTensorKeyDictionary()
+
+
+@torch.no_grad()
+def _quantize_input(x: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """`_quantize_tokens` of `x` in groups of `group_size`, computed once for the layers sharing `x` (q/k/v, gate/up)."""
+    # Inference tensors have no version counter
+    if torch.compiler.is_compiling() or x.is_inference():
+        return _quantize_tokens(x.reshape(-1, group_size))
+    cached = _quantized_inputs.get(x)
+    if cached is None or cached[0] != (x._version, group_size):
+        cached = _quantized_inputs[x] = ((x._version, group_size), _quantize_tokens(x.reshape(-1, group_size)))
+    return cached[1]
+
+
 class _FP8Matmul(torch.autograd.Function):
     """
     `x @ (weight_scale * weight_fp8).T` with FP8 GEMMs and per-token scales for `x` and its gradient. The gradient of
@@ -71,14 +87,13 @@ class _FP8Matmul(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, weight_fp8, weight_scale, weight, fast_accum):
+    def forward(ctx, x, x_fp8, x_scale, weight_fp8, weight_scale, weight, fast_accum):
         ctx.save_for_backward(x if weight is not None else None, weight_fp8, weight_scale)
         ctx.input_shape, ctx.weight_dtype, ctx.fast_accum = (
             x.shape,
             None if weight is None else weight.dtype,
             fast_accum,
         )
-        x_fp8, x_scale = _quantize_tokens(x.reshape(-1, x.shape[-1]))
         out = torch._scaled_mm(
             x_fp8,
             weight_fp8.t(),
@@ -108,7 +123,7 @@ class _FP8Matmul(torch.autograd.Function):
         if x is not None:
             x = x.reshape(-1, x.shape[-1])
             grad_weight = (grad_output.t().to(x.dtype) @ x).to(ctx.weight_dtype)
-        return grad_input.to(grad_output.dtype).view(ctx.input_shape), None, None, grad_weight, None
+        return grad_input.to(grad_output.dtype).view(ctx.input_shape), None, None, None, None, grad_weight, None
 
 
 class FP8Linear(nn.Module):
@@ -141,7 +156,8 @@ class FP8Linear(nn.Module):
         self.bias = linear.bias
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = _FP8Matmul.apply(x, self.weight_fp8, self.weight_scale, self.weight, self.fast_accum)
+        x_fp8, x_scale = _quantize_input(x, x.shape[-1])
+        out = _FP8Matmul.apply(x, x_fp8, x_scale, self.weight_fp8, self.weight_scale, self.weight, self.fast_accum)
         return out if self.bias is None else out + self.bias.to(out.dtype)
 
 
@@ -164,10 +180,9 @@ class _BlockFP8Matmul(torch.autograd.Function):
     group."""
 
     @staticmethod
-    def forward(ctx, x, weight_fp8, weight_scale):
+    def forward(ctx, x, x_fp8, x_scale, weight_fp8, weight_scale):
         ctx.save_for_backward(weight_fp8, weight_scale)
         ctx.input_shape = x.shape
-        x_fp8, x_scale = _quantize_tokens(x.reshape(-1, 128))
         x_fp8, x_scale = x_fp8.view(-1, x.shape[-1]), x_scale.view(-1, x.shape[-1] // 128)
         out = _block_scaled_mm(x_fp8, x_scale, weight_fp8.t(), weight_scale.t())
         return out.to(x.dtype).view(*x.shape[:-1], -1)
@@ -179,7 +194,7 @@ class _BlockFP8Matmul(torch.autograd.Function):
         grad_fp8 = grad_fp8.view(-1, grad_output.shape[-1])
         grad_scale = grad_scale.view(-1, grad_output.shape[-1] // 128)
         grad_input = _block_scaled_mm(grad_fp8, grad_scale, weight_fp8, weight_scale)
-        return grad_input.to(grad_output.dtype).view(ctx.input_shape), None, None
+        return grad_input.to(grad_output.dtype).view(ctx.input_shape), None, None, None, None
 
 
 class BlockFP8Linear(nn.Module):
@@ -208,7 +223,7 @@ class BlockFP8Linear(nn.Module):
         self.bias = linear.bias
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = _BlockFP8Matmul.apply(x, self.weight_fp8, self.weight_scale)
+        out = _BlockFP8Matmul.apply(x, *_quantize_input(x, 128), self.weight_fp8, self.weight_scale)
         return out if self.bias is None else out + self.bias.to(out.dtype)
 
 
