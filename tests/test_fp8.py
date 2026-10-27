@@ -51,11 +51,12 @@ def test_fp8_linear_matches_its_dequantized_weight_forward_and_backward(trainabl
         torch.testing.assert_close(linear.weight.grad.float(), expected_weight_grad, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9), reason="test requires FP8 CUDA GEMMs"
+)
 @pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("cache_frozen_transpose", [False, True])
 def test_fp8_linear_backward_accepts_column_major_gradients(compiled, cache_frozen_transpose):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
-        pytest.skip("requires native FP8 CUDA matmul")
     torch.manual_seed(0)
     linear = torch.nn.Linear(64, 64, bias=False, device="cuda", dtype=torch.bfloat16).requires_grad_(False)
     layer = FP8Linear(linear, cache_frozen_transpose=cache_frozen_transpose)
@@ -64,13 +65,11 @@ def test_fp8_linear_backward_accepts_column_major_gradients(compiled, cache_froz
 
     for tokens in (32, 48):
         x = torch.randn(tokens, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        # Transposed upstream gradients are valid autograd inputs and occur in
-        # the compiled decoder backward even when the forward input is dense.
+        # A compiled decoder backward can pass column-major gradients
         grad = torch.randn(64, tokens, device="cuda", dtype=torch.bfloat16).t()
         forward(x).backward(grad)
 
         expected = grad.float() @ weight
-        assert torch.isfinite(x.grad).all()
         assert (x.grad.float() - expected).norm() / expected.norm() < 0.05
 
 
