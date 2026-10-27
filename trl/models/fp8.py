@@ -120,7 +120,9 @@ class _FP8Matmul(torch.autograd.Function):
         grad_fp8 = grad_fp8.contiguous()
         ones = weight_scale.new_ones(1, weight_fp8.shape[1])
         grad_input = torch._scaled_mm(
-            grad_fp8,
+            # Quantization can preserve a column-major upstream gradient.
+            # The left operand of the FP8 GEMM must be row-major.
+            grad_fp8.contiguous(),
             (weight_fp8.t().contiguous() if weight_fp8_t is None else weight_fp8_t).t(),
             grad_scale,
             ones,
