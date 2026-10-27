@@ -5633,6 +5633,34 @@ def test_fp8_recipe_trains_the_linear_layers_with_fp8_gemms(tiny_llama, tmp_path
 
 
 @require_torchao
+def test_fp8_recipe_generates_without_exhausting_the_recompile_limit(tiny_llama, tmp_path):
+    _, tokenizer = tiny_llama
+    # transformers generation compiles each decoder layer separately, for its cache layer
+    config = LlamaConfig(
+        vocab_size=32, hidden_size=32, intermediate_size=64, num_hidden_layers=9, num_attention_heads=2
+    )
+    trainer = GRPOTrainer(
+        model=LlamaForCausalLM(config),
+        processing_class=tokenizer,
+        reward_funcs=lambda completions, **kwargs: [float(i % 2) for i in range(len(completions))],
+        args=GRPOConfig(
+            output_dir=str(tmp_path),
+            report_to="none",
+            bf16=False,
+            per_device_train_batch_size=4,
+            num_generations=2,
+            max_completion_length=4,
+            max_steps=1,
+            fp8_recipe="rowwise_with_gw_hp",
+        ),
+        train_dataset=Dataset.from_dict({"prompt": ["a", "a a"]}),
+    )
+    torch._dynamo.reset()
+    with torch._dynamo.config.patch(fail_on_recompile_limit_hit=True):
+        trainer.train()
+
+
+@require_torchao
 def test_fp8_recipe_requantizes_after_fused_optimizer_steps_and_ref_syncs(tiny_llama, tmp_path):
     _, tokenizer = tiny_llama
     config = LlamaConfig(

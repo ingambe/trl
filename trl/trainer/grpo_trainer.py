@@ -2144,6 +2144,10 @@ class GRPOTrainer(_BaseTrainer):
                 ) as unwrapped_model,
                 torch.no_grad(),
                 self._dist.summon_full_params(self.model_wrapped, recurse=False),
+                # The compiled FP8 decoder layers would recompile per cache layer, exhausting the recompile limit
+                torch.compiler.set_stance("eager_on_recompile")
+                if self.args.fp8_recipe is not None
+                else contextlib.nullcontext(),
             ):
                 # Cast to the appropriate dtype based on training configuration
                 if self.args.bf16:
@@ -2224,6 +2228,10 @@ class GRPOTrainer(_BaseTrainer):
                 ) as unwrapped_model,
                 torch.no_grad(),
                 self._dist.summon_full_params(self.model_wrapped, recurse=False),
+                # The compiled FP8 decoder layers would recompile per cache layer, exhausting the recompile limit
+                torch.compiler.set_stance("eager_on_recompile")
+                if self.args.fp8_recipe is not None
+                else contextlib.nullcontext(),
             ):
                 prompt_completion_ids = unwrapped_model.generate(
                     **generate_inputs, generation_config=self.generation_config
