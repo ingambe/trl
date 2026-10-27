@@ -23,9 +23,14 @@ from transformers.pytorch_utils import Conv1D
 from transformers.utils import is_peft_available
 
 import trl.generation.vllm_generation as vllm_generation_module
+from trl.import_utils import is_vllm_available
 from trl.models.fp8 import BlockFP8Linear, FP8Linear, quantize_rowwise, requantize_fp8_layers
 
 from .testing_utils import quantize_like_fp8_checkpoint, require_peft
+
+
+if is_vllm_available():
+    from vllm.model_executor.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 
 
 if is_peft_available():
@@ -209,6 +214,8 @@ def fp8_vllm_model(weights):
             if module in ("q_proj", "k_proj"):
                 fused = vllm_model.qk_proj.get_parameter(kind).data
                 (fused[:16] if module == "q_proj" else fused[16:]).copy_(weight)
+            elif not module:
+                vllm_model.get_parameter(kind).data.copy_(weight)
             else:
                 vllm_model[module].get_parameter(kind).data.copy_(weight)
 
@@ -227,19 +234,43 @@ def fp8_vllm_model(weights):
 
 
 @require_peft
-def test_lora_shares_the_fp8_base_in_any_vllm_layout(vllm_generation):
+@pytest.mark.parametrize("output_sizes", [[16, 16], [8, 8, 16]])
+@pytest.mark.parametrize(
+    "namespace",
+    ["identity", pytest.param("qwen3_5", marks=pytest.mark.skipif(not is_vllm_available(), reason="requires vLLM"))],
+)
+def test_lora_shares_the_fp8_base_in_any_vllm_layout(vllm_generation, output_sizes, namespace):
+    body = torch.nn.ModuleDict({name: torch.nn.Linear(16, 16) for name in ("q_proj", "k_proj", "o_proj")})
+    body.register_parameter("A_log", torch.nn.Parameter(torch.tensor([0.25, -0.75], dtype=torch.bfloat16)))
+    base = (
+        torch.nn.ModuleDict({"model": torch.nn.ModuleDict({"language_model": body})})
+        if namespace == "qwen3_5"
+        else body
+    )
     model = get_peft_model(
-        torch.nn.ModuleDict({name: torch.nn.Linear(16, 16) for name in ("q_proj", "k_proj", "o_proj")}),
+        base,
         LoraConfig(r=1, target_modules=["q_proj", "k_proj", "o_proj"]),
     )
-    layers = {name: model.base_model.model[name] for name in ("q_proj", "k_proj", "o_proj")}
+    layers = {name: body[name] for name in ("q_proj", "k_proj", "o_proj")}
     vllm_model = fp8_vllm_model({name: layer.base_layer.weight for name, layer in layers.items()})
+    vllm_model.register_parameter("A_log", torch.nn.Parameter(body.A_log.float().detach().clone()))
+    vllm_model.qk_proj.output_sizes = output_sizes
     for layer in layers.values():
         layer.base_layer = FP8Linear(layer.base_layer)
     x = torch.randn(3, 16)
     expected = {name: layer(x) for name, layer in layers.items()}
     runner = vllm_generation.llm.llm_engine.model_executor.driver_worker.model_runner
-    runner.model = vllm_model
+    if namespace == "qwen3_5":
+        # vLLM's Qwen3.5 namespace differs from the trainer's
+        runner.model = torch.nn.ModuleDict({"language_model": torch.nn.ModuleDict({"model": vllm_model})})
+        runner.model.hf_to_vllm_mapper = Qwen3_5ForConditionalGeneration.hf_to_vllm_mapper
+        runner.model.packed_modules_mapping = vllm_model.packed_modules_mapping
+        load_weights = vllm_model.load_weights
+        runner.model.load_weights = lambda weights: load_weights(
+            (name.removeprefix("language_model.model."), weight) for name, weight in weights
+        )
+    else:
+        runner.model = vllm_model
     vllm_generation.model = model
     vllm_generation.share_weights = True
     vllm_generation.native_lora = True
@@ -247,6 +278,9 @@ def test_lora_shares_the_fp8_base_in_any_vllm_layout(vllm_generation):
     unshared = vllm_generation._share_weights()
 
     assert unshared == []
+    assert body.A_log.dtype == torch.float32
+    assert body.A_log.data_ptr() == vllm_model.A_log.data_ptr()
+    torch.testing.assert_close(body.A_log, torch.tensor([0.25, -0.75]), rtol=0, atol=0)
     for name, layer in layers.items():
         torch.testing.assert_close(layer(x), expected[name], rtol=0, atol=0)
     rows = vllm_model.qk_proj.weight.t()
