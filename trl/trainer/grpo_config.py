@@ -75,10 +75,10 @@ class GRPOConfig(_BaseConfig):
         fp8_fast_accum (`list[str]`, *optional*):
             FP8 GEMMs (`"output"`, `"grad_input"`, `"grad_weight"`) that use the faster, less accurate accumulation
             with `fp8_recipe`. All GEMMs accumulate accurately by default. Not available with MXFP8.
-        fp8_cache_frozen_transpose (`bool`, *optional*, defaults to `True`):
+        fp8_cache_frozen_transpose (`bool`, *optional*, defaults to `False`):
             Whether the frozen FP8 layers of a PEFT base keep a transposed copy of their weights with `fp8_recipe`,
-            instead of transposing them on every backward. Faster, but the base then takes as much memory as in BF16:
-            disable it to keep the FP8 memory saving. Trainable FP8 layers always keep one.
+            instead of transposing them on every backward. Faster, but the base then takes as much memory as in BF16.
+            Trainable FP8 layers always keep one.
 
         > Parameters that control the data preprocessing
 
@@ -592,11 +592,11 @@ class GRPOConfig(_BaseConfig):
         },
     )
     fp8_cache_frozen_transpose: bool = field(
-        default=True,
+        default=False,
         metadata={
             "help": "Whether the frozen FP8 layers of a PEFT base keep a transposed copy of their weights with "
             "`fp8_recipe`, instead of transposing them on every backward. Faster, but the base then takes as much "
-            "memory as in BF16: disable it to keep the FP8 memory saving. Trainable FP8 layers always keep one."
+            "memory as in BF16. Trainable FP8 layers always keep one."
         },
     )
 

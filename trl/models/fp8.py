@@ -140,12 +140,12 @@ class FP8Linear(nn.Module):
             Layer to convert. Its high-precision weight is kept only if it requires gradients.
         fast_accum (`list[str]`, *optional*):
             GEMMs (`"output"`, `"grad_input"`) that use the faster, less accurate FP8 accumulation.
-        cache_frozen_transpose (`bool`, *optional*, defaults to `True`):
+        cache_frozen_transpose (`bool`, *optional*, defaults to `False`):
             Whether a frozen layer also keeps a transposed FP8 copy instead of transposing its weight on every
             backward, doubling its memory.
     """
 
-    def __init__(self, linear: nn.Linear, fast_accum: list[str] | None = None, cache_frozen_transpose: bool = True):
+    def __init__(self, linear: nn.Linear, fast_accum: list[str] | None = None, cache_frozen_transpose: bool = False):
         super().__init__()
         if torch.version.hip is not None:
             raise ValueError("FP8Linear uses the OCP float8_e4m3fn format, which ROCm doesn't compute natively.")
@@ -216,12 +216,12 @@ class BlockFP8Linear(nn.Module):
     Args:
         linear (`nn.Linear`):
             Layer of the checkpoint, with its FP8 `weight` and the `weight_scale_inv` multiplying each of its blocks.
-        cache_frozen_transpose (`bool`, *optional*, defaults to `True`):
+        cache_frozen_transpose (`bool`, *optional*, defaults to `False`):
             Whether to keep a transposed FP8 copy instead of transposing the weight on every backward, doubling its
             memory.
     """
 
-    def __init__(self, linear: nn.Linear, cache_frozen_transpose: bool = True):
+    def __init__(self, linear: nn.Linear, cache_frozen_transpose: bool = False):
         super().__init__()
         if linear.in_features % 128 or linear.out_features % 128 or linear.weight_scale_inv.dtype != torch.float32:
             raise ValueError("Only FP8 checkpoints with float32 scales for 128x128 blocks of weights are supported.")
@@ -296,7 +296,7 @@ def convert_to_fp8_training(
     recipe: str,
     skip_modules: list[str] | None = None,
     fast_accum: list[str] | None = None,
-    cache_frozen_transpose: bool = True,
+    cache_frozen_transpose: bool = False,
 ) -> None:
     """
     Run the linear layers of a model with FP8 GEMMs, keeping their parameters in their original precision.
@@ -321,7 +321,7 @@ def convert_to_fp8_training(
         fast_accum (`list[str]`, *optional*):
             FP8 GEMMs (`"output"`, `"grad_input"`, `"grad_weight"`) that use the faster, less accurate accumulation.
             Not available with MXFP8.
-        cache_frozen_transpose (`bool`, *optional*, defaults to `True`):
+        cache_frozen_transpose (`bool`, *optional*, defaults to `False`):
             Whether frozen [`FP8Linear`] and [`BlockFP8Linear`] layers keep a transposed FP8 copy of their weight
             instead of transposing it on every backward, doubling their memory.
     """
