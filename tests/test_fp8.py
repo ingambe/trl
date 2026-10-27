@@ -85,6 +85,9 @@ def test_fp8_linear_requantizes_a_changed_input_and_releases_it():
         x.zero_()
         torch.testing.assert_close(layer(x), layer.bias.expand(4, -1), rtol=0, atol=0)
 
+    with torch.inference_mode():
+        torch.testing.assert_close(layer(torch.zeros(4, 64, dtype=torch.bfloat16)), layer.bias.expand(4, -1))
+
     x_ref = weakref.ref(x)
     del x
     assert x_ref() is None
