@@ -58,6 +58,7 @@ from transformers import (
     is_trackio_available,
     is_wandb_available,
 )
+from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers.utils import is_peft_available, is_rich_available
 
@@ -1180,6 +1181,11 @@ class GRPOTrainer(_BaseTrainer):
                     if name.endswith((".weight_fp8", ".weight_fp8_t", ".weight_scale"))
                 ],
             )
+            # Compiling each decoder layer fuses the activation quantization into the ops around it
+            for fp8_model in [model] if self.ref_model is None else [model, self.ref_model]:
+                for module in fp8_model.modules():
+                    if isinstance(module, GradientCheckpointingLayer):
+                        module.compile(dynamic=True)
             self._fp8_quantized_step = 0
 
         # Liger's fused linear cross-entropy replaces `model.forward` when training starts, which would drop the fused
