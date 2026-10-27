@@ -48,7 +48,9 @@ from .vllm_client import VLLMClient
 
 if is_vllm_available():
     from vllm import LLM, RequestOutput, SamplingParams
+    from vllm.config import ModelConfig
     from vllm.lora.request import LoRARequest
+    from vllm.model_executor.models import ModelRegistry
     from vllm.model_executor.models.interfaces import supports_lora
     from vllm.sampling_params import StructuredOutputsParams
 
@@ -589,19 +591,42 @@ class VLLMGeneration:
                     f"vLLM quantizes `{name}` together with the projections it fuses it with: keep all of them in "
                     "high precision with `fp8_skip_modules`, or none."
                 )
-        # vLLM's fused MoE experts have no trainer counterpart
-        return ["*.experts"] + [
+        ignored = [
             self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", ""))
             for name in ignored
         ]
+        if self.model_impl != "transformers" and (isinstance(model, PreTrainedModel) or is_peft_model(model)):
+            # vLLM matches the ignore list against its own module names, without mapping it
+            model_config = ModelConfig(
+                model=model.name_or_path, model_impl=self.model_impl, trust_remote_code=self.trust_remote_code
+            )
+            model_class, _ = ModelRegistry.resolve_model_cls(model.config.architectures, model_config)
+            mapper = getattr(model_class, "hf_to_vllm_mapper", None)
+            if mapper is not None:
+                ignored = mapper.get_rename_mapper().apply_list(ignored)
+        # vLLM's fused MoE experts have no trainer counterpart
+        return ["*.experts"] + ignored
 
     @torch.no_grad()
     def _share_weights(self) -> list[tuple[str, torch.Tensor]]:
         """Point the model's parameters at vLLM's weights, and return the parameters that can't be shared."""
         vllm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+        mapper = getattr(vllm_model, "hf_to_vllm_mapper", None)
+        mapper = mapper.get_rename_mapper() if mapper is not None else None
+
+        def trainer_name(name):
+            name = self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", ""))
+            # Match vLLM's namespace, retaining the logical constituents of fused projections.
+            return mapper.map_name(name) if mapper is not None else name
+
         views = {name.replace(".base_layer", ""): param.data for name, param in vllm_model.named_parameters()}
         # Fused layers (e.g. qkv_proj) stack several parameters
         packed = vllm_model.packed_modules_mapping if supports_lora(vllm_model) else {}
+        trainer_output_sizes = {
+            trainer_name(name): module.out_features
+            for name, module in self.model.named_modules()
+            if isinstance(module, nn.Linear | FP8Linear)
+        }
         fp8_views = {}
         for module_name, module in vllm_model.named_modules():
             module_name = module_name.replace(".base_layer", "")
@@ -612,11 +637,15 @@ class VLLMGeneration:
             if "weight_scale_inv" in params:
                 # vLLM loaded the blockwise FP8 weights of the checkpoint itself, like the trainer
                 del params["weight"], params["weight_scale_inv"]
+            sizes = module.output_sizes if params and parts and parts != [fused] else None
+            if sizes is not None and len(sizes) != len(parts):
+                # Qwen3.5 GDN packs physical q/k/v/z shards into logical qkv/z projections.
+                sizes = [trainer_output_sizes[f"{prefix}{part}"] for part in parts]
             if "weight" in params and params["weight"].dtype == torch.float8_e4m3fn:
                 # Per-channel FP8: one row and one scale per output channel, whatever layout the kernel uses
                 weight = params.pop("weight").data
                 rows = weight if weight.stride(-1) == 1 else weight.t()
-                sizes = module.output_sizes if parts and parts != [fused] else [rows.size(0)]
+                sizes = sizes or [rows.size(0)]
                 for part, row_view, scale_view in zip(
                     parts or [fused],
                     rows.split(sizes),
@@ -626,7 +655,7 @@ class VLLMGeneration:
                     fp8_views[f"{prefix}{part}"] = (row_view, scale_view)
             if parts and parts != [fused]:
                 for name, param in params.items():
-                    for part, view in zip(parts, param.data.split(module.output_sizes), strict=True):
+                    for part, view in zip(parts, param.data.split(sizes), strict=True):
                         views[f"{prefix}{part}.{name}"] = view
 
         self._unmerge()
@@ -635,17 +664,15 @@ class VLLMGeneration:
         if adapter_prefix and not self.native_lora:
             adapter = self.model.active_adapters[0]
             lora_layers = {
-                self._fix_param_name_to_vllm(name.removeprefix("base_model.model.")) + ".weight": module
+                trainer_name(name) + ".weight": module
                 for name, module in self.model.named_modules()
                 if isinstance(module, BaseTunerLayer)
             }
         fp8_layers = {
-            self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", "")): module
-            for name, module in self.model.named_modules()
-            if isinstance(module, FP8Linear)
+            trainer_name(name): module for name, module in self.model.named_modules() if isinstance(module, FP8Linear)
         }
         params = [
-            (self._fix_param_name_to_vllm(name.removeprefix("base_model.model.").replace(".base_layer", "")), param)
+            (trainer_name(name), param)
             for name, param in self.model.named_parameters()
             if not (adapter_prefix and adapter_prefix in name)
         ]
@@ -664,6 +691,15 @@ class VLLMGeneration:
                 setattr(parent, child_name, child.base_layer)
             for name, param in params:
                 view = views.get(name)
+                if (
+                    view is not None
+                    and view.shape == param.shape
+                    and not param.requires_grad
+                    and param.dtype in (torch.float16, torch.bfloat16)
+                    and view.dtype == torch.float32
+                ):
+                    # vLLM keeps some frozen parameters (e.g. Qwen3.5's A_log) in FP32
+                    param.data = param.data.float()
                 if view is None or view.shape != param.shape or view.dtype != param.dtype:
                     self._unshareable.add(name)
                     continue

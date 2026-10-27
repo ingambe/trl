@@ -116,6 +116,8 @@ class _FP8Matmul(torch.autograd.Function):
         grad_output = grad_output.reshape(-1, grad_output.shape[-1])
         # The weight scales run along the reduced dimension, so they are folded into the gradient
         grad_fp8, grad_scale = _quantize_scaled_tokens(grad_output, weight_scale.t())
+        # `_scaled_mm` takes it row-major, which a compiled backward's gradient may not be
+        grad_fp8 = grad_fp8.contiguous()
         ones = weight_scale.new_ones(1, weight_fp8.shape[1])
         grad_input = torch._scaled_mm(
             # Quantization can preserve a column-major upstream gradient.
