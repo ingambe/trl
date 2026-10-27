@@ -1161,11 +1161,24 @@ class GRPOTrainer(_BaseTrainer):
                 # The reference converts the same layers as the policy, whose frozen layers stay in high precision
                 for param, ref_param in zip(model.parameters(), self.ref_model.parameters(), strict=True):
                     ref_param.requires_grad_(param.requires_grad)
-                convert_to_fp8_training(self.ref_model, args.fp8_recipe, args.fp8_skip_modules, args.fp8_fast_accum)
-            convert_to_fp8_training(model, args.fp8_recipe, args.fp8_skip_modules, args.fp8_fast_accum)
+                convert_to_fp8_training(
+                    self.ref_model,
+                    args.fp8_recipe,
+                    args.fp8_skip_modules,
+                    args.fp8_fast_accum,
+                    args.fp8_cache_frozen_transpose,
+                )
+            convert_to_fp8_training(
+                model, args.fp8_recipe, args.fp8_skip_modules, args.fp8_fast_accum, args.fp8_cache_frozen_transpose
+            )
             # Each rank requantizes its own FP8 copies, which DDP can't broadcast
             DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(
-                model, [name for name, _ in model.named_buffers() if name.endswith((".weight_fp8", ".weight_scale"))]
+                model,
+                [
+                    name
+                    for name, _ in model.named_buffers()
+                    if name.endswith((".weight_fp8", ".weight_fp8_t", ".weight_scale"))
+                ],
             )
             self._fp8_quantized_step = 0
 
