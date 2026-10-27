@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import weakref
+
 import pytest
 import torch
 from transformers.utils import is_peft_available
@@ -73,6 +75,22 @@ def test_fp8_linear_does_not_flush_tiny_gradients_to_zero(trainable):
     FP8Linear(linear)(x).backward(grad.bfloat16())
 
     torch.testing.assert_close(x.grad.float(), 4 * grad, rtol=0, atol=0)
+
+
+def test_fp8_linear_requantizes_a_changed_input_and_releases_it():
+    layer = FP8Linear(torch.nn.Linear(64, 32, dtype=torch.bfloat16))
+    x = torch.randn(4, 64, dtype=torch.bfloat16, requires_grad=True)
+    layer(x)
+    with torch.no_grad():
+        x.zero_()
+        torch.testing.assert_close(layer(x), layer.bias.expand(4, -1), rtol=0, atol=0)
+
+    with torch.inference_mode():
+        torch.testing.assert_close(layer(torch.zeros(4, 64, dtype=torch.bfloat16)), layer.bias.expand(4, -1))
+
+    x_ref = weakref.ref(x)
+    del x
+    assert x_ref() is None
 
 
 def test_fp8_layers_propagate_small_gradients_to_earlier_layers():
