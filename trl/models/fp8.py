@@ -146,9 +146,12 @@ class FP8Linear(nn.Module):
             Layer to convert. Its high-precision weight is kept only if it requires gradients.
         fast_accum (`list[str]`, *optional*):
             GEMMs (`"output"`, `"grad_input"`) that use the faster, less accurate FP8 accumulation.
+        cache_frozen_transpose (`bool`, *optional*, defaults to `True`):
+            Whether a frozen layer also keeps a transposed FP8 copy instead of transposing its weight on every
+            backward, doubling its memory.
     """
 
-    def __init__(self, linear: nn.Linear, fast_accum: list[str] | None = None):
+    def __init__(self, linear: nn.Linear, fast_accum: list[str] | None = None, cache_frozen_transpose: bool = True):
         super().__init__()
         if torch.version.hip is not None:
             raise ValueError("FP8Linear uses the OCP float8_e4m3fn format, which ROCm doesn't compute natively.")
@@ -160,8 +163,9 @@ class FP8Linear(nn.Module):
         weight_fp8, weight_scale = quantize_rowwise(linear.weight.detach(), scale_dtype)
         self.register_buffer("weight_fp8", weight_fp8, persistent=self.weight is None)
         self.register_buffer("weight_scale", weight_scale, persistent=self.weight is None)
+        cache_transpose = self.weight is not None or cache_frozen_transpose
         self.register_buffer(
-            "weight_fp8_t", None if self.weight is None else weight_fp8.t().contiguous(), persistent=False
+            "weight_fp8_t", weight_fp8.t().contiguous() if cache_transpose else None, persistent=False
         )
         self.bias = linear.bias
 
@@ -192,8 +196,8 @@ class _BlockFP8Matmul(torch.autograd.Function):
     group."""
 
     @staticmethod
-    def forward(ctx, x, x_fp8, x_scale, weight_fp8, weight_scale):
-        ctx.save_for_backward(weight_fp8, weight_scale)
+    def forward(ctx, x, x_fp8, x_scale, weight_fp8, weight_fp8_t, weight_scale):
+        ctx.save_for_backward(weight_fp8, weight_fp8_t, weight_scale)
         ctx.input_shape = x.shape
         x_fp8, x_scale = x_fp8.view(-1, x.shape[-1]), x_scale.view(-1, x.shape[-1] // 128)
         out = _block_scaled_mm(x_fp8, x_scale, weight_fp8.t(), weight_scale.t())
@@ -201,12 +205,13 @@ class _BlockFP8Matmul(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        weight_fp8, weight_scale = ctx.saved_tensors
+        weight_fp8, weight_fp8_t, weight_scale = ctx.saved_tensors
         grad_fp8, grad_scale = _quantize_tokens(grad_output.reshape(-1, 128))
         grad_fp8 = grad_fp8.view(-1, grad_output.shape[-1])
         grad_scale = grad_scale.view(-1, grad_output.shape[-1] // 128)
-        grad_input = _block_scaled_mm(grad_fp8, grad_scale, weight_fp8, weight_scale)
-        return grad_input.to(grad_output.dtype).view(ctx.input_shape), None, None, None, None
+        weight = weight_fp8 if weight_fp8_t is None else weight_fp8_t.t()
+        grad_input = _block_scaled_mm(grad_fp8, grad_scale, weight, weight_scale)
+        return grad_input.to(grad_output.dtype).view(ctx.input_shape), None, None, None, None, None
 
 
 class BlockFP8Linear(nn.Module):
@@ -217,9 +222,12 @@ class BlockFP8Linear(nn.Module):
     Args:
         linear (`nn.Linear`):
             Layer of the checkpoint, with its FP8 `weight` and the `weight_scale_inv` multiplying each of its blocks.
+        cache_frozen_transpose (`bool`, *optional*, defaults to `True`):
+            Whether to keep a transposed FP8 copy instead of transposing the weight on every backward, doubling its
+            memory.
     """
 
-    def __init__(self, linear: nn.Linear):
+    def __init__(self, linear: nn.Linear, cache_frozen_transpose: bool = True):
         super().__init__()
         if linear.in_features % 128 or linear.out_features % 128 or linear.weight_scale_inv.dtype != torch.float32:
             raise ValueError("Only FP8 checkpoints with float32 scales for 128x128 blocks of weights are supported.")
@@ -232,10 +240,12 @@ class BlockFP8Linear(nn.Module):
         self.weight = None  # no high-precision weight, as for a frozen `FP8Linear`
         self.register_buffer("weight_fp8", linear.weight.detach())
         self.register_buffer("weight_scale", linear.weight_scale_inv.detach())
+        weight_fp8_t = linear.weight.detach().t().contiguous() if cache_frozen_transpose else None
+        self.register_buffer("weight_fp8_t", weight_fp8_t, persistent=False)
         self.bias = linear.bias
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = _BlockFP8Matmul.apply(x, *_quantize_input(x, 128), self.weight_fp8, self.weight_scale)
+        out = _BlockFP8Matmul.apply(x, *_quantize_input(x, 128), self.weight_fp8, self.weight_fp8_t, self.weight_scale)
         return out if self.bias is None else out + self.bias.to(out.dtype)
 
 
@@ -288,7 +298,11 @@ def dequantize_fp8_layers(model: nn.Module, dtype: torch.dtype) -> None:
 
 
 def convert_to_fp8_training(
-    model: nn.Module, recipe: str, skip_modules: list[str] | None = None, fast_accum: list[str] | None = None
+    model: nn.Module,
+    recipe: str,
+    skip_modules: list[str] | None = None,
+    fast_accum: list[str] | None = None,
+    cache_frozen_transpose: bool = True,
 ) -> None:
     """
     Run the linear layers of a model with FP8 GEMMs, keeping their parameters in their original precision.
@@ -313,6 +327,9 @@ def convert_to_fp8_training(
         fast_accum (`list[str]`, *optional*):
             FP8 GEMMs (`"output"`, `"grad_input"`, `"grad_weight"`) that use the faster, less accurate accumulation.
             Not available with MXFP8.
+        cache_frozen_transpose (`bool`, *optional*, defaults to `True`):
+            Whether frozen [`FP8Linear`] and [`BlockFP8Linear`] layers keep a transposed FP8 copy of their weight
+            instead of transposing it on every backward, doubling their memory.
     """
     if recipe not in ("rowwise_with_gw_hp", "rowwise", "tensorwise", "mxfp8_with_gw_hp", "mxfp8"):
         raise ValueError(f"Unknown FP8 recipe: {recipe!r}.")
@@ -338,7 +355,7 @@ def convert_to_fp8_training(
             raise ValueError("`skip_modules` can't keep the layers of an FP8 checkpoint in high precision.")
         for name, module in prequantized:
             parent, _, child = name.rpartition(".")
-            setattr(model.get_submodule(parent), child, BlockFP8Linear(module))
+            setattr(model.get_submodule(parent), child, BlockFP8Linear(module, cache_frozen_transpose))
         return
     emulate = not torch.cuda.is_available()
     mxfp8 = recipe.startswith("mxfp8")
@@ -375,7 +392,7 @@ def convert_to_fp8_training(
             fp8_module.weight, fp8_module.bias = module.weight, module.bias
         # Only a PEFT base, which checkpoints never include, can drop its high-precision weight
         elif recipe in ("rowwise_with_gw_hp", "rowwise") and is_peft_model(model) and not module.weight.requires_grad:
-            fp8_module = FP8Linear(module, fast_accum)
+            fp8_module = FP8Linear(module, fast_accum, cache_frozen_transpose)
         elif recipe == "rowwise_with_gw_hp" and module.weight.requires_grad:
             fp8_module = FP8Linear(module, fast_accum)
         else:
