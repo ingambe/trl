@@ -67,7 +67,8 @@ class GRPOConfig(_BaseConfig):
             values, on Blackwell GPUs. TorchAO's `"rowwise"` and `"tensorwise"` recipes and `"mxfp8"` also quantize the
             weight-gradient GEMM. A checkpoint quantized to FP8 in 128x128 blocks (e.g. `Qwen/Qwen3-8B-FP8`) keeps its
             FP8 weights whatever the recipe, and only trains a PEFT adapter. The decoder layers are compiled with
-            `torch.compile`. Requires a GPU with FP8 support and `torchao` for TorchAO's recipes and FP8 checkpoints.
+            `torch.compile`, except with `"mxfp8"`. Requires a GPU with FP8 support and `torchao` for TorchAO's recipes
+            and FP8 checkpoints.
         fp8_skip_modules (`list[str]`, *optional*):
             Glob patterns of the linear layers kept in high precision with `fp8_recipe`, e.g. `"model.layers.0.*"`. The
             `tools/fp8_parity/replay.py --target-kl` sensitivity analysis produces such a list. vLLM quantizes the
@@ -573,7 +574,8 @@ class GRPOConfig(_BaseConfig):
             "on Blackwell GPUs. TorchAO's `'rowwise'` and `'tensorwise'` recipes and `'mxfp8'` also quantize the "
             "weight-gradient GEMM. A checkpoint quantized to FP8 in 128x128 blocks (e.g. `Qwen/Qwen3-8B-FP8`) keeps "
             "its FP8 weights whatever the recipe, and only trains a PEFT adapter. The decoder layers are compiled with "
-            "`torch.compile`. Requires a GPU with FP8 support and `torchao` for TorchAO's recipes and FP8 checkpoints."
+            "`torch.compile`, except with `'mxfp8'`. Requires a GPU with FP8 support and `torchao` for TorchAO's "
+            "recipes and FP8 checkpoints."
         },
     )
     fp8_skip_modules: list[str] | None = field(
