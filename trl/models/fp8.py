@@ -74,13 +74,15 @@ def _quantize_scaled_tokens(x: torch.Tensor, column_scale: torch.Tensor) -> tupl
 _quantized_inputs = WeakTensorKeyDictionary()
 
 
+@torch.no_grad()
 def _quantize_input(x: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
     """`_quantize_tokens` of `x` in groups of `group_size`, computed once for the layers sharing `x` (q/k/v, gate/up)."""
     if torch.compiler.is_compiling():
         return _quantize_tokens(x.reshape(-1, group_size))
-    if x not in _quantized_inputs:
-        _quantized_inputs[x] = _quantize_tokens(x.reshape(-1, group_size))
-    return _quantized_inputs[x]
+    cached = _quantized_inputs.get(x)
+    if cached is None or cached[0] != (x._version, group_size):
+        cached = _quantized_inputs[x] = ((x._version, group_size), _quantize_tokens(x.reshape(-1, group_size)))
+    return cached[1]
 
 
 class _FP8Matmul(torch.autograd.Function):
