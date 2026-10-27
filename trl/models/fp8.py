@@ -71,7 +71,8 @@ _quantized_inputs = WeakTensorKeyDictionary()
 @torch.no_grad()
 def _quantize_input(x: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
     """`_quantize_tokens` of `x` in groups of `group_size`, computed once for the layers sharing `x` (q/k/v, gate/up)."""
-    if torch.compiler.is_compiling():
+    # Inference tensors have no version counter
+    if torch.compiler.is_compiling() or x.is_inference():
         return _quantize_tokens(x.reshape(-1, group_size))
     cached = _quantized_inputs.get(x)
     if cached is None or cached[0] != (x._version, group_size):
